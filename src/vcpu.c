@@ -40,6 +40,10 @@ int vcpu_init(struct vcpu *vcpu, const struct kvm_context *kvm, unsigned id)
     return 0;
 }
 
+// 设置实模式只需要：
+// CS.base = 0，CS.selector = 0
+// RIP = 第一条指令的地址
+// RFLAGS.bit1 = 1（x86-64 保留位，必须始终为 1）
 int vcpu_setup_regs(struct vcpu *vcpu)
 {
     struct kvm_sregs sregs;
