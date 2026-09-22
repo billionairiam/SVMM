@@ -12,6 +12,7 @@ struct linux_image {
     size_t setup_size;
     size_t kernel_size;
     uint32_t init_size;
+    uint64_t runtime_start;
 };
 
 int boot_linux_load(const char *path, struct linux_image *image);

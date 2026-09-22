@@ -4,6 +4,9 @@ CPPFLAGS += -Isrc
 
 SOURCES := src/main.c src/kvm.c src/memory.c src/vcpu.c src/serial.c src/boot/linux.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
+DEPFILES := $(OBJECTS:.o=.d)
+
+-include $(DEPFILES)
 
 .PHONY: all run test clean
 
@@ -23,7 +26,7 @@ bin/test_boot: tests/test_boot.c src/boot/linux.c src/boot/linux.h src/memory.c 
 
 build/%.o: src/%.c | build
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
 build bin:
 	mkdir -p $@
