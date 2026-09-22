@@ -67,6 +67,21 @@ int vcpu_setup_regs(struct vcpu *vcpu)
     return 0;
 }
 
+// struct {
+//     uint8_t  direction;   /* KVM_EXIT_IO_IN 或 KVM_EXIT_IO_OUT */
+//     uint8_t  size;        /* 1、2 或 4 字节                     */
+//     uint16_t port;        /* I/O 端口号                          */
+//     uint32_t count;       /* 重复计数（rep 前缀的 ins/outs）      */
+//     uint64_t data_offset; /* 从 kvm_run 基址到数据的字节偏移      */
+// } io;
+// data_offset 是动态偏移：
+//    它是 struct kvm_run 内部的相对偏移，不同 KVM 版本可能不同。
+//    必须使用 (uint8_t *)run + run->io.data_offset 定位数据——绝不硬编码。
+// 总数据大小 = size × count：
+//    对于 rep outsb 这样的指令，count 会大于 1。Stage 01 的客户机只使用 size=1, count=1，
+//    但运行循环代码处理了一般情况。
+// out imm8, al 只能寻址 0x00–0xFF：
+//    端口 0x3f8 超出了 8 位立即数的范围，因此必须通过 DX 寄存器间接寻址（mov dx, 0x3f8; out dx, al）。
 int vcpu_run(struct vcpu *vcpu, struct serial *serial)
 {
     for (;;) {
