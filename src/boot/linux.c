@@ -29,6 +29,14 @@ static uint16_t read_le16(const uint8_t *data)
     return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
 }
 
+static uint64_t read_le64(const uint8_t *data)
+{
+    uint64_t value = 0;
+    for (unsigned i = 0; i < 8; ++i)
+        value |= (uint64_t)data[i] << (8 * i);
+    return value;
+}
+
 int boot_linux_load(const char *path, struct linux_image *image)
 {
     *image = (struct linux_image){ 0 };
@@ -71,11 +79,23 @@ int boot_linux_load(const char *path, struct linux_image *image)
     uint16_t version = read_le16(data + 0x206);
     uint32_t init_size;
     memcpy(&init_size, data + 0x260, sizeof(init_size));
+    uint64_t preferred = read_le64(data + 0x258);
+    uint32_t alignment;
+    memcpy(&alignment, data + 0x230, sizeof(alignment));
+    int relocatable = data[0x234] != 0;
+    uint64_t runtime_start = relocatable ?
+        (preferred > KERNEL_ADDR ? preferred : KERNEL_ADDR) : preferred;
+    if (relocatable && preferred <= UINT32_MAX && alignment &&
+        !(alignment & (alignment - 1)))
+        runtime_start = (runtime_start + alignment - 1) &
+                        ~((uint64_t)alignment - 1);
     if (memcmp(data + 0x202, "HdrS", 4) != 0 ||
         version < BOOT_PROTOCOL_MIN || !(data[0x211] & LOADED_HIGH) ||
         data[0x201] < 0x62 || setup_size > 0x10000 || setup_size >= size ||
         init_size == 0 || init_size > BZIMAGE_MAX_SIZE ||
-        init_size < size - setup_size) {
+        init_size < size - setup_size || preferred > UINT32_MAX ||
+        (relocatable && (!alignment || (alignment & (alignment - 1)))) ||
+        runtime_start + init_size > UINT32_MAX) {
         fprintf(stderr, "unsupported or malformed x86 bzImage\n");
         free(data);
         return -1;
@@ -85,12 +105,14 @@ int boot_linux_load(const char *path, struct linux_image *image)
     image->setup_size = setup_size;
     image->kernel_size = size - setup_size;
     image->init_size = init_size;
+    image->runtime_start = runtime_start;
     return 0;
 }
 
 size_t boot_linux_memory_size(const struct linux_image *image)
 {
-    size_t size = KERNEL_ADDR + (size_t)image->init_size + 32u * 1024u * 1024u;
+    size_t size = (size_t)image->runtime_start + image->init_size +
+                  32u * 1024u * 1024u;
     const size_t alignment = 2u * 1024u * 1024u;
     size = (size + alignment - 1) & ~(alignment - 1);
     return size < GUEST_MEMORY_MIN_SIZE ? GUEST_MEMORY_MIN_SIZE : size;
@@ -100,7 +122,9 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
                        const char *cmdline)
 {
     if (!memory->data || !image->data || memory->size < KERNEL_ADDR ||
-        image->init_size > memory->size - KERNEL_ADDR ||
+        image->runtime_start > memory->size ||
+        image->init_size > memory->size - image->runtime_start ||
+        image->kernel_size > memory->size - KERNEL_ADDR ||
         image->setup_size > CMDLINE_ADDR - SETUP_CODE_ADDR) {
         errno = EINVAL;
         return -1;

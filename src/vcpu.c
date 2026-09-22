@@ -152,8 +152,8 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial)
             return 0;
         }
         case KVM_EXIT_SHUTDOWN:
-            fprintf(stderr, "INFO: guest shutdown\n");
-            return 0;
+            fprintf(stderr, "ERROR: guest shutdown (possible triple fault)\n");
+            return -1;
         case KVM_EXIT_IO: {
             if (run->io.size != 1 && run->io.size != 2 && run->io.size != 4) {
                 fprintf(stderr, "invalid I/O width: %u\n", run->io.size);

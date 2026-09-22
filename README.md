@@ -40,6 +40,6 @@ BZIMAGE_PATH=/boot/vmlinuz-6.16.0 REQUIRE_KERNEL_LOG=1 make test
 | `0x20000` | 内核命令行 |
 | `0x100000` | bzImage 压缩内核载荷及入口 |
 
-客户机内存至少 128 MiB；若镜像的 `init_size` 更大，则继续增加。这里比教程的 32 MiB 大，因为较新的内核仅初始化空间就可能超过 32 MiB。e820 表根据实际分配的内存填写。
+客户机内存至少 128 MiB；若内核首选运行地址加 `init_size` 超出该范围，则继续增加。这里比教程的 32 MiB 大，因为较新的内核仅初始化空间就可能超过 32 MiB。e820 表根据实际分配的内存填写。
 
-本阶段没有 initramfs、根文件系统和完整的中断控制器。VMM 在客户机第一次 `hlt` 或 shutdown 时退出；`Stage 02 completed` 表示本阶段的运行循环结束，不代表内核已进入用户空间。
+本阶段没有 initramfs、根文件系统和完整的中断控制器。VMM 在客户机第一次 `hlt` 时退出；`Stage 02 completed` 表示本阶段的运行循环结束。部分内核会在根文件系统挂载失败后持续停留在 panic 中，此时可以用 `timeout 15 make run` 限制运行时间；集成测试会将出现明确 VFS 根文件系统 panic 的情况视为达到本阶段预期边界。客户机 shutdown 会被报告为错误，因为它也可能由三重故障引起。
