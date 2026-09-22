@@ -14,7 +14,8 @@ struct vcpu {
 };
 
 int vcpu_init(struct vcpu *vcpu, const struct kvm_context *kvm, unsigned id);
-int vcpu_setup_regs(struct vcpu *vcpu);
+int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
+                          unsigned boot_params_addr);
 int vcpu_run(struct vcpu *vcpu, struct serial *serial);
 void vcpu_destroy(struct vcpu *vcpu);
 
