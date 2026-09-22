@@ -7,18 +7,22 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
-int guest_memory_init(struct guest_memory *memory, int vm_fd)
+int guest_memory_init(struct guest_memory *memory, int vm_fd, size_t size)
 {
     memory->data = NULL;
     memory->size = 0;
-    void *mapping = mmap(NULL, GUEST_MEMORY_SIZE, PROT_READ | PROT_WRITE,
+    if (size < GUEST_MEMORY_MIN_SIZE || (size & 0xfff) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    void *mapping = mmap(NULL, size, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mapping == MAP_FAILED) {
         perror("mmap guest memory");
         return -1;
     }
     memory->data = mapping;
-    memory->size = GUEST_MEMORY_SIZE;
+    memory->size = size;
 
     struct kvm_userspace_memory_region region = {
         .slot = 0,
