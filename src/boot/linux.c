@@ -1,5 +1,6 @@
 #include "boot/linux.h"
 
+#include "ablation.h"
 #include "memory.h"
 
 #include <asm/bootparam.h>
@@ -174,6 +175,9 @@ int boot_linux_load(const char *path, struct linux_image *image)
 
 size_t boot_linux_memory_size(const struct linux_image *image)
 {
+    if (SVMM_ABLATE_DYNAMIC_MEMORY_ENABLED)
+        return BLOG_GUEST_MEMORY_SIZE;
+
     size_t size = (size_t)image->runtime_start + image->init_size +
                   32u * 1024u * 1024u;
     const size_t memory_alignment = 2u * 1024u * 1024u;
@@ -195,8 +199,9 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
     size_t cmdline_len = strlen(cmdline);
     const struct setup_header *source_hdr =
         (const struct setup_header *)(image->data + 0x1f1);
-    if (cmdline_len >= CMDLINE_MAX_LEN ||
-        (source_hdr->cmdline_size && cmdline_len > source_hdr->cmdline_size)) {
+    if (!SVMM_ABLATE_CMDLINE_ENABLED &&
+        (cmdline_len >= CMDLINE_MAX_LEN ||
+         (source_hdr->cmdline_size && cmdline_len > source_hdr->cmdline_size))) {
         errno = E2BIG;
         return -1;
     }
@@ -209,23 +214,29 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
     params.hdr.type_of_loader = 0xff;
     params.hdr.loadflags |= CAN_USE_HEAP;
     params.hdr.heap_end_ptr = 0xde00;
-    params.hdr.cmd_line_ptr = CMDLINE_ADDR;
+    params.hdr.cmd_line_ptr = SVMM_ABLATE_CMDLINE_ENABLED ? 0 : CMDLINE_ADDR;
     params.hdr.code32_start = KERNEL_ADDR;
-    params.e820_entries = 3;
-    params.e820_table[0] = (struct boot_e820_entry){
-        .addr = 0, .size = 0x10000, .type = E820_RESERVED,
-    };
-    params.e820_table[1] = (struct boot_e820_entry){
-        .addr = 0x10000, .size = 0xf0000, .type = E820_RAM,
-    };
-    params.e820_table[2] = (struct boot_e820_entry){
-        .addr = 0x100000, .size = memory->size - 0x100000, .type = E820_RAM,
-    };
+    params.e820_entries = SVMM_ABLATE_E820_ENABLED ? 0 : 3;
+    if (!SVMM_ABLATE_E820_ENABLED) {
+        params.e820_table[0] = (struct boot_e820_entry){
+            .addr = 0, .size = 0x10000, .type = E820_RESERVED,
+        };
+        params.e820_table[1] = (struct boot_e820_entry){
+            .addr = 0x10000, .size = 0xf0000, .type = E820_RAM,
+        };
+        params.e820_table[2] = (struct boot_e820_entry){
+            .addr = 0x100000, .size = memory->size - 0x100000, .type = E820_RAM,
+        };
+    }
     if (guest_memory_load(memory, KERNEL_ADDR, image->data + image->setup_size,
                           image->kernel_size) < 0 ||
         guest_memory_load(memory, SETUP_CODE_ADDR, image->data,
-                          image->setup_size) < 0 ||
-        guest_memory_load(memory, CMDLINE_ADDR, cmdline, cmdline_len + 1) < 0 ||
+                          image->setup_size) < 0)
+        return -1;
+    if (!SVMM_ABLATE_CMDLINE_ENABLED &&
+        guest_memory_load(memory, CMDLINE_ADDR, cmdline, cmdline_len + 1) < 0)
+        return -1;
+    if (!SVMM_ABLATE_BOOT_PARAMS_ENABLED &&
         guest_memory_load(memory, BOOT_PARAMS_ADDR, &params, sizeof(params)) < 0)
         return -1;
 

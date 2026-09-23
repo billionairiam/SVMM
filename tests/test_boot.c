@@ -1,8 +1,10 @@
+#include "ablation.h"
 #include "boot/linux.h"
 #include "memory.h"
 
 #include <asm/bootparam.h>
 #include <assert.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,16 +77,27 @@ int main(void)
     assert(boot_linux_prepare(&memory, &image, "console=ttyS0") == 0);
     assert(memcmp(memory.data + KERNEL_ADDR, file + 1024, 32) == 0);
     assert(memory.data[SETUP_CODE_ADDR + 0x300] == 0x5a);
+#if SVMM_ABLATE_CMDLINE_ENABLED
+    assert(memory.data[CMDLINE_ADDR] == 0);
+#else
     assert(strcmp((char *)memory.data + CMDLINE_ADDR, "console=ttyS0") == 0);
+#endif
 
     const struct boot_params *params =
         (const struct boot_params *)(memory.data + BOOT_PARAMS_ADDR);
+#if SVMM_ABLATE_BOOT_PARAMS_ENABLED
+    assert(params->hdr.header == 0);
+#else
     assert(params->hdr.version == 0x020c);
-    assert(params->hdr.cmd_line_ptr == CMDLINE_ADDR);
-    const struct setup_header *setup_hdr =
-        (const struct setup_header *)(memory.data + SETUP_CODE_ADDR + 0x1f1);
-    assert(setup_hdr->cmd_line_ptr == CMDLINE_ADDR);
     assert(params->hdr.loadflags & CAN_USE_HEAP);
+#if SVMM_ABLATE_CMDLINE_ENABLED
+    assert(params->hdr.cmd_line_ptr == 0);
+#else
+    assert(params->hdr.cmd_line_ptr == CMDLINE_ADDR);
+#endif
+#if SVMM_ABLATE_E820_ENABLED
+    assert(params->e820_entries == 0);
+#else
     assert(params->e820_entries == 3);
     assert(params->e820_table[0].addr == 0);
     assert(params->e820_table[0].size == 0x10000);
@@ -95,9 +108,22 @@ int main(void)
     assert(params->e820_table[2].addr == 0x100000);
     assert(params->e820_table[2].size == memory.size - 0x100000);
     assert(params->e820_table[2].type == 1);
+#endif
+#endif
+    const struct setup_header *setup_hdr =
+        (const struct setup_header *)(memory.data + SETUP_CODE_ADDR + 0x1f1);
+#if SVMM_ABLATE_CMDLINE_ENABLED
+    assert(setup_hdr->cmd_line_ptr == 0);
+#else
+    assert(setup_hdr->cmd_line_ptr == CMDLINE_ADDR);
+#endif
     assert(boot_linux_prepare(&memory, &image, "console=ttyS0 root=/dev/none") == 0);
+#if SVMM_ABLATE_CMDLINE_ENABLED
+    assert(memory.data[CMDLINE_ADDR] == 0);
+#else
     assert(strcmp((char *)memory.data + CMDLINE_ADDR,
                   "console=ttyS0 root=/dev/none") == 0);
+#endif
     put64(file, 0x258, 256 * 1024 * 1024);
     struct linux_image high_image = { 0 };
     char high_fixture[] = "/tmp/svmm-bzimage-high-XXXXXX";
@@ -107,7 +133,20 @@ int main(void)
     assert(close(high_fd) == 0);
     assert(boot_linux_load(high_fixture, &high_image) == 0);
     assert(high_image.runtime_start == 256 * 1024 * 1024);
+#if SVMM_ABLATE_DYNAMIC_MEMORY_ENABLED
+    assert(boot_linux_memory_size(&high_image) == 32u * 1024u * 1024u);
+    struct guest_memory blog_memory = {
+        .data = calloc(1, 32u * 1024u * 1024u),
+        .size = 32u * 1024u * 1024u,
+    };
+    assert(blog_memory.data);
+    errno = 0;
+    assert(boot_linux_prepare(&blog_memory, &high_image, "console=ttyS0") == -1);
+    assert(errno == EINVAL);
+    free(blog_memory.data);
+#else
     assert(boot_linux_memory_size(&high_image) >= 260 * 1024 * 1024);
+#endif
     assert(boot_linux_prepare(&memory, &high_image, "console=ttyS0") == -1);
     boot_linux_free(&high_image);
     assert(unlink(high_fixture) == 0);
