@@ -2,6 +2,7 @@
 
 #include "ablation.h"
 #include "kvm.h"
+#include "metrics.h"
 #include "serial.h"
 
 #include <errno.h>
@@ -132,6 +133,13 @@ int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
     return 0;
 }
 
+static int vcpu_finish(struct vcpu_run_stats *stats, const char *reason,
+                       int status)
+{
+    metric_exit(stderr, SVMM_VARIANT_NAME, reason, stats);
+    return status;
+}
+
 int vcpu_run(struct vcpu *vcpu, struct serial *serial,
              struct vcpu_run_stats *stats)
 {
@@ -142,7 +150,7 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
             if (errno == EINTR)
                 continue;
             perror("KVM_RUN");
-            return -1;
+            return vcpu_finish(stats, "kvm_error", -1);
         }
         struct kvm_run *run = vcpu->run;
         stats->entered = 1;
@@ -157,7 +165,7 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
                         stats->serial_exits);
             else
                 fprintf(stderr, "INFO: guest halted\n");
-            return 0;
+            return vcpu_finish(stats, "hlt", 0);
         }
         case KVM_EXIT_SHUTDOWN:
             fprintf(stderr, "ERROR: guest shutdown (possible triple fault)\n");
@@ -179,14 +187,14 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
                 if (run->io.direction == KVM_EXIT_IO_OUT) {
                     if (serial_handle_out(serial, run->io.port, data, data_size) < 0) {
                         perror("serial output");
-                        return -1;
+                        return vcpu_finish(stats, "serial_error", -1);
                     }
                 } else {
                     memset(data, 0, data_size);
                     for (size_t i = 0; i < run->io.count; ++i) {
                         if (serial_handle_in(serial, run->io.port,
                                              data + i * run->io.size) < 0)
-                            return -1;
+                            return vcpu_finish(stats, "serial_error", -1);
                     }
                 }
             } else {
