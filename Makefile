@@ -72,6 +72,7 @@ run: all
 
 test: bin/test_metrics
 	./bin/test_metrics
+	python3 -m unittest -v tests/test_ablation_collect.py
 	sh tests/test_loader_ablations.sh
 	sh tests/test_linux_boot.sh
 
