@@ -37,6 +37,12 @@ static uint64_t read_le64(const uint8_t *data)
     return value;
 }
 
+/* alignment 必须是 2 的幂。 */
+static uint64_t align_up(uint64_t value, uint64_t alignment)
+{
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
 /*
  * 把一个 Linux x86 bzImage 读入宿主机内存并解析启动头。
  *
@@ -102,11 +108,29 @@ int boot_linux_load(const char *path, struct linux_image *image)
 
     /* 下面这些偏移都来自 Linux x86 boot protocol 的 setup_header。 */
     uint16_t version = read_le16(data + 0x206);
+
+    /*
+     * init_size（偏移 0x260，单位：字节）：内核在能够读取 e820 内存表前，
+     * 从 runtime_start 开始所需的连续内存长度。它不是启动 Linux 所需的
+     * 总内存大小，而是内核早期初始化阶段必须保证可用的内存窗口大小。
+     */
     uint32_t init_size;
     memcpy(&init_size, data + 0x260, sizeof(init_size));
+
+    /*
+     * preferred（pref_address，偏移 0x258，单位：客户机物理地址）：内核
+     * 希望最终运行的位置。不可重定位内核必须在这里运行；可重定位内核在
+     * 当前载入地址低于该地址时，也会把自己移动到这里。
+     */
     uint64_t preferred = read_le64(data + 0x258);
-    uint32_t alignment;
-    memcpy(&alignment, data + 0x230, sizeof(alignment));
+
+    /*
+     * kernel_alignment（偏移 0x230，单位：字节）：可重定位
+     * 内核运行地址必须满足的对齐值，例如 0x200000 表示按 2 MiB 对齐。
+     * 协议要求它是 2 的幂，后面据此把 runtime_start 向上取整。
+     */
+    uint32_t kernel_alignment;
+    memcpy(&kernel_alignment, data + 0x230, sizeof(kernel_alignment));
     int relocatable = data[0x234] != 0;
 
     /*
@@ -116,22 +140,22 @@ int boot_linux_load(const char *path, struct linux_image *image)
      */
     uint64_t runtime_start = relocatable ?
         (preferred > KERNEL_ADDR ? preferred : KERNEL_ADDR) : preferred;
-    if (relocatable && preferred <= UINT32_MAX && alignment &&
-        !(alignment & (alignment - 1)))
-        runtime_start = (runtime_start + alignment - 1) &
-                        ~((uint64_t)alignment - 1);
+    if (relocatable && preferred <= UINT32_MAX && kernel_alignment &&
+        !(kernel_alignment & (kernel_alignment - 1)))
+        runtime_start = align_up(runtime_start, kernel_alignment);
 
     /*
      * 只接受本阶段支持的镜像：带 HdrS 的现代 bzImage、启动协议至少 2.12、
      * 使用高地址载入，并且 setup、压缩载荷及初始化内存窗口均在合法范围内。
-     * alignment 必须是 2 的幂，才能使用上面的位运算完成向上对齐。
+     * kernel_alignment 必须是 2 的幂，才能交给 align_up() 计算。
      */
     if (memcmp(data + 0x202, "HdrS", 4) != 0 ||
         version < BOOT_PROTOCOL_MIN || !(data[0x211] & LOADED_HIGH) ||
         data[0x201] < 0x62 || setup_size > 0x10000 || setup_size >= size ||
         init_size == 0 || init_size > BZIMAGE_MAX_SIZE ||
         init_size < size - setup_size || preferred > UINT32_MAX ||
-        (relocatable && (!alignment || (alignment & (alignment - 1)))) ||
+        (relocatable && (!kernel_alignment ||
+                           (kernel_alignment & (kernel_alignment - 1)))) ||
         runtime_start + init_size > UINT32_MAX) {
         fprintf(stderr, "unsupported or malformed x86 bzImage\n");
         free(data);
@@ -152,8 +176,8 @@ size_t boot_linux_memory_size(const struct linux_image *image)
 {
     size_t size = (size_t)image->runtime_start + image->init_size +
                   32u * 1024u * 1024u;
-    const size_t alignment = 2u * 1024u * 1024u;
-    size = (size + alignment - 1) & ~(alignment - 1);
+    const size_t memory_alignment = 2u * 1024u * 1024u;
+    size = (size_t)align_up(size, memory_alignment);
     return size < GUEST_MEMORY_MIN_SIZE ? GUEST_MEMORY_MIN_SIZE : size;
 }
 
