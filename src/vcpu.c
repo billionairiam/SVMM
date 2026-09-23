@@ -1,5 +1,6 @@
 #include "vcpu.h"
 
+#include "ablation.h"
 #include "kvm.h"
 #include "serial.h"
 
@@ -73,46 +74,50 @@ int vcpu_init(struct vcpu *vcpu, const struct kvm_context *kvm, unsigned id)
         return -1;
     }
     vcpu->run = mapping;
+    if (SVMM_ABLATE_CPUID_ENABLED)
+        return 0;
     return vcpu_setup_cpuid(vcpu, kvm->system_fd);
 }
 
 int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
                           unsigned boot_params_addr)
 {
-    struct kvm_sregs sregs;
-    if (ioctl(vcpu->fd, KVM_GET_SREGS, &sregs) < 0) {
-        perror("KVM_GET_SREGS");
-        return -1;
-    }
-    /* The 32-bit boot protocol enters the compressed kernel directly. */
-    struct kvm_segment code = {
-        .base = 0,
-        .limit = 0xffffffff,
-        .selector = 0x10,
-        .type = 0xb,
-        .present = 1,
-        .s = 1,
-        .db = 1,
-        .g = 1,
-    };
-    struct kvm_segment data = code;
-    data.selector = 0x18;
-    data.type = 0x3;
-    sregs.cs = code;
-    sregs.ds = data;
-    sregs.es = data;
-    sregs.fs = data;
-    sregs.gs = data;
-    sregs.ss = data;
-    sregs.gdt.base = 0x500;
-    sregs.gdt.limit = 4 * 8 - 1;
-    sregs.cr0 = (sregs.cr0 | 1u) & ~(1u << 31);
-    sregs.cr3 = 0;
-    sregs.cr4 = 0;
-    sregs.efer = 0;
-    if (ioctl(vcpu->fd, KVM_SET_SREGS, &sregs) < 0) {
-        perror("KVM_SET_SREGS");
-        return -1;
+    if (!SVMM_ABLATE_PROTECTED_MODE_ENABLED) {
+        struct kvm_sregs sregs;
+        if (ioctl(vcpu->fd, KVM_GET_SREGS, &sregs) < 0) {
+            perror("KVM_GET_SREGS");
+            return -1;
+        }
+        /* The 32-bit boot protocol enters the compressed kernel directly. */
+        struct kvm_segment code = {
+            .base = 0,
+            .limit = 0xffffffff,
+            .selector = 0x10,
+            .type = 0xb,
+            .present = 1,
+            .s = 1,
+            .db = 1,
+            .g = 1,
+        };
+        struct kvm_segment data = code;
+        data.selector = 0x18;
+        data.type = 0x3;
+        sregs.cs = code;
+        sregs.ds = data;
+        sregs.es = data;
+        sregs.fs = data;
+        sregs.gs = data;
+        sregs.ss = data;
+        sregs.gdt.base = 0x500;
+        sregs.gdt.limit = 4 * 8 - 1;
+        sregs.cr0 = (sregs.cr0 | 1u) & ~(1u << 31);
+        sregs.cr3 = 0;
+        sregs.cr4 = 0;
+        sregs.efer = 0;
+        if (ioctl(vcpu->fd, KVM_SET_SREGS, &sregs) < 0) {
+            perror("KVM_SET_SREGS");
+            return -1;
+        }
     }
     struct kvm_regs regs = {
         .rip = kernel_addr,
@@ -127,11 +132,11 @@ int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
     return 0;
 }
 
-int vcpu_run(struct vcpu *vcpu, struct serial *serial)
+int vcpu_run(struct vcpu *vcpu, struct serial *serial,
+             struct vcpu_run_stats *stats)
 {
     unsigned ignored_io = 0;
-    unsigned long exits = 0;
-    unsigned long serial_exits = 0;
+    *stats = (struct vcpu_run_stats){ 0 };
     for (;;) {
         if (ioctl(vcpu->fd, KVM_RUN, 0) < 0) {
             if (errno == EINTR)
@@ -140,13 +145,16 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial)
             return -1;
         }
         struct kvm_run *run = vcpu->run;
-        ++exits;
+        stats->entered = 1;
+        ++stats->exits;
+        stats->exit_reason = run->exit_reason;
         switch (run->exit_reason) {
         case KVM_EXIT_HLT: {
             struct kvm_regs regs;
             if (ioctl(vcpu->fd, KVM_GET_REGS, &regs) == 0)
                 fprintf(stderr, "INFO: guest halted at RIP=0x%llx exits=%lu serial=%lu\n",
-                        (unsigned long long)regs.rip, exits, serial_exits);
+                        (unsigned long long)regs.rip, stats->exits,
+                        stats->serial_exits);
             else
                 fprintf(stderr, "INFO: guest halted\n");
             return 0;
@@ -166,8 +174,8 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial)
                 return -1;
             }
             uint8_t *data = (uint8_t *)run + offset;
-            if (serial_handles_port(run->io.port)) {
-                ++serial_exits;
+            if (!SVMM_ABLATE_UART_ENABLED && serial_handles_port(run->io.port)) {
+                ++stats->serial_exits;
                 if (run->io.direction == KVM_EXIT_IO_OUT) {
                     if (serial_handle_out(serial, run->io.port, data, data_size) < 0) {
                         perror("serial output");

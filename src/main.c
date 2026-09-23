@@ -44,7 +44,8 @@ int main(int argc, char **argv)
     if (vcpu_setup_linux_boot(&vcpu, KERNEL_ADDR, BOOT_PARAMS_ADDR) < 0)
         goto done;
     serial_init(&serial, STDOUT_FILENO);
-    int run_result = vcpu_run(&vcpu, &serial);
+    struct vcpu_run_stats run_stats = { 0 };
+    int run_result = vcpu_run(&vcpu, &serial, &run_stats);
     if (run_result == 0) {
         fprintf(stderr, "INFO: Stage 02 completed\n");
         status = 0;
