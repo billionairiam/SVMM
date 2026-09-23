@@ -435,6 +435,10 @@ def _report(
 ) -> None:
     functional = [row for row in rows if row["experiment"] == "functional"]
     performance = [row for row in summaries if row["experiment"] == "performance"]
+    timed_out_runs: dict[tuple[str, str], int] = defaultdict(int)
+    for row in rows:
+        if row["experiment"] == "performance" and row["timed_out"] == "1":
+            timed_out_runs[(row["kernel"], row["variant"])] += 1
     lines = [
         "# Stage 02 消融实验报告",
         "",
@@ -475,19 +479,21 @@ def _report(
             "",
             "## 性能结果",
             "",
-            "| 变体 | 次数 | 终点识别率 | 时间均值 ms | 时间范围 ms | exits 均值 | RSS 均值 KiB |",
-            "| --- | ---: | ---: | ---: | --- | ---: | ---: |",
+            "| 变体 | 次数 | 终点识别率 | 超时次数 | 时间均值 ms | 时间范围 ms | exits 均值 | RSS 均值 KiB |",
+            "| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |",
         ]
     )
     if performance:
         for row in performance:
             lines.append(
                 f"| {row['variant']} | {row['runs']} | {row['success_rate']} | "
-                f"{row['wall_ms_avg']} | {row['wall_ms_min']}–{row['wall_ms_max']} | "
+                f"{timed_out_runs[(row['kernel'], row['variant'])]} | "
+                f"{row['wall_ms_avg']} | "
+                f"{row['wall_ms_min']}–{row['wall_ms_max']} | "
                 f"{row['exits_avg']} | {row['max_rss_kib_avg']} |"
             )
     else:
-        lines.append("| 无符合条件的变体 | 0 | 0.000 |  |  |  |  |")
+        lines.append("| 无符合条件的变体 | 0 | 0.000 | 0 |  |  |  |  |")
     lines.extend(["", "## 逐项解释", ""])
     primary_rows = {row["variant"]: row for row in functional if row["kernel"] == "primary"}
     for variant in VARIANTS:
@@ -505,6 +511,7 @@ def _report(
             "",
             "- 结果只适用于记录的内核、宿主机 KVM 和当前 Stage 02 实现。",
             "- 超时表示观察窗口内没有终止，不能单独证明客户机崩溃。",
+            "- 性能表中的超时运行墙钟值是观察窗口长度，不代表到达 panic 或成功启动的耗时。",
             "- 无 Linux 串口日志的变体只能依据宿主机 KVM exit 判断进度。",
             "- 超时终止的进程无法输出最终 exit 计数，且 `/usr/bin/time` 可能无法写入 RSS；这些不可得值留空。",
             "- 最大 RSS 包含 VMM 进程及 `/usr/bin/time` 观测到的宿主机开销。",

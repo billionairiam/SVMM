@@ -58,6 +58,11 @@ bin/test_boot: tests/test_boot.c src/boot/linux.c src/boot/linux.h src/memory.c 
 bin/test_metrics: tests/test_metrics.c src/metrics.c src/metrics.h src/vcpu.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_metrics.c src/metrics.c -o $@
 
+bin/test_vcpu_errors: tests/test_vcpu_errors.c src/vcpu.c src/vcpu.h \
+                      src/serial.c src/serial.h src/metrics.c src/metrics.h | bin
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_vcpu_errors.c src/vcpu.c \
+		src/serial.c src/metrics.c -Wl,--wrap=ioctl -o $@
+
 build/%.o: src/%.c | build
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
@@ -71,8 +76,9 @@ bin/ablation/%:
 run: all
 	@./bin/linux_boot
 
-test: bin/test_metrics
+test: bin/test_metrics bin/test_vcpu_errors
 	./bin/test_metrics
+	./bin/test_vcpu_errors
 	python3 -m unittest -v tests/test_ablation_collect.py
 	sh tests/test_loader_ablations.sh
 	sh tests/test_linux_boot.sh
