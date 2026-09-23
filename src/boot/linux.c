@@ -37,35 +37,31 @@ static uint64_t read_le64(const uint8_t *data)
     return value;
 }
 
-// open(path, O_RDONLY) 打开 bzImage。
-// fstat() 检查文件大小。
-// 将整个文件读入宿主机缓冲区。
-// 验证偏移 0x202 处的 "HdrS" 签名。
-// 读取偏移 0x1f1 处的 setup_sects。
-// 验证启动协议版本。
-// 计算载荷偏移：(setup_sects + 1) * 512。
-// 分离出两部分：
-// +-------------------------------+  文件偏移 0x0000
-// | 引导扇区 + 设置代码            |  实模式设置代码
-// +-------------------------------+  文件偏移 0x01f1
-// | setup_header                  |  Linux 启动协议字段
-// | - setup_sects                 |  设置扇区数
-// | - HdrS 签名                   |  在偏移 0x202
-// | - version                     |  启动协议版本
-// | - loadflags                   |  标志如 LOADED_HIGH
-// | - cmd_line_ptr                |  内核命令行指针
-// | - ramdisk_image / size        |  initrd 字段（Stage 03+）
-// +-------------------------------+  (setup_sects + 1) * 512
-// | 压缩内核载荷                   |  复制到 0x00100000
-// +-------------------------------+
+/*
+ * 把一个 Linux x86 bzImage 读入宿主机内存并解析启动头。
+ *
+ * bzImage 由两部分组成：
+ *   [引导扇区 + setup 代码][压缩内核载荷]
+ *                            ^ setup_size，也是内核载荷的文件偏移
+ *
+ * 本函数只负责读取和验证镜像。把各部分复制进客户机内存的工作由
+ * boot_linux_prepare() 完成。
+ */
 int boot_linux_load(const char *path, struct linux_image *image)
 {
+    /* 先清空输出，确保任意失败路径都能安全调用 boot_linux_free()。 */
     *image = (struct linux_image){ 0 };
+
+    /* O_CLOEXEC 防止以后执行其他程序时把镜像文件描述符泄漏过去。 */
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         perror("open bzImage");
         return -1;
     }
+    /*
+     * 在分配内存前检查文件大小：0x264 是当前会读取到的最后一个
+     * 启动头字段 init_size 的末尾，512 MiB 是本程序设置的安全上限。
+     */
     struct stat statbuf;
     if (fstat(fd, &statbuf) < 0 || statbuf.st_size < 0 ||
         statbuf.st_size > BZIMAGE_MAX_SIZE || statbuf.st_size < 0x264) {
@@ -80,6 +76,7 @@ int boot_linux_load(const char *path, struct linux_image *image)
         close(fd);
         return -1;
     }
+    /* read() 可能被信号中断或只读取一部分，因此循环直到读完整个文件。 */
     size_t offset = 0;
     while (offset < size) {
         ssize_t n = read(fd, data + offset, size - offset);
@@ -94,9 +91,16 @@ int boot_linux_load(const char *path, struct linux_image *image)
         offset += (size_t)n;
     }
     close(fd);
-    // 计算设置代码占用的 512 字节扇区数；值为 0 时视为 4
+
+    /*
+     * setup_sects 位于文件偏移 0x1f1，记录 boot sector 后面还有多少个
+     * setup 扇区。协议规定值为 0 时按 4 处理；再加 1 才包含 boot sector。
+     * 所以 setup_size 同时也是压缩内核载荷在文件中的起始偏移。
+     */
     size_t setup_sectors = data[0x1f1] ? data[0x1f1] : 4;
     size_t setup_size = (setup_sectors + 1) * 512;
+
+    /* 下面这些偏移都来自 Linux x86 boot protocol 的 setup_header。 */
     uint16_t version = read_le16(data + 0x206);
     uint32_t init_size;
     memcpy(&init_size, data + 0x260, sizeof(init_size));
@@ -104,12 +108,24 @@ int boot_linux_load(const char *path, struct linux_image *image)
     uint32_t alignment;
     memcpy(&alignment, data + 0x230, sizeof(alignment));
     int relocatable = data[0x234] != 0;
+
+    /*
+     * init_size 从“内核最终运行地址”开始计算，而不是固定从 1 MiB 计算。
+     * 可重定位内核会选择 max(载入地址, 首选地址)，然后向上对齐；不可
+     * 重定位内核必须使用镜像指定的 preferred 地址。后续据此分配客户机内存。
+     */
     uint64_t runtime_start = relocatable ?
         (preferred > KERNEL_ADDR ? preferred : KERNEL_ADDR) : preferred;
     if (relocatable && preferred <= UINT32_MAX && alignment &&
         !(alignment & (alignment - 1)))
         runtime_start = (runtime_start + alignment - 1) &
                         ~((uint64_t)alignment - 1);
+
+    /*
+     * 只接受本阶段支持的镜像：带 HdrS 的现代 bzImage、启动协议至少 2.12、
+     * 使用高地址载入，并且 setup、压缩载荷及初始化内存窗口均在合法范围内。
+     * alignment 必须是 2 的幂，才能使用上面的位运算完成向上对齐。
+     */
     if (memcmp(data + 0x202, "HdrS", 4) != 0 ||
         version < BOOT_PROTOCOL_MIN || !(data[0x211] & LOADED_HIGH) ||
         data[0x201] < 0x62 || setup_size > 0x10000 || setup_size >= size ||
@@ -121,6 +137,8 @@ int boot_linux_load(const char *path, struct linux_image *image)
         free(data);
         return -1;
     }
+
+    /* 保存解析结果；image->data 的所有权转交给调用者。 */
     image->data = data;
     image->size = size;
     image->setup_size = setup_size;
