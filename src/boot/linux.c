@@ -185,9 +185,41 @@ size_t boot_linux_memory_size(const struct linux_image *image)
     return size < GUEST_MEMORY_MIN_SIZE ? GUEST_MEMORY_MIN_SIZE : size;
 }
 
+/*
+ * 按 Linux x86 boot protocol 把已经解析过的 bzImage 放入客户机内存。
+ * 本阶段不执行 16 位 setup 代码，而是直接以 32 位保护模式跳到
+ * KERNEL_ADDR，并让 RSI 指向 BOOT_PARAMS_ADDR。
+ *
+ * 主要客户机物理地址布局：
+ *
+ *   0x00000500  GDT
+ *   0x00009000  struct boot_params（zero page）
+ *   0x00010000  bzImage 的 boot sector 和 setup 代码副本
+ *   0x00020000  以 NUL 结尾的内核命令行
+ *   0x00100000  压缩内核载荷，即 32 位入口
+ *
+ * boot_params 中本函数关心的协议偏移：
+ *
+ *   0x1e8  e820_entries           e820 条目数
+ *   0x1f1  hdr.setup_sects        setup 扇区数
+ *   0x210  hdr.type_of_loader     引导加载器 ID
+ *   0x211  hdr.loadflags          CAN_USE_HEAP 等标志
+ *   0x228  hdr.cmd_line_ptr       命令行客户机物理地址
+ *   0x230  hdr.kernel_alignment   可重定位内核的对齐要求
+ *   0x234  hdr.relocatable_kernel 可重定位标志
+ *   0x238  hdr.cmdline_size       镜像允许的最大命令行长度
+ *   0x258  hdr.pref_address       内核首选运行地址
+ *   0x260  hdr.init_size          早期初始化内存窗口大小
+ *   0x2d0  e820_table             BIOS 风格物理内存表
+ */
 int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *image,
                        const char *cmdline)
 {
+    /*
+     * 在进行任何复制前验证内核最终运行窗口、压缩载荷、setup 副本，
+     * 以及 setup 与命令行之间的边界。减法形式的检查可以避免
+     * address + size 本身发生整数溢出。
+     */
     if (!memory->data || !image->data || memory->size < KERNEL_ADDR ||
         image->runtime_start > memory->size ||
         image->init_size > memory->size - image->runtime_start ||
@@ -196,6 +228,12 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
         errno = EINVAL;
         return -1;
     }
+
+    /*
+     * cmdline_size 来自镜像启动头；本实现还设置了 4096 字节的本地上限。
+     * 两个上限都不包含最后写入客户机内存的 NUL。no_cmdline 消融项不会
+     * 使用命令行，因此也不应该因为宿主机传入的字符串过长而提前失败。
+     */
     size_t cmdline_len = strlen(cmdline);
     const struct setup_header *source_hdr =
         (const struct setup_header *)(image->data + 0x1f1);
@@ -206,16 +244,32 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
         return -1;
     }
 
+    /*
+     * zero page 必须先清零，再只复制镜像声明存在的 setup_header 字节。
+     * 这样旧协议中不存在的尾部字段保持为 0，也不会越过本地结构体。
+     */
     struct boot_params params = { 0 };
     size_t header_size = image->data[0x201] + 0x202 - 0x1f1;
     if (header_size > sizeof(params.hdr))
         header_size = sizeof(params.hdr);
     memcpy(&params.hdr, source_hdr, header_size);
+
+    /*
+     * 0xff 表示未登记的引导器。CAN_USE_HEAP/heap_end_ptr 告诉早期 setup
+     * 代码低端内存中可用堆的末端；code32_start 则明确 32 位入口为 1 MiB。
+     * 当前 VMM 直接进入 code32_start，但仍把这些字段填写完整，保证
+     * zero page 与 Linux boot protocol 一致。
+     */
     params.hdr.type_of_loader = 0xff;
     params.hdr.loadflags |= CAN_USE_HEAP;
     params.hdr.heap_end_ptr = 0xde00;
     params.hdr.cmd_line_ptr = SVMM_ABLATE_CMDLINE_ENABLED ? 0 : CMDLINE_ADDR;
     params.hdr.code32_start = KERNEL_ADDR;
+    /*
+     * 告诉内核哪些客户机物理地址可以分配：最低 64 KiB 保留，
+     * 64 KiB 到 1 MiB 可用，1 MiB 以上一直覆盖实际分配的客户机内存。
+     * no_e820 只把条目数设为 0，供消融实验观察内核的失败位置。
+     */
     params.e820_entries = SVMM_ABLATE_E820_ENABLED ? 0 : 3;
     if (!SVMM_ABLATE_E820_ENABLED) {
         params.e820_table[0] = (struct boot_e820_entry){
@@ -228,19 +282,39 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
             .addr = 0x100000, .size = memory->size - 0x100000, .type = E820_RAM,
         };
     }
+    /*
+     * bzImage 文件在 setup_size 处分成两部分。后半段压缩内核放到 1 MiB
+     * 并作为 vCPU 的入口；前半段保留在 64 KiB，便于内核和调试代码检查
+     * 原始 setup 区，但当前启动路径不会从那里执行。
+     */
     if (guest_memory_load(memory, KERNEL_ADDR, image->data + image->setup_size,
                           image->kernel_size) < 0 ||
         guest_memory_load(memory, SETUP_CODE_ADDR, image->data,
                           image->setup_size) < 0)
         return -1;
+    /* 命令行包含结尾 NUL；cmd_line_ptr 在前面已指向同一个地址。 */
     if (!SVMM_ABLATE_CMDLINE_ENABLED &&
         guest_memory_load(memory, CMDLINE_ADDR, cmdline, cmdline_len + 1) < 0)
         return -1;
+
+    /*
+     * vCPU 进入内核时 RSI 指向这里。no_boot_params 消融项保留其他载入
+     * 步骤，只跳过 zero page，从而一次只移除一个启动组件。
+     */
     if (!SVMM_ABLATE_BOOT_PARAMS_ENABLED &&
         guest_memory_load(memory, BOOT_PARAMS_ADDR, &params, sizeof(params)) < 0)
         return -1;
 
-    /* Selectors 0x10 and 0x18 required by the x86 32-bit boot protocol. */
+    /*
+     * 保护模式下，CS/DS/SS 保存的是 GDT selector，而不是段基址。
+     * vcpu_setup_linux_boot() 会把 CS 设为 0x10（GDT index 2），把数据段
+     * 设为 0x18（index 3）。两个描述符的 base 都是 0，limit 都覆盖 4 GiB：
+     *
+     *   index 0  0x0000000000000000  空描述符
+     *   index 1  0x0000000000000000  保留
+     *   index 2  0x00cf9b000000ffff  32 位可执行代码段
+     *   index 3  0x00cf93000000ffff  32 位可写数据段
+     */
     const uint64_t gdt[4] = {
         0,
         0,
@@ -250,7 +324,11 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
     if (guest_memory_load(memory, 0x500, gdt, sizeof(gdt)) < 0)
         return -1;
 
-    /* Keep the loaded real-mode setup header consistent for inspection. */
+    /*
+     * params.hdr 已被本函数修改，所以同步更新 64 KiB 处 setup 副本中的
+     * 启动头。zero page 和 setup 副本由此不会显示互相矛盾的入口、堆和
+     * 命令行信息；即使 no_boot_params 跳过 zero page，该副本仍可供检查。
+     */
     memcpy(memory->data + SETUP_CODE_ADDR + 0x1f1,
            &params.hdr, sizeof(params.hdr));
     return 0;
