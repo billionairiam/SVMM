@@ -1,0 +1,8 @@
+SVMM_METRIC variant=no_boot_params stage=image_loaded guest_memory_bytes=0
+SVMM_METRIC variant=no_boot_params stage=memory guest_memory_bytes=134217728
+SVMM_METRIC variant=no_boot_params stage=memory_mapped guest_memory_bytes=134217728
+SVMM_METRIC variant=no_boot_params stage=boot_prepared guest_memory_bytes=134217728
+SVMM_METRIC variant=no_boot_params stage=vcpu_setup guest_memory_bytes=134217728
+SVMM_METRIC variant=no_boot_params stage=kvm_run guest_memory_bytes=134217728
+ERROR: guest shutdown (possible triple fault)
+SVMM_METRIC variant=no_boot_params stage=vcpu_exit reason=shutdown entered=1 exits=1 serial_exits=0

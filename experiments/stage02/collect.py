@@ -136,7 +136,7 @@ def classify(
     metrics = parse_metrics(stderr)
     stage = metrics.get("stage", "")
     reason = metrics.get("reason", "")
-    panic = "Kernel panic - not syncing: VFS: Unable to mount root fs" in stdout
+    panic = "Kernel panic - not syncing:" in stdout
     linux_version = "Linux version" in stdout
     e820 = "BIOS-e820" in stdout
     loader_stages = {
@@ -167,7 +167,7 @@ def classify(
         e820=e820,
         serial_output=bool(stdout.strip()),
         panic=panic,
-        entered=_as_int(metrics.get("entered")),
+        entered=max(_as_int(metrics.get("entered")), int(stage == "kvm_run")),
         guest_memory_bytes=_as_int(metrics.get("guest_memory_bytes")),
         exit_reason=reason,
         exits=_as_int(metrics.get("exits")),
@@ -326,7 +326,7 @@ def _sha256(path: Path) -> str:
 
 def _write_csv(path: Path, fieldnames: tuple[str, ...], rows: list[dict[str, str]]) -> None:
     with path.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer = csv.DictWriter(stream, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -360,6 +360,7 @@ def _result_row(
     result = classify(stdout, stderr, execution.returncode, execution.timed_out)
     timing_path.unlink(missing_ok=True)
     final_prefix = Path("experiments/stage02/results/logs")
+    has_final_exit = bool(result.exit_reason) or not result.entered
     return {
         "kernel": kernel_label,
         "kernel_path": str(kernel_path),
@@ -377,10 +378,10 @@ def _result_row(
         "serial_output": "1" if result.serial_output else "0",
         "panic": "1" if result.panic else "0",
         "exit_reason": result.exit_reason,
-        "exits": str(result.exits),
-        "serial_exits": str(result.serial_exits),
+        "exits": str(result.exits) if has_final_exit else "",
+        "serial_exits": str(result.serial_exits) if has_final_exit else "",
         "wall_ms": str(execution.wall_ms),
-        "max_rss_kib": str(execution.max_rss_kib),
+        "max_rss_kib": str(execution.max_rss_kib) if execution.max_rss_kib else "",
         "stdout_path": str(final_prefix / stdout_path.name),
         "stderr_path": str(final_prefix / stderr_path.name),
     }
@@ -437,14 +438,14 @@ def _report(
         lines.append(
             f"| {row['kernel']} | {row['variant']} | {row['primary_result']} | "
             f"{row['linux_version']} | {row['e820']} | {row['serial_output']} | "
-            f"{row['exits']} | {row['timed_out']} |"
+            f"{row['exits'] or '未记录'} | {row['timed_out']} |"
         )
     lines.extend(
         [
             "",
             "## 性能结果",
             "",
-            "| 变体 | 次数 | 成功率 | 时间均值 ms | 时间范围 ms | exits 均值 | RSS 均值 KiB |",
+            "| 变体 | 次数 | 终点识别率 | 时间均值 ms | 时间范围 ms | exits 均值 | RSS 均值 KiB |",
             "| --- | ---: | ---: | ---: | --- | ---: | ---: |",
         ]
     )
@@ -475,6 +476,7 @@ def _report(
             "- 结果只适用于记录的内核、宿主机 KVM 和当前 Stage 02 实现。",
             "- 超时表示观察窗口内没有终止，不能单独证明客户机崩溃。",
             "- 无 Linux 串口日志的变体只能依据宿主机 KVM exit 判断进度。",
+            "- 超时终止的进程无法输出最终 exit 计数，且 `/usr/bin/time` 可能无法写入 RSS；这些不可得值留空。",
             "- 最大 RSS 包含 VMM 进程及 `/usr/bin/time` 观测到的宿主机开销。",
             "",
         ]
@@ -581,12 +583,89 @@ def run_experiment(
         raise
 
 
+def validate_results(repo: Path, results: Path, performance_runs: int) -> None:
+    raw_path = results / "raw.csv"
+    summary_path = results / "summary.csv"
+    report_path = results / "report.md"
+    try:
+        with raw_path.open(newline="") as stream:
+            reader = csv.DictReader(stream)
+            if reader.fieldnames != list(RAW_FIELDS):
+                raise RuntimeError("raw.csv header does not match the declared schema")
+            rows = list(reader)
+        with summary_path.open(newline="") as stream:
+            reader = csv.DictReader(stream)
+            if reader.fieldnames != list(SUMMARY_FIELDS):
+                raise RuntimeError("summary.csv header does not match the declared schema")
+            summary_rows = list(reader)
+        report = report_path.read_text()
+    except FileNotFoundError as error:
+        raise RuntimeError(f"result artifact is missing: {error.filename}") from error
+
+    if any(None in row for row in rows) or any(None in row for row in summary_rows):
+        raise RuntimeError("CSV row has more columns than its declared header")
+
+    functional = [row for row in rows if row["experiment"] == "functional"]
+    expected_matrix = {(kernel, variant) for kernel in ("primary", "compat") for variant in VARIANTS}
+    actual_matrix = {(row["kernel"], row["variant"]) for row in functional}
+    if len(functional) != 16 or actual_matrix != expected_matrix:
+        raise RuntimeError("expected exactly 16 functional rows covering both kernels")
+
+    eligible = {
+        row["variant"]
+        for row in functional
+        if row["kernel"] == "primary"
+        and row["linux_version"] == "1"
+        and row["primary_result"] in {"halted", "panic"}
+    }
+    performance = [row for row in rows if row["experiment"] == "performance"]
+    for variant in VARIANTS:
+        variant_rows = [
+            row
+            for row in performance
+            if row["kernel"] == "primary" and row["variant"] == variant
+        ]
+        expected = performance_runs if variant in eligible else 0
+        if len(variant_rows) != expected:
+            raise RuntimeError(
+                f"expected {expected} performance rows for {variant}, got {len(variant_rows)}"
+            )
+    if any(row["kernel"] != "primary" for row in performance):
+        raise RuntimeError("performance rows must use the primary kernel")
+
+    for row in rows:
+        for field in ("stdout_path", "stderr_path"):
+            if not (repo / row[field]).is_file():
+                raise RuntimeError(f"referenced log is missing: {row[field]}")
+
+    expected_summaries = {
+        (row["kernel"], row["variant"], row["experiment"]): row
+        for row in summarize(rows)
+    }
+    actual_summaries = {
+        (row["kernel"], row["variant"], row["experiment"]): row
+        for row in summary_rows
+    }
+    if set(actual_summaries) != set(expected_summaries):
+        raise RuntimeError("summary groups do not match raw.csv groups")
+    for key, expected in expected_summaries.items():
+        actual = actual_summaries[key]
+        for field in ("runs", *RESULT_KINDS):
+            if actual[field] != expected[field]:
+                raise RuntimeError(f"summary count mismatch for {key}: {field}")
+
+    for digest in {row["kernel_sha256"] for row in rows}:
+        if digest not in report:
+            raise RuntimeError(f"report does not contain kernel hash: {digest}")
+
+
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--primary-kernel", type=Path, default=Path(PRIMARY_KERNEL))
     parser.add_argument("--compat-kernel", type=Path, default=Path(COMPAT_KERNEL))
     parser.add_argument("--performance-runs", type=int, default=PERFORMANCE_RUNS)
     parser.add_argument("--timeout", type=float, default=TIMEOUT_SECONDS)
+    parser.add_argument("--validate-results", action="store_true")
     return parser.parse_args()
 
 
@@ -597,6 +676,14 @@ def main() -> int:
     if args.timeout <= 0:
         raise SystemExit("--timeout must be positive")
     repo = Path(__file__).resolve().parents[2]
+    if args.validate_results:
+        validate_results(
+            repo,
+            repo / "experiments" / "stage02" / "results",
+            args.performance_runs,
+        )
+        print("PASS: Stage 02 ablation results are internally consistent")
+        return 0
     run_experiment(
         repo,
         args.primary_kernel.resolve(),

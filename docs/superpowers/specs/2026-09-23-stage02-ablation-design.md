@@ -98,7 +98,7 @@ experiments/stage02/results/logs/
 - 是否出现 `Linux version`
 - 是否出现 BIOS-e820 日志
 - 是否出现串口输出
-- 是否出现 VFS panic
+- 是否出现明确的 kernel panic
 - KVM exit 总次数
 - 串口 I/O exit 次数
 - 墙钟时间，单位毫秒
@@ -113,7 +113,7 @@ experiments/stage02/results/logs/
 
 1. `loader_rejected`：进入 `KVM_RUN` 前因镜像或内存布局被拒绝。
 2. `triple_fault`：收到 `KVM_EXIT_SHUTDOWN`。
-3. `panic`：日志包含明确的 VFS 根文件系统 panic。
+3. `panic`：日志包含明确的 `Kernel panic - not syncing:`。这包括 VFS 根文件系统 panic，也包括消融组件后暴露出的更早期 panic。
 4. `halted`：收到 `KVM_EXIT_HLT`。
 5. `booted`：出现 `Linux version`，但没有出现以上终止状态。
 6. `timeout`：15 秒到期且没有更具体的已识别状态。

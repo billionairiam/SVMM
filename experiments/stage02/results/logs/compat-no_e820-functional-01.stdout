@@ -1,0 +1,57 @@
+[    0.000000] Linux version 6.18.0 (root@master) (gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0, GNU ld (GNU Binutils for Ubuntu) 2.42) #1 SMP PREEMPT_DYNAMIC Tue Dec 16 09:34:48 CST 2025
+[    0.000000] Command line: console=ttyS0 earlycon=uart8250,io,0x3f8
+[    0.000000] KERNEL supported cpus:
+[    0.000000]   Intel GenuineIntel
+[    0.000000]   AMD AuthenticAMD
+[    0.000000]   Hygon HygonGenuine
+[    0.000000]   Centaur CentaurHauls
+[    0.000000]   zhaoxin   Shanghai  
+[    0.000000] Disabled fast string operations
+[    0.000000] x86/split lock detection: #DB: warning on user-space bus_locks
+[    0.000000] BIOS-provided physical RAM map:
+[    0.000000] BIOS-e801: [mem 0x0000000000000000-0x000000000009efff] usable
+[    0.000000] earlycon: uart8250 at I/O port 0x3f8 (options '')
+[    0.000000] printk: legacy bootconsole [uart8250] enabled
+[    0.000000] NX (Execute Disable) protection: active
+[    0.000000] APIC: Static calls initialized
+[    0.000000] DMI not present or invalid.
+[    0.000000] Hypervisor detected: KVM
+[    0.000000] last_pfn = 0x9f max_arch_pfn = 0x10000000000
+[    0.000000] kvm-clock: Using msrs 4b564d01 and 4b564d00
+[    0.000001] kvm-clock: using sched offset of 233362294 cycles
+[    0.000526] clocksource: kvm-clock: mask: 0xffffffffffffffff max_cycles: 0x1cd42e4dffb, max_idle_ns: 881590591483 ns
+[    0.002162] tsc: Detected 2200.000 MHz processor
+[    0.002634] .text .data .bss are not marked as E820_TYPE_RAM!
+[    0.003226] last_pfn = 0x4430 max_arch_pfn = 0x10000000000
+[    0.003828] MTRRs disabled by BIOS
+[    0.004171] x86/PAT: Configuration [0-7]: WB  WC  UC- UC  WB  WP  UC- WT  
+[    0.024831] Using GB pages for direct mapping
+[    0.025364] Failed to release memory for alloc_low_pages()
+[    0.025398] Kernel panic - not syncing: alloc_low_pages: can not alloc memory
+[    0.026695] CPU: 0 UID: 0 PID: 0 Comm: swapper Not tainted 6.18.0 #1 PREEMPT(undef) 
+[    0.027478] Call Trace:
+[    0.027728]  <TASK>
+[    0.027939]  dump_stack_lvl+0x27/0xa0
+[    0.028312]  dump_stack+0x10/0x20
+[    0.028646]  vpanic+0x372/0x400
+[    0.028969]  panic+0x5f/0x60
+[    0.029261]  alloc_low_pages+0x7d/0x1c0
+[    0.029649]  phys_pmd_init+0x246/0x500
+[    0.030031]  phys_pud_init+0x45d/0x4e0
+[    0.030410]  phys_p4d_init+0x390/0x400
+[    0.030790]  ? __sort_r+0x11d/0x3b0
+[    0.031143]  __kernel_physical_mapping_init+0x337/0x4f0
+[    0.031668]  kernel_physical_mapping_init+0x14/0x30
+[    0.032163]  init_memory_mapping+0x25c/0x560
+[    0.032596]  init_range_memory_mapping+0xd8/0x170
+[    0.033073]  init_mem_mapping+0x2e3/0x450
+[    0.033475]  ? memblock_clear_kho_scratch+0x8e/0xc0
+[    0.033971]  setup_arch+0x8a2/0x1000
+[    0.034332]  ? _printk+0x5f/0x90
+[    0.034660]  start_kernel+0x67/0xbb0
+[    0.035024]  x86_64_start_reservations+0x18/0x30
+[    0.035489]  x86_64_start_kernel+0xfd/0x150
+[    0.035912]  ? soft_restart_cpu+0x14/0x14
+[    0.036317]  common_startup_64+0x13e/0x141
+[    0.036735]  </TASK>
+[    0.036957] ---[ end Kernel panic - not syncing: alloc_low_pages: can not alloc memory ]---

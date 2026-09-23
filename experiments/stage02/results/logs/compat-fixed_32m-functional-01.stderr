@@ -1,0 +1,5 @@
+SVMM_METRIC variant=fixed_32m stage=image_loaded guest_memory_bytes=0
+SVMM_METRIC variant=fixed_32m stage=memory guest_memory_bytes=33554432
+SVMM_METRIC variant=fixed_32m stage=memory_mapped guest_memory_bytes=33554432
+prepare Linux boot: Invalid argument
+SVMM_METRIC variant=fixed_32m stage=failed_boot_prepare guest_memory_bytes=33554432
