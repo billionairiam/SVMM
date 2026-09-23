@@ -198,6 +198,73 @@ class ProcessSafetyTests(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.killpg(pgid, 0)
 
+    def test_timeout_kills_term_ignoring_process_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pgid_file = root / "pgid"
+            command = [
+                "/bin/sh",
+                "-c",
+                f"trap '' TERM; ps -o pgid= -p $$ > '{pgid_file}'; "
+                "while :; do sleep 1; done",
+            ]
+            try:
+                result = run_timed(
+                    command,
+                    0.05,
+                    root / "stdout",
+                    root / "stderr",
+                    root / "timing",
+                )
+                self.assertTrue(result.timed_out)
+                pgid = int(pgid_file.read_text().strip())
+                with self.assertRaises(ProcessLookupError):
+                    os.killpg(pgid, 0)
+            finally:
+                if pgid_file.exists():
+                    pgid = int(pgid_file.read_text().strip())
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_interruption_kills_started_process_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_popen = __import__("subprocess").Popen
+            started = {}
+
+            def interrupting_popen(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                started["pgid"] = process.pid
+                real_wait = process.wait
+                first_wait = True
+
+                def interrupted_wait(timeout=None):
+                    nonlocal first_wait
+                    if first_wait:
+                        first_wait = False
+                        raise KeyboardInterrupt
+                    return real_wait(timeout=timeout)
+
+                process.wait = interrupted_wait
+                return process
+
+            with patch(
+                "experiments.stage02.collect.subprocess.Popen",
+                side_effect=interrupting_popen,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    run_timed(
+                        ["/bin/sh", "-c", "while :; do sleep 1; done"],
+                        60,
+                        root / "stdout",
+                        root / "stderr",
+                        root / "timing",
+                    )
+            with self.assertRaises(ProcessLookupError):
+                os.killpg(started["pgid"], 0)
+
 
 class ResultValidationTests(unittest.TestCase):
     def _write_valid_results(self, repo: Path) -> Path:
@@ -209,7 +276,6 @@ class ResultValidationTests(unittest.TestCase):
         logs = results / "logs"
         logs.mkdir(parents=True)
         raw_rows = []
-        summary_rows = []
         for kernel, digest in (("primary", "aaa111"), ("compat", "bbb222")):
             for variant in variants:
                 stem = f"{kernel}-{variant}"
@@ -241,22 +307,7 @@ class ResultValidationTests(unittest.TestCase):
                     "stdout_path": stdout_rel,
                     "stderr_path": stderr_rel,
                 })
-                summary = {name: "" for name in SUMMARY_FIELDS}
-                summary.update({
-                    "kernel": kernel,
-                    "variant": variant,
-                    "experiment": "functional",
-                    "runs": "1",
-                    "loader_rejected": "0",
-                    "triple_fault": "0",
-                    "panic": "0",
-                    "halted": "0",
-                    "booted": "0",
-                    "timeout": "0",
-                    "error": "1",
-                    "success_rate": "0.000",
-                })
-                summary_rows.append(summary)
+        summary_rows = summarize(raw_rows)
         with (results / "raw.csv").open("w", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=RAW_FIELDS)
             writer.writeheader()
@@ -285,6 +336,61 @@ class ResultValidationTests(unittest.TestCase):
                 writer.writeheader()
                 writer.writerows(rows[:-1])
             with self.assertRaisesRegex(RuntimeError, "16 functional"):
+                validate_results(repo, results, performance_runs=10)
+
+    def test_rejects_missing_summary_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            results = self._write_valid_results(repo)
+            path = results / "summary.csv"
+            lines = path.read_text().splitlines()
+            lines[1] = lines[1].rsplit(",", 1)[0]
+            path.write_text("\n".join(lines) + "\n")
+            with self.assertRaisesRegex(RuntimeError, "missing columns"):
+                validate_results(repo, results, performance_runs=10)
+
+    def test_rejects_incorrect_summary_aggregate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            results = self._write_valid_results(repo)
+            path = results / "summary.csv"
+            with path.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            rows[0]["wall_ms_avg"] = "999.000"
+            with path.open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=SUMMARY_FIELDS)
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(RuntimeError, "summary mismatch"):
+                validate_results(repo, results, performance_runs=10)
+
+    def test_rejects_duplicate_summary_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            results = self._write_valid_results(repo)
+            path = results / "summary.csv"
+            with path.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            with path.open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=SUMMARY_FIELDS)
+                writer.writeheader()
+                writer.writerows([*rows, rows[0]])
+            with self.assertRaisesRegex(RuntimeError, "duplicate summary"):
+                validate_results(repo, results, performance_runs=10)
+
+    def test_rejects_non_numeric_raw_metric(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            results = self._write_valid_results(repo)
+            path = results / "raw.csv"
+            with path.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            rows[0]["wall_ms"] = "not-a-number"
+            with path.open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=RAW_FIELDS)
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(RuntimeError, "numeric"):
                 validate_results(repo, results, performance_runs=10)
 
 
