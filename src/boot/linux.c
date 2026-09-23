@@ -53,6 +53,19 @@ static uint64_t align_up(uint64_t value, uint64_t alignment)
  *
  * 本函数只负责读取和验证镜像。把各部分复制进客户机内存的工作由
  * boot_linux_prepare() 完成。
+ *  * boot_params 中本函数关心的协议偏移：
+ *
+ *   0x1e8  e820_entries           e820 条目数
+ *   0x1f1  hdr.setup_sects        setup 扇区数
+ *   0x210  hdr.type_of_loader     引导加载器 ID
+ *   0x211  hdr.loadflags          CAN_USE_HEAP 等标志
+ *   0x228  hdr.cmd_line_ptr       命令行客户机物理地址
+ *   0x230  hdr.kernel_alignment   可重定位内核的对齐要求
+ *   0x234  hdr.relocatable_kernel 可重定位标志
+ *   0x238  hdr.cmdline_size       镜像允许的最大命令行长度
+ *   0x258  hdr.pref_address       内核首选运行地址
+ *   0x260  hdr.init_size          早期初始化内存窗口大小
+ *   0x2d0  e820_table             BIOS 风格物理内存表
  */
 int boot_linux_load(const char *path, struct linux_image *image)
 {
@@ -197,20 +210,23 @@ size_t boot_linux_memory_size(const struct linux_image *image)
  *   0x00010000  bzImage 的 boot sector 和 setup 代码副本
  *   0x00020000  以 NUL 结尾的内核命令行
  *   0x00100000  压缩内核载荷，即 32 位入口
- *
- * boot_params 中本函数关心的协议偏移：
- *
- *   0x1e8  e820_entries           e820 条目数
- *   0x1f1  hdr.setup_sects        setup 扇区数
- *   0x210  hdr.type_of_loader     引导加载器 ID
- *   0x211  hdr.loadflags          CAN_USE_HEAP 等标志
- *   0x228  hdr.cmd_line_ptr       命令行客户机物理地址
- *   0x230  hdr.kernel_alignment   可重定位内核的对齐要求
- *   0x234  hdr.relocatable_kernel 可重定位标志
- *   0x238  hdr.cmdline_size       镜像允许的最大命令行长度
- *   0x258  hdr.pref_address       内核首选运行地址
- *   0x260  hdr.init_size          早期初始化内存窗口大小
- *   0x2d0  e820_table             BIOS 风格物理内存表
+ *  +-------------------------------+ 0x00000000
+ *  | IVT + BDA + 保留低内存         |
+ *   +-------------------------------+ 0x00000500
+ *   | 辅助 GDT 位置                  |  GDT_ADDR，遗留/辅助区域
+ *   +-------------------------------+ 0x00009000
+ *   | boot_params / 零页面           |  BOOT_PARAMS_ADDR
+ *   +-------------------------------+ 0x0000A000
+ *   | e820 表镜像                    |  E820_ADDR
+ *   +-------------------------------+ 0x00010000
+ *   | Linux 实模式设置代码            |  SETUP_CODE_ADDR，入口在偏移 0x200
+ *   +-------------------------------+ 0x00020000
+ *   | 内核 cmdline 字符串            |  CMDLINE_ADDR，"console=ttyS0"
+ *   +-------------------------------+ 0x00100000
+ *   | 压缩内核载荷                   |  KERNEL_ADDR
+ *   +-------------------------------+ 0x02000000
+ *   | 客户机 RAM 结束                |  32 MiB
+ *   +-------------------------------+
  */
 int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *image,
                        const char *cmdline)
