@@ -270,6 +270,38 @@ def _read_timing(path: Path) -> tuple[int, int]:
         return 0, 0
 
 
+def _process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait()
+        return
+
+    try:
+        process.wait(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        pass
+
+    if _process_group_exists(process.pid):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    process.wait()
+
+    deadline = time.monotonic() + 1.0
+    while _process_group_exists(process.pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
 def run_timed(
     command: list[str],
     timeout_seconds: float,
@@ -299,13 +331,11 @@ def run_timed(
             returncode = process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=0.2)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            _terminate_process_group(process)
             returncode = 124
+        except BaseException:
+            _terminate_process_group(process)
+            raise
     measured_ms = int((time.monotonic() - start) * 1000)
     time_ms, max_rss_kib = _read_timing(timing_path)
     return Execution(
@@ -602,8 +632,62 @@ def validate_results(repo: Path, results: Path, performance_runs: int) -> None:
     except FileNotFoundError as error:
         raise RuntimeError(f"result artifact is missing: {error.filename}") from error
 
-    if any(None in row for row in rows) or any(None in row for row in summary_rows):
+    all_csv_rows = [*rows, *summary_rows]
+    if any(None in row for row in all_csv_rows):
         raise RuntimeError("CSV row has more columns than its declared header")
+    if any(any(value is None for value in row.values()) for row in all_csv_rows):
+        raise RuntimeError("CSV row has missing columns")
+
+    raw_integer_fields = (
+        "run",
+        "guest_memory_bytes",
+        "entered_kvm",
+        "returncode",
+        "timed_out",
+        "linux_version",
+        "e820",
+        "serial_output",
+        "panic",
+        "exits",
+        "serial_exits",
+        "wall_ms",
+        "max_rss_kib",
+    )
+    summary_integer_fields = (
+        "runs",
+        *RESULT_KINDS,
+        "wall_ms_min",
+        "wall_ms_max",
+        "exits_min",
+        "exits_max",
+        "serial_exits_min",
+        "serial_exits_max",
+        "max_rss_kib_min",
+        "max_rss_kib_max",
+    )
+    summary_float_fields = (
+        "success_rate",
+        "wall_ms_avg",
+        "exits_avg",
+        "serial_exits_avg",
+        "max_rss_kib_avg",
+    )
+    for label, csv_rows, fields, conversion in (
+        ("raw", rows, raw_integer_fields, int),
+        ("summary", summary_rows, summary_integer_fields, int),
+        ("summary", summary_rows, summary_float_fields, float),
+    ):
+        for line, row in enumerate(csv_rows, start=2):
+            for field in fields:
+                value = row[field]
+                if value == "":
+                    continue
+                try:
+                    conversion(value)
+                except ValueError as error:
+                    raise RuntimeError(
+                        f"{label}.csv line {line} has non-numeric {field}: {value}"
+                    ) from error
 
     functional = [row for row in rows if row["experiment"] == "functional"]
     expected_matrix = {(kernel, variant) for kernel in ("primary", "compat") for variant in VARIANTS}
@@ -642,17 +726,20 @@ def validate_results(repo: Path, results: Path, performance_runs: int) -> None:
         (row["kernel"], row["variant"], row["experiment"]): row
         for row in summarize(rows)
     }
-    actual_summaries = {
-        (row["kernel"], row["variant"], row["experiment"]): row
+    summary_keys = [
+        (row["kernel"], row["variant"], row["experiment"])
         for row in summary_rows
-    }
+    ]
+    if len(summary_keys) != len(set(summary_keys)):
+        raise RuntimeError("duplicate summary group")
+    actual_summaries = dict(zip(summary_keys, summary_rows))
     if set(actual_summaries) != set(expected_summaries):
         raise RuntimeError("summary groups do not match raw.csv groups")
     for key, expected in expected_summaries.items():
         actual = actual_summaries[key]
-        for field in ("runs", *RESULT_KINDS):
+        for field in SUMMARY_FIELDS:
             if actual[field] != expected[field]:
-                raise RuntimeError(f"summary count mismatch for {key}: {field}")
+                raise RuntimeError(f"summary mismatch for {key}: {field}")
 
     for digest in {row["kernel_sha256"] for row in rows}:
         if digest not in report:

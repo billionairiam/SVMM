@@ -2,6 +2,11 @@
 set -eu
 
 variants='baseline no_cpuid fixed_32m no_boot_params no_e820 no_cmdline no_protected_mode no_uart'
+make clean
+make
+test -x bin/linux_boot
+test ! -e bin/ablation/baseline/linux_boot
+
 make ablation
 for variant in $variants; do
     test -x "bin/ablation/$variant/linux_boot"

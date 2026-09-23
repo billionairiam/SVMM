@@ -1,6 +1,7 @@
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -O2 -g -D_GNU_SOURCE
 CPPFLAGS += -Isrc
+.DEFAULT_GOAL := all
 
 SOURCES := src/main.c src/kvm.c src/memory.c src/vcpu.c src/serial.c src/metrics.c src/boot/linux.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
