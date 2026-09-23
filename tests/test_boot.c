@@ -45,6 +45,69 @@ static void reset_fixture_name(void)
     strcpy(fixture_path, "/tmp/svmm-bzimage-test-XXXXXX");
 }
 
+static void write_temp(char *path, const void *data, size_t size)
+{
+    int fd = mkstemp(path);
+    assert(fd >= 0);
+    assert(write(fd, data, size) == (ssize_t)size);
+    assert(close(fd) == 0);
+}
+
+/*
+ * 夹具内核运行窗口为 [2 MiB, 6 MiB)，客户机内存 8 MiB。检查：
+ *   - 默认位置 96 MiB（小内核不需要顺延）；
+ *   - 文件内容逐字节进入客户机内存，大小如实返回；
+ *   - 空文件、放不进客户机内存的位置被拒绝；
+ *   - ramdisk_image/ramdisk_size 写入 zero page；
+ *   - 与内核窗口重叠、越过内存末尾、超过 initrd_addr_max 的位置被拒绝。
+ */
+static void check_initrd(struct guest_memory *memory, const struct linux_image *image)
+{
+    assert(boot_linux_initrd_addr(image) == INITRD_ADDR);
+
+    const uint64_t addr = 6u * 1024u * 1024u;
+    uint8_t cpio[4096];
+    for (size_t i = 0; i < sizeof(cpio); ++i)
+        cpio[i] = (uint8_t)(i * 7u + 1u);
+    char path[] = "/tmp/svmm-initrd-test-XXXXXX";
+    write_temp(path, cpio, sizeof(cpio));
+    size_t size = 1;
+    assert(boot_linux_load_initramfs(memory, addr, path, &size) == 0);
+    assert(size == sizeof(cpio));
+    assert(memcmp(memory->data + addr, cpio, sizeof(cpio)) == 0);
+    assert(boot_linux_load_initramfs(memory, memory->size - 1024, path, &size) == -1);
+    assert(size == 0);
+    assert(unlink(path) == 0);
+
+    char empty[] = "/tmp/svmm-initrd-empty-XXXXXX";
+    write_temp(empty, "", 0);
+    assert(boot_linux_load_initramfs(memory, addr, empty, &size) == -1);
+    assert(unlink(empty) == 0);
+    assert(boot_linux_load_initramfs(memory, addr, "/nonexistent/initrd", &size) == -1);
+
+    struct linux_initrd initrd = { .addr = addr, .size = sizeof(cpio) };
+    assert(boot_linux_prepare(memory, image, "console=ttyS0", &initrd) == 0);
+#if !SVMM_ABLATE_BOOT_PARAMS_ENABLED
+    const struct boot_params *params =
+        (const struct boot_params *)(memory->data + BOOT_PARAMS_ADDR);
+    assert(params->hdr.ramdisk_image == addr);
+    assert(params->hdr.ramdisk_size == sizeof(cpio));
+    assert(params->hdr.initrd_addr_max == 0x7fffffff);
+#endif
+
+    struct linux_initrd overlap = { .addr = 5u * 1024u * 1024u, .size = 4096 };
+    errno = 0;
+    assert(boot_linux_prepare(memory, image, "console=ttyS0", &overlap) == -1);
+    assert(errno == EINVAL);
+
+    struct linux_initrd past_end = { .addr = memory->size - 1024, .size = 4096 };
+    assert(boot_linux_prepare(memory, image, "console=ttyS0", &past_end) == -1);
+
+    struct linux_image low_limit = *image;
+    low_limit.initrd_addr_max = (uint32_t)(addr + 2048);
+    assert(boot_linux_prepare(memory, &low_limit, "console=ttyS0", &initrd) == -1);
+}
+
 int main(void)
 {
     uint8_t file[1056] = { 0 };
@@ -58,6 +121,7 @@ int main(void)
     file[0x234] = 1;                /* relocatable_kernel */
     put64(file, 0x258, 0x100000);
     put32(file, 0x260, 4 * 1024 * 1024);
+    put32(file, 0x22c, 0x7fffffff);  /* initrd_addr_max */
     file[0x300] = 0x5a;             /* setup code outside the header */
     memset(file + 1024, 0xa5, 32);
 
@@ -74,7 +138,7 @@ int main(void)
         .size = 8 * 1024 * 1024,
     };
     assert(memory.data);
-    assert(boot_linux_prepare(&memory, &image, "console=ttyS0") == 0);
+    assert(boot_linux_prepare(&memory, &image, "console=ttyS0", NULL) == 0);
     assert(memcmp(memory.data + KERNEL_ADDR, file + 1024, 32) == 0);
     assert(memory.data[SETUP_CODE_ADDR + 0x300] == 0x5a);
 #if SVMM_ABLATE_CMDLINE_ENABLED
@@ -117,13 +181,15 @@ int main(void)
 #else
     assert(setup_hdr->cmd_line_ptr == CMDLINE_ADDR);
 #endif
-    assert(boot_linux_prepare(&memory, &image, "console=ttyS0 root=/dev/none") == 0);
+    assert(boot_linux_prepare(&memory, &image, "console=ttyS0 root=/dev/none", NULL) == 0);
 #if SVMM_ABLATE_CMDLINE_ENABLED
     assert(memory.data[CMDLINE_ADDR] == 0);
 #else
     assert(strcmp((char *)memory.data + CMDLINE_ADDR,
                   "console=ttyS0 root=/dev/none") == 0);
 #endif
+    check_initrd(&memory, &image);
+
     put64(file, 0x258, 256 * 1024 * 1024);
     struct linux_image high_image = { 0 };
     char high_fixture[] = "/tmp/svmm-bzimage-high-XXXXXX";
@@ -133,6 +199,8 @@ int main(void)
     assert(close(high_fd) == 0);
     assert(boot_linux_load(high_fixture, &high_image) == 0);
     assert(high_image.runtime_start == 256 * 1024 * 1024);
+    /* 内核窗口延伸到 96 MiB 之后时，initramfs 顺延到窗口末尾之后。 */
+    assert(boot_linux_initrd_addr(&high_image) == 260 * 1024 * 1024);
 #if SVMM_ABLATE_DYNAMIC_MEMORY_ENABLED
     assert(boot_linux_memory_size(&high_image) == 32u * 1024u * 1024u);
     struct guest_memory blog_memory = {
@@ -141,13 +209,13 @@ int main(void)
     };
     assert(blog_memory.data);
     errno = 0;
-    assert(boot_linux_prepare(&blog_memory, &high_image, "console=ttyS0") == -1);
+    assert(boot_linux_prepare(&blog_memory, &high_image, "console=ttyS0", NULL) == -1);
     assert(errno == EINVAL);
     free(blog_memory.data);
 #else
     assert(boot_linux_memory_size(&high_image) >= 260 * 1024 * 1024);
 #endif
-    assert(boot_linux_prepare(&memory, &high_image, "console=ttyS0") == -1);
+    assert(boot_linux_prepare(&memory, &high_image, "console=ttyS0", NULL) == -1);
     boot_linux_free(&high_image);
     assert(unlink(high_fixture) == 0);
     free(memory.data);

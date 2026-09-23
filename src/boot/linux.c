@@ -63,6 +63,9 @@ static uint64_t align_up(uint64_t value, uint64_t alignment)
  *   0x230  hdr.kernel_alignment   可重定位内核的对齐要求
  *   0x234  hdr.relocatable_kernel 可重定位标志
  *   0x238  hdr.cmdline_size       镜像允许的最大命令行长度
+ *   0x218  hdr.ramdisk_image      initramfs 客户机物理地址（由加载器填写）
+ *   0x21c  hdr.ramdisk_size       initramfs 字节数（由加载器填写）
+ *   0x22c  hdr.initrd_addr_max    initramfs 最后一个字节允许的最高地址
  *   0x258  hdr.pref_address       内核首选运行地址
  *   0x260  hdr.init_size          早期初始化内存窗口大小
  *   0x2d0  e820_table             BIOS 风格物理内存表
@@ -139,6 +142,13 @@ int boot_linux_load(const char *path, struct linux_image *image)
     uint64_t preferred = read_le64(data + 0x258);
 
     /*
+     * initrd_addr_max（偏移 0x22c）：内核能访问的 initramfs 最高字节地址。
+     * 它是内核告诉加载器的限制，加载器只读取并遵守，不应改写。
+     */
+    uint32_t initrd_addr_max;
+    memcpy(&initrd_addr_max, data + 0x22c, sizeof(initrd_addr_max));
+
+    /*
      * kernel_alignment（偏移 0x230，单位：字节）：可重定位
      * 内核运行地址必须满足的对齐值，例如 0x200000 表示按 2 MiB 对齐。
      * 协议要求它是 2 的幂，后面据此把 runtime_start 向上取整。
@@ -183,7 +193,20 @@ int boot_linux_load(const char *path, struct linux_image *image)
     image->kernel_size = size - setup_size;
     image->init_size = init_size;
     image->runtime_start = runtime_start;
+    image->initrd_addr_max = initrd_addr_max;
     return 0;
+}
+
+/*
+ * initramfs 默认放在 INITRD_ADDR（96 MiB）。如果内核最终运行窗口
+ * [runtime_start, runtime_start + init_size) 延伸到了 96 MiB 之后，就顺延到
+ * 窗口末尾向上按 2 MiB 对齐的位置，保证解压内核时不会覆盖 initramfs。
+ */
+uint64_t boot_linux_initrd_addr(const struct linux_image *image)
+{
+    uint64_t kernel_end = align_up(image->runtime_start + image->init_size,
+                                   2u * 1024u * 1024u);
+    return kernel_end > INITRD_ADDR ? kernel_end : INITRD_ADDR;
 }
 
 size_t boot_linux_memory_size(const struct linux_image *image)
@@ -193,6 +216,11 @@ size_t boot_linux_memory_size(const struct linux_image *image)
 
     size_t size = (size_t)image->runtime_start + image->init_size +
                   32u * 1024u * 1024u;
+    /* 总是为最大尺寸的 initramfs 留出位置，再多留 16 MiB 给内核使用。 */
+    size_t initrd_end = (size_t)boot_linux_initrd_addr(image) + INITRD_MAX_SIZE +
+                        16u * 1024u * 1024u;
+    if (initrd_end > size)
+        size = initrd_end;
     const size_t memory_alignment = 2u * 1024u * 1024u;
     size = (size_t)align_up(size, memory_alignment);
     return size < GUEST_MEMORY_MIN_SIZE ? GUEST_MEMORY_MIN_SIZE : size;
@@ -203,33 +231,30 @@ size_t boot_linux_memory_size(const struct linux_image *image)
  * 本阶段不执行 16 位 setup 代码，而是直接以 32 位保护模式跳到
  * KERNEL_ADDR，并让 RSI 指向 BOOT_PARAMS_ADDR。
  *
- * 主要客户机物理地址布局：
+ * 主要客户机物理地址布局（ACPI 表由 boot_acpi_setup 另行写入）：
  *
- *   0x00000500  GDT
- *   0x00009000  struct boot_params（zero page）
- *   0x00010000  bzImage 的 boot sector 和 setup 代码副本
- *   0x00020000  以 NUL 结尾的内核命令行
- *   0x00100000  压缩内核载荷，即 32 位入口
- *  +-------------------------------+ 0x00000000
- *  | IVT + BDA + 保留低内存         |
+ *   +-------------------------------+ 0x00000000
+ *   | IVT + BDA + 保留低内存         |
  *   +-------------------------------+ 0x00000500
- *   | 辅助 GDT 位置                  |  GDT_ADDR，遗留/辅助区域
+ *   | 32 位启动用 GDT                |  GDT_ADDR
  *   +-------------------------------+ 0x00009000
  *   | boot_params / 零页面           |  BOOT_PARAMS_ADDR
- *   +-------------------------------+ 0x0000A000
- *   | e820 表镜像                    |  E820_ADDR
  *   +-------------------------------+ 0x00010000
- *   | Linux 实模式设置代码            |  SETUP_CODE_ADDR，入口在偏移 0x200
+ *   | bzImage boot sector + setup   |  SETUP_CODE_ADDR（只作副本，不执行）
  *   +-------------------------------+ 0x00020000
- *   | 内核 cmdline 字符串            |  CMDLINE_ADDR，"console=ttyS0"
+ *   | 内核 cmdline 字符串            |  CMDLINE_ADDR
+ *   +-------------------------------+ 0x000E0000
+ *   | ACPI：RSDP/RSDT/FADT/DSDT/MADT |  ACPI_RSDP_ADDR；内核把 640K–1M 视为 BIOS 区保留
  *   +-------------------------------+ 0x00100000
- *   | 压缩内核载荷                   |  KERNEL_ADDR
- *   +-------------------------------+ 0x02000000
- *   | 客户机 RAM 结束                |  32 MiB
+ *   | 压缩内核载荷，32 位入口         |  KERNEL_ADDR
+ *   +-------------------------------+ 至少 0x06000000
+ *   | initramfs（可选）              |  boot_linux_initrd_addr()
+ *   +-------------------------------+
+ *   | 客户机 RAM 结束                |  至少 256 MiB
  *   +-------------------------------+
  */
 int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *image,
-                       const char *cmdline)
+                       const char *cmdline, const struct linux_initrd *initrd)
 {
     /*
      * 在进行任何复制前验证内核最终运行窗口、压缩载荷、setup 副本，
@@ -243,6 +268,22 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
         image->setup_size > CMDLINE_ADDR - SETUP_CODE_ADDR) {
         errno = EINVAL;
         return -1;
+    }
+    /*
+     * initramfs 必须完整落在客户机内存里、不能与内核运行窗口重叠，
+     * 最后一个字节不能超过内核声明的 initrd_addr_max，且 ramdisk_image /
+     * ramdisk_size 都只有 32 位。
+     */
+    if (initrd && initrd->size) {
+        uint64_t kernel_end = image->runtime_start + image->init_size;
+        uint64_t initrd_last = initrd->addr + initrd->size - 1;
+        if (initrd->size > INITRD_MAX_SIZE || initrd->addr < kernel_end ||
+            initrd->addr > memory->size ||
+            initrd->size > memory->size - initrd->addr ||
+            initrd_last > image->initrd_addr_max || initrd_last > UINT32_MAX) {
+            errno = EINVAL;
+            return -1;
+        }
     }
 
     /*
@@ -290,6 +331,14 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
     params.hdr.heap_end_ptr = 0xde00;
     params.hdr.cmd_line_ptr = SVMM_ABLATE_CMDLINE_ENABLED ? 0 : CMDLINE_ADDR;
     params.hdr.code32_start = KERNEL_ADDR;
+    /*
+     * 内核看到 ramdisk_image 非零，就会在 populate_rootfs() 中把这段 cpio
+     * （可带 gzip 压缩）解包到 rootfs，然后执行其中的 /init。
+     */
+    if (initrd && initrd->size) {
+        params.hdr.ramdisk_image = (uint32_t)initrd->addr;
+        params.hdr.ramdisk_size = (uint32_t)initrd->size;
+    }
     /*
      * 告诉内核哪些客户机物理地址可以分配：最低 64 KiB 保留，
      * 64 KiB 到 1 MiB 可用，1 MiB 以上一直覆盖实际分配的客户机内存。
@@ -356,6 +405,49 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
      */
     memcpy(memory->data + SETUP_CODE_ADDR + 0x1f1,
            &params.hdr, sizeof(params.hdr));
+    return 0;
+}
+
+/*
+ * 把 initramfs 文件（通常是 cpio.gz）直接读进客户机物理地址 address，
+ * 成功后 *size 为文件字节数，供 boot_linux_prepare() 写入 ramdisk_size。
+ */
+int boot_linux_load_initramfs(struct guest_memory *memory, uint64_t address,
+                              const char *path, size_t *size)
+{
+    *size = 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        perror("open initramfs");
+        return -1;
+    }
+    struct stat statbuf;
+    if (fstat(fd, &statbuf) < 0 || !S_ISREG(statbuf.st_mode) ||
+        statbuf.st_size <= 0 || (uint64_t)statbuf.st_size > INITRD_MAX_SIZE ||
+        address > memory->size ||
+        (uint64_t)statbuf.st_size > memory->size - address) {
+        fprintf(stderr, "invalid initramfs size or location\n");
+        close(fd);
+        return -1;
+    }
+    size_t file_size = (size_t)statbuf.st_size;
+    size_t offset = 0;
+    while (offset < file_size) {
+        ssize_t n = read(fd, memory->data + address + offset, file_size - offset);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0) {
+            if (n == 0)
+                fprintf(stderr, "read initramfs: unexpected end of file\n");
+            else
+                perror("read initramfs");
+            close(fd);
+            return -1;
+        }
+        offset += (size_t)n;
+    }
+    close(fd);
+    *size = file_size;
     return 0;
 }
 

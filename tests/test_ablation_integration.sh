@@ -9,7 +9,8 @@ run_variant() {
     variant=$1
     out=$(mktemp)
     err=$(mktemp)
-    if timeout 15 "bin/ablation/$variant/linux_boot" "$kernel" >"$out" 2>"$err"; then
+    if INITRAMFS_PATH= timeout 15 "bin/ablation/$variant/linux_boot" "$kernel" \
+           </dev/null >"$out" 2>"$err"; then
         status=0
     else
         status=$?
