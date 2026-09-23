@@ -68,6 +68,7 @@ run: all
 	@./bin/linux_boot
 
 test:
+	sh tests/test_loader_ablations.sh
 	sh tests/test_linux_boot.sh
 
 clean:

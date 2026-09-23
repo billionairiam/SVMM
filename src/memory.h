@@ -1,10 +1,17 @@
 #ifndef GUEST_MEMORY_H
 #define GUEST_MEMORY_H
 
+#include "ablation.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
+#define BLOG_GUEST_MEMORY_SIZE (32u * 1024u * 1024u)
+#if SVMM_ABLATE_DYNAMIC_MEMORY_ENABLED
+#define GUEST_MEMORY_MIN_SIZE BLOG_GUEST_MEMORY_SIZE
+#else
 #define GUEST_MEMORY_MIN_SIZE (128u * 1024u * 1024u)
+#endif
 #define KERNEL_ADDR 0x00100000u
 #define SETUP_CODE_ADDR 0x00010000u
 #define BOOT_PARAMS_ADDR 0x00009000u
