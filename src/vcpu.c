@@ -173,13 +173,13 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
         case KVM_EXIT_IO: {
             if (run->io.size != 1 && run->io.size != 2 && run->io.size != 4) {
                 fprintf(stderr, "invalid I/O width: %u\n", run->io.size);
-                return -1;
+                return vcpu_finish(stats, "invalid_io_width", -1);
             }
             size_t data_size = (size_t)run->io.size * run->io.count;
             size_t offset = (size_t)run->io.data_offset;
             if (offset > vcpu->run_size || data_size > vcpu->run_size - offset) {
                 fprintf(stderr, "KVM I/O data is outside the run mapping\n");
-                return -1;
+                return vcpu_finish(stats, "invalid_io_data", -1);
             }
             uint8_t *data = (uint8_t *)run + offset;
             if (!SVMM_ABLATE_UART_ENABLED && serial_handles_port(run->io.port)) {
@@ -209,7 +209,7 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
         case KVM_EXIT_MMIO:
             if (run->mmio.len > sizeof(run->mmio.data)) {
                 fprintf(stderr, "invalid MMIO width: %u\n", run->mmio.len);
-                return -1;
+                return vcpu_finish(stats, "invalid_mmio_width", -1);
             }
             if (!run->mmio.is_write)
                 memset(run->mmio.data, 0xff, run->mmio.len);
@@ -219,7 +219,7 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
             break;
         default:
             fprintf(stderr, "unexpected KVM exit reason: %u\n", run->exit_reason);
-            return -1;
+            return vcpu_finish(stats, "unexpected_exit", -1);
         }
     }
 }

@@ -10,6 +10,7 @@ from experiments.stage02.collect import (
     Execution,
     RAW_FIELDS,
     SUMMARY_FIELDS,
+    _report,
     _result_row,
     _write_csv,
     classify,
@@ -156,7 +157,73 @@ class CsvAndSummaryTests(unittest.TestCase):
             self.assertEqual(row["entered_kvm"], "1")
             self.assertEqual(row["exits"], "")
             self.assertEqual(row["serial_exits"], "")
-            self.assertEqual(row["max_rss_kib"], "")
+        self.assertEqual(row["max_rss_kib"], "")
+
+
+class ReportTests(unittest.TestCase):
+    def test_performance_table_exposes_timeout_limited_durations(self):
+        functional = []
+        for variant in (
+            "baseline", "no_cpuid", "fixed_32m", "no_boot_params",
+            "no_e820", "no_cmdline", "no_protected_mode", "no_uart",
+        ):
+            functional.append({
+                "kernel": "primary",
+                "variant": variant,
+                "experiment": "functional",
+                "primary_result": "halted",
+                "linux_version": "1",
+                "e820": "1",
+                "serial_output": "1",
+                "exits": "1",
+                "timed_out": "0",
+            })
+        performance_rows = [
+            {
+                "kernel": "primary",
+                "variant": "no_e820",
+                "experiment": "performance",
+                "timed_out": "1" if run <= 7 else "0",
+            }
+            for run in range(1, 11)
+        ]
+        performance = {
+            "kernel": "primary",
+            "variant": "no_e820",
+            "experiment": "performance",
+            "runs": "10",
+            "success_rate": "1.000",
+            "timeout": "0",
+            "wall_ms_avg": "15000.000",
+            "wall_ms_min": "15000",
+            "wall_ms_max": "15000",
+            "exits_avg": "",
+            "max_rss_kib_avg": "",
+        }
+        kernels = {
+            label: {"path": f"/boot/{label}", "size": "1", "sha256": label}
+            for label in ("primary", "compat")
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "report.md"
+            _report(
+                report,
+                [*functional, *performance_rows],
+                [performance],
+                kernels,
+                10,
+                15,
+            )
+            lines = report.read_text().splitlines()
+
+        table_start = lines.index("## 性能结果")
+        header = [cell.strip() for cell in lines[table_start + 2].split("|")[1:-1]]
+        values = [cell.strip() for cell in lines[table_start + 4].split("|")[1:-1]]
+        self.assertEqual(values[header.index("超时次数")], "7")
+        limitation = next(
+            line for line in lines if "观察窗口" in line and "panic" in line
+        )
+        self.assertIn("成功启动", limitation)
 
 
 class ProcessSafetyTests(unittest.TestCase):
