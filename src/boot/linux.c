@@ -247,6 +247,15 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
     /*
      * zero page 必须先清零，再只复制镜像声明存在的 setup_header 字节。
      * 这样旧协议中不存在的尾部字段保持为 0，也不会越过本地结构体。
+     *
+     * 文件偏移 0x200 是一条两字节的短跳转指令 `EB xx`，0x201 的 xx
+     * 是以 0x202（该指令结束后的地址）为基准的 8 位相对位移。合法
+     * bzImage 在这里向前跳到 setup 代码入口，也就是实际启动头的末尾。因此：
+     *
+     *   启动头末尾 = 0x202 + image->data[0x201]
+     *   启动头长度 = 启动头末尾 - setup_header 起点 0x1f1
+     *
+     * 这个长度来自镜像本身，最后仍用 sizeof(params.hdr) 限制复制范围。
      */
     struct boot_params params = { 0 };
     size_t header_size = image->data[0x201] + 0x202 - 0x1f1;
