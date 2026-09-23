@@ -37,6 +37,27 @@ static uint64_t read_le64(const uint8_t *data)
     return value;
 }
 
+// open(path, O_RDONLY) 打开 bzImage。
+// fstat() 检查文件大小。
+// 将整个文件读入宿主机缓冲区。
+// 验证偏移 0x202 处的 "HdrS" 签名。
+// 读取偏移 0x1f1 处的 setup_sects。
+// 验证启动协议版本。
+// 计算载荷偏移：(setup_sects + 1) * 512。
+// 分离出两部分：
+// +-------------------------------+  文件偏移 0x0000
+// | 引导扇区 + 设置代码            |  实模式设置代码
+// +-------------------------------+  文件偏移 0x01f1
+// | setup_header                  |  Linux 启动协议字段
+// | - setup_sects                 |  设置扇区数
+// | - HdrS 签名                   |  在偏移 0x202
+// | - version                     |  启动协议版本
+// | - loadflags                   |  标志如 LOADED_HIGH
+// | - cmd_line_ptr                |  内核命令行指针
+// | - ramdisk_image / size        |  initrd 字段（Stage 03+）
+// +-------------------------------+  (setup_sects + 1) * 512
+// | 压缩内核载荷                   |  复制到 0x00100000
+// +-------------------------------+
 int boot_linux_load(const char *path, struct linux_image *image)
 {
     *image = (struct linux_image){ 0 };
@@ -73,7 +94,7 @@ int boot_linux_load(const char *path, struct linux_image *image)
         offset += (size_t)n;
     }
     close(fd);
-
+    // 计算设置代码占用的 512 字节扇区数；值为 0 时视为 4
     size_t setup_sectors = data[0x1f1] ? data[0x1f1] : 4;
     size_t setup_size = (setup_sectors + 1) * 512;
     uint16_t version = read_le16(data + 0x206);
