@@ -3,3 +3,6 @@
 /images/
 
 /.worktrees/
+/experiments/stage02/results.tmp.*/
+/experiments/stage02/results.previous/
+__pycache__/
