@@ -43,3 +43,17 @@ BZIMAGE_PATH=/boot/vmlinuz-6.16.0 REQUIRE_KERNEL_LOG=1 make test
 客户机内存至少 128 MiB；若内核首选运行地址加 `init_size` 超出该范围，则继续增加。这里比教程的 32 MiB 大，因为较新的内核仅初始化空间就可能超过 32 MiB。e820 表根据实际分配的内存填写。
 
 本阶段没有 initramfs、根文件系统和完整的中断控制器。VMM 在客户机第一次 `hlt` 时退出；`Stage 02 completed` 表示本阶段的运行循环结束。部分内核会在根文件系统挂载失败后持续停留在 panic 中，此时可以用 `timeout 15 make run` 限制运行时间；集成测试会将出现明确 VFS 根文件系统 panic 的情况视为达到本阶段预期边界。客户机 shutdown 会被报告为错误，因为它也可能由三重故障引起。
+
+## Stage 02 消融实验
+
+实验构建为 CPUID、动态内存、boot params、e820、内核命令行、保护模式/GDT 和 UART 分别生成一个只移除单项能力的二进制。普通 `make all` 不启用任何消融宏。
+
+```sh
+make ablation
+experiments/stage02/run.sh
+python3 experiments/stage02/collect.py --validate-results
+```
+
+默认主内核为 `/boot/vmlinuz-6.16.0`，兼容性内核为 `/boot/vmlinuz-6.18.0.bak`，单次运行上限为 15 秒。可以使用 `--primary-kernel`、`--compat-kernel`、`--performance-runs` 和 `--timeout` 覆盖这些值。完整实验通常需要约 2–5 分钟，具体取决于进入超时路径的变体数量。
+
+结果保存在 `experiments/stage02/results/`：`raw.csv` 记录每次运行，`summary.csv` 保存聚合指标，`report.md` 给出结论，`logs/` 保留对应的 stdout 和 stderr。功能表覆盖全部变体；性能表只统计确认进入 Linux 且到达可识别终点的变体，loader 拒绝、三重故障和纯超时不会与正常启动耗时混合计算。

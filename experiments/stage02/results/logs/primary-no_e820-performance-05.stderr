@@ -1,0 +1,8 @@
+SVMM_METRIC variant=no_e820 stage=image_loaded guest_memory_bytes=0
+SVMM_METRIC variant=no_e820 stage=memory guest_memory_bytes=134217728
+SVMM_METRIC variant=no_e820 stage=memory_mapped guest_memory_bytes=134217728
+SVMM_METRIC variant=no_e820 stage=boot_prepared guest_memory_bytes=134217728
+SVMM_METRIC variant=no_e820 stage=vcpu_setup guest_memory_bytes=134217728
+SVMM_METRIC variant=no_e820 stage=kvm_run guest_memory_bytes=134217728
+INFO: unmodeled I/O port=0xcf8 direction=1
+INFO: unmodeled I/O port=0xcfc direction=0

@@ -17,6 +17,9 @@ run_variant() {
     case "$variant" in
         baseline) grep -q 'Linux version' "$out" ;;
         no_uart) ! grep -q 'Linux version' "$out" ;;
+        no_boot_params)
+            grep -q 'stage=vcpu_exit reason=shutdown entered=1' "$err"
+            ;;
         no_cpuid|no_protected_mode)
             [ "$status" -ne 0 ] || ! grep -q 'Linux version' "$out"
             ;;
@@ -26,5 +29,6 @@ run_variant() {
 
 run_variant baseline
 run_variant no_cpuid
+run_variant no_boot_params
 run_variant no_protected_mode
 run_variant no_uart

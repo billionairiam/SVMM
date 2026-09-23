@@ -1,0 +1,9 @@
+SVMM_METRIC variant=no_cpuid stage=image_loaded guest_memory_bytes=0
+SVMM_METRIC variant=no_cpuid stage=memory guest_memory_bytes=134217728
+SVMM_METRIC variant=no_cpuid stage=memory_mapped guest_memory_bytes=134217728
+SVMM_METRIC variant=no_cpuid stage=boot_prepared guest_memory_bytes=134217728
+SVMM_METRIC variant=no_cpuid stage=vcpu_setup guest_memory_bytes=134217728
+SVMM_METRIC variant=no_cpuid stage=kvm_run guest_memory_bytes=134217728
+INFO: guest halted at RIP=0xfd3938 exits=1 serial=0
+SVMM_METRIC variant=no_cpuid stage=vcpu_exit reason=hlt entered=1 exits=1 serial_exits=0
+INFO: Stage 02 completed

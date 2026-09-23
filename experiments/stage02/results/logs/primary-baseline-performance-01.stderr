@@ -1,0 +1,17 @@
+SVMM_METRIC variant=baseline stage=image_loaded guest_memory_bytes=0
+SVMM_METRIC variant=baseline stage=memory guest_memory_bytes=134217728
+SVMM_METRIC variant=baseline stage=memory_mapped guest_memory_bytes=134217728
+SVMM_METRIC variant=baseline stage=boot_prepared guest_memory_bytes=134217728
+SVMM_METRIC variant=baseline stage=vcpu_setup guest_memory_bytes=134217728
+SVMM_METRIC variant=baseline stage=kvm_run guest_memory_bytes=134217728
+INFO: unmodeled I/O port=0xcf8 direction=1
+INFO: unmodeled I/O port=0xcfc direction=0
+INFO: unmodeled I/O port=0xcf8 direction=1
+INFO: unmodeled I/O port=0xcfc direction=0
+INFO: unmodeled I/O port=0xcf8 direction=1
+INFO: unmodeled I/O port=0xcfc direction=0
+INFO: unmodeled I/O port=0xcf8 direction=1
+INFO: unmodeled I/O port=0xcfc direction=0
+INFO: guest halted at RIP=0xffffffff915bd34f exits=209384 serial=29927
+SVMM_METRIC variant=baseline stage=vcpu_exit reason=hlt entered=1 exits=209384 serial_exits=29927
+INFO: Stage 02 completed

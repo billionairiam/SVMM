@@ -1,0 +1,42 @@
+[    0.000000] Linux version 6.16.0 (root@master) (gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0, GNU ld (GNU Binutils for Ubuntu) 2.42) #1 SMP PREEMPT_DYNAMIC Tue Dec  9 15:48:43 CST 2025
+[    0.000000] Command line: console=ttyS0 earlycon=uart8250,io,0x3f8
+[    0.000000] Disabled fast string operations
+[    0.000000] x86/split lock detection: #DB: warning on user-space bus_locks
+[    0.000000] BIOS-provided physical RAM map:
+[    0.000000] BIOS-e801: [mem 0x0000000000000000-0x000000000009efff] usable
+[    0.000000] earlycon: uart8250 at I/O port 0x3f8 (options '')
+[    0.000000] printk: legacy bootconsole [uart8250] enabled
+[    0.000000] NX (Execute Disable) protection: active
+[    0.000000] APIC: Static calls initialized
+[    0.000000] DMI not present or invalid.
+[    0.000000] Hypervisor detected: KVM
+[    0.000000] kvm-clock: Using msrs 4b564d01 and 4b564d00
+[    0.000000] kvm-clock: using sched offset of 178179395 cycles
+[    0.000290] clocksource: kvm-clock: mask: 0xffffffffffffffff max_cycles: 0x1cd42e4dffb, max_idle_ns: 881590591483 ns
+[    0.001184] tsc: Detected 2200.000 MHz processor
+[    0.001492] .text .data .bss are not marked as E820_TYPE_RAM!
+[    0.001811] last_pfn = 0x3630 max_arch_pfn = 0x10000000000
+[    0.002143] MTRRs disabled by BIOS
+[    0.002331] x86/PAT: Configuration [0-7]: WB  WC  UC- UC  WB  WP  UC- WT  
+[    0.011502] Using GB pages for direct mapping
+[    0.011817] Failed to release memory for alloc_low_pages()
+[    0.011834] Kernel panic - not syncing: alloc_low_pages: can not alloc memory
+[    0.012593] CPU: 0 UID: 0 PID: 0 Comm: swapper Not tainted 6.16.0 #1 PREEMPT(undef) 
+[    0.013018] Call Trace:
+[    0.013155]  <TASK>
+[    0.013270]  ? panic+0x325/0x380
+[    0.013450]  ? alloc_low_pages+0x5c/0x150
+[    0.013670]  ? phys_pmd_init+0x200/0x3a0
+[    0.013887]  ? phys_pud_init+0x361/0x390
+[    0.014102]  ? phys_p4d_init+0x98/0x330
+[    0.014317]  ? __kernel_physical_mapping_init+0xa5/0x370
+[    0.014609]  ? init_memory_mapping+0x14d/0x3d0
+[    0.014853]  ? init_range_memory_mapping+0xd7/0x170
+[    0.015124]  ? init_mem_mapping+0x2c0/0x370
+[    0.015354]  ? setup_arch+0x765/0xd80
+[    0.015556]  ? start_kernel+0x5b/0x7e0
+[    0.015762]  ? x86_64_start_reservations+0x18/0x30
+[    0.016024]  ? x86_64_start_kernel+0x103/0x120
+[    0.016273]  ? common_startup_64+0x13e/0x148
+[    0.016508]  </TASK>
+[    0.016629] ---[ end Kernel panic - not syncing: alloc_low_pages: can not alloc memory ]---
