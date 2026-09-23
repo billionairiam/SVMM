@@ -1,9 +1,11 @@
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -O2 -g -D_GNU_SOURCE
+CFLAGS += -pthread
 CPPFLAGS += -Isrc
 .DEFAULT_GOAL := all
 
-SOURCES := src/main.c src/kvm.c src/memory.c src/vcpu.c src/serial.c src/metrics.c src/boot/linux.c
+SOURCES := src/main.c src/kvm.c src/memory.c src/vcpu.c src/serial.c src/console.c \
+           src/metrics.c src/boot/linux.c src/boot/acpi.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 DEPFILES := $(OBJECTS:.o=.d)
 
@@ -37,11 +39,16 @@ $(foreach variant,$(ABLATION_VARIANTS),$(eval $(call ABLATION_template,$(variant
 
 -include $(DEPFILES) $(ABLATION_DEPFILES)
 
-.PHONY: all ablation run test clean
+.PHONY: all ablation initramfs run test clean
 
 all: bin/linux_boot
 
 ablation: $(ABLATION_VARIANTS:%=bin/ablation/%/linux_boot)
+
+initramfs: build/initramfs.cpio.gz
+
+build/initramfs.cpio.gz: rootfs/build-rootfs.sh | build
+	sh rootfs/build-rootfs.sh $@
 
 bin/linux_boot: $(OBJECTS) | bin
 	$(CC) $(CFLAGS) $(OBJECTS) -o $@
@@ -58,7 +65,7 @@ bin/test_boot: tests/test_boot.c src/boot/linux.c src/boot/linux.h src/memory.c 
 bin/test_metrics: tests/test_metrics.c src/metrics.c src/metrics.h src/vcpu.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_metrics.c src/metrics.c -o $@
 
-bin/test_vcpu_errors: tests/test_vcpu_errors.c src/vcpu.c src/vcpu.h \
+bin/test_vcpu_errors: tests/test_vcpu_errors.c src/vcpu.c src/vcpu.h src/boot/acpi.h \
                       src/serial.c src/serial.h src/metrics.c src/metrics.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_vcpu_errors.c src/vcpu.c \
 		src/serial.c src/metrics.c -Wl,--wrap=ioctl -o $@
@@ -73,7 +80,7 @@ build bin:
 bin/ablation/%:
 	mkdir -p $@
 
-run: all
+run: all initramfs
 	@./bin/linux_boot
 
 test: bin/test_metrics bin/test_vcpu_errors
@@ -82,6 +89,7 @@ test: bin/test_metrics bin/test_vcpu_errors
 	python3 -m unittest -v tests/test_ablation_collect.py
 	sh tests/test_loader_ablations.sh
 	sh tests/test_linux_boot.sh
+	python3 -m unittest -v tests/test_initramfs_shell.py
 
 clean:
 	rm -rf build bin

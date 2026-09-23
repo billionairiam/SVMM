@@ -37,20 +37,20 @@ fi
 output_file=$(mktemp)
 error_file=$(mktemp)
 trap 'rm -f "$output_file" "$error_file"' EXIT HUP INT TERM
-if timeout 15 ./bin/linux_boot "$kernel" > "$output_file" 2> "$error_file"; then
+# 不加载 initramfs 时内核应停在 Stage 02 的边界：找不到根文件系统而 panic。
+# 默认命令行带 panic=-1，内核随即复位，VMM 把复位当作客户机退出。
+if INITRAMFS_PATH= timeout 30 ./bin/linux_boot "$kernel" \
+       < /dev/null > "$output_file" 2> "$error_file"; then
     result=0
 else
     result=$?
 fi
-if [ "$result" -eq 0 ] && grep -q 'Stage 02 completed' "$error_file"; then
-    :
-elif [ "$result" -eq 124 ] &&
-     grep -q 'Kernel panic - not syncing: VFS: Unable to mount root fs' "$output_file" &&
-     grep -q 'Linux version' "$output_file"; then
-    :
-else
+if [ "$result" -ne 0 ] ||
+   ! grep -q 'Stage 03 completed' "$error_file" ||
+   ! grep -q 'stage=vcpu_exit reason=reset' "$error_file" ||
+   ! grep -q 'Kernel panic - not syncing: VFS: Unable to mount root fs' "$output_file"; then
     cat "$error_file" >&2
-    echo "unexpected KVM result: $result" >&2
+    echo "unexpected KVM result without initramfs: $result" >&2
     exit 1
 fi
 if [ "${REQUIRE_KERNEL_LOG:-0}" = 1 ] &&
@@ -59,4 +59,4 @@ if [ "${REQUIRE_KERNEL_LOG:-0}" = 1 ] &&
     echo 'kernel did not reach the serial console' >&2
     exit 1
 fi
-echo 'PASS: Stage 02 KVM run'
+echo 'PASS: KVM run without initramfs reaches the root fs panic'

@@ -1,12 +1,15 @@
 #include "vcpu.h"
 
 #include "ablation.h"
+#include "boot/acpi.h"
 #include "kvm.h"
 #include "metrics.h"
 #include "serial.h"
 
 #include <errno.h>
 #include <linux/kvm.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,7 +39,7 @@
  *
  * 成功返回 0；失败返回 -1，并已打印错误信息。
  */
-static int vcpu_setup_cpuid(struct vcpu *vcpu, int system_fd)
+static int vcpu_setup_cpuid(struct vcpu *vcpu, int system_fd, unsigned apic_id)
 {
     /*
      * CPUID 条目数量随 CPU 型号和内核版本变化，事先无法确定。
@@ -60,6 +63,29 @@ static int vcpu_setup_cpuid(struct vcpu *vcpu, int system_fd)
          * 必须在第一次 KVM_RUN 之前完成。
          */
         if (ioctl(system_fd, KVM_GET_SUPPORTED_CPUID, cpuid) == 0) {
+            /*
+             * TSC-deadline 定时器由内核 LAPIC 模拟提供，但不在
+             * GET_SUPPORTED_CPUID 的结果里，需要按 KVM_CAP_TSC_DEADLINE_TIMER
+             * 自行打开 CPUID.1:ECX bit 24。ACPI 硬件精简模式下没有 PIT 可用来
+             * 校准 LAPIC 定时器，Linux 依赖它作为时钟事件设备。
+             */
+            int tsc_deadline = ioctl(system_fd, KVM_CHECK_EXTENSION,
+                                     KVM_CAP_TSC_DEADLINE_TIMER) > 0;
+            /*
+             * 宿主机 CPUID 里的 APIC ID 是宿主机当前 CPU 的编号，要换成本 vCPU
+             * 的 ID（LAPIC 复位后等于 vCPU id），否则 Linux 会报 APIC ID 不一致：
+             * leaf 1 的 EBX[31:24]，以及 x2APIC 拓扑 leaf 0xb/0x1f 的 EDX。
+             */
+            for (uint32_t i = 0; i < cpuid->nent; ++i) {
+                struct kvm_cpuid_entry2 *entry = &cpuid->entries[i];
+                if (entry->function == 1) {
+                    entry->ebx = (entry->ebx & 0x00ffffffu) | (apic_id << 24);
+                    if (tsc_deadline)
+                        entry->ecx |= 1u << 24;
+                } else if (entry->function == 0xb || entry->function == 0x1f) {
+                    entry->edx = apic_id;
+                }
+            }
             int result = ioctl(vcpu->fd, KVM_SET_CPUID2, cpuid);
             if (result < 0)
                 perror("KVM_SET_CPUID2");
@@ -129,7 +155,7 @@ int vcpu_init(struct vcpu *vcpu, const struct kvm_context *kvm, unsigned id)
     /* no_cpuid 消融项保留 KVM 的默认 CPUID，用来观察缺少 CPUID 时的失败点。 */
     if (SVMM_ABLATE_CPUID_ENABLED)
         return 0;
-    return vcpu_setup_cpuid(vcpu, kvm->system_fd);
+    return vcpu_setup_cpuid(vcpu, kvm->system_fd, id);
 }
 
 /*
@@ -252,14 +278,78 @@ static int vcpu_finish(struct vcpu_run_stats *stats, const char *reason,
 }
 
 /*
+ * 处理与电源相关的平台端口。返回 1 表示客户机请求关机或复位，
+ * 0 表示端口已处理，-1 表示不是这些端口。
+ *
+ *   ACPI 睡眠控制（FADT SLEEP_CONTROL_REG）：SLP_EN 且 SLP_TYP = 5 为 S5 关机
+ *   ACPI 睡眠状态（FADT SLEEP_STATUS_REG）：读恒为 0
+ *   0xcf9 复位控制（FADT RESET_REG）：bit 2 置位表示复位 CPU
+ *   0x64 i8042 命令端口：0xfe 是经典的“脉冲复位线”命令
+ */
+static int platform_handle_io(const struct kvm_run *run, uint8_t *data,
+                              size_t size, const char **event)
+{
+    uint16_t port = run->io.port;
+    if (run->io.direction == KVM_EXIT_IO_IN) {
+        if (port != ACPI_SLEEP_CONTROL_PORT && port != ACPI_SLEEP_STATUS_PORT &&
+            port != ACPI_RESET_PORT)
+            return -1;
+        memset(data, 0, size);
+        return 0;
+    }
+    uint8_t value = data[0];
+    switch (port) {
+    case ACPI_SLEEP_CONTROL_PORT:
+        if ((value & ACPI_SLEEP_ENABLE) &&
+            ((value >> 2) & 0x7) == ACPI_SLEEP_TYPE_S5) {
+            *event = "poweroff";
+            return 1;
+        }
+        return 0;
+    case ACPI_SLEEP_STATUS_PORT:
+        return 0;
+    case ACPI_RESET_PORT:
+        if (value & 0x04) {
+            *event = "reset";
+            return 1;
+        }
+        return 0;
+    case 0x64:
+        if (value == 0xfe) {
+            *event = "reset";
+            return 1;
+        }
+        return -1;
+    default:
+        return -1;
+    }
+}
+
+/*
+ * 请求 vcpu_run() 尽快返回，可以从其他线程或信号处理函数中调用。
+ * immediate_exit 让下一次（或正在进入的）KVM_RUN 立刻以 EINTR 返回，
+ * 信号则打断已经在客户机里运行的 KVM_RUN。
+ */
+void vcpu_request_stop(struct vcpu *vcpu)
+{
+    vcpu->stop_requested = 1;
+    if (vcpu->run)
+        vcpu->run->immediate_exit = 1;
+    if (vcpu->thread_valid)
+        pthread_kill(vcpu->thread, SIGUSR1);
+}
+
+/*
  * 反复进入客户机，直到客户机停机或出错。
  *
  * 每次 KVM_RUN 返回代表一次 VM exit：客户机执行了 KVM 无法在内核内
- * 自行处理、需要用户态 VMM 参与的操作。本 VMM 只模拟 COM1 串口；
- * 其他端口 I/O 和 MMIO 都按“没有设备”处理后继续运行。
+ * 自行处理、需要用户态 VMM 参与的操作。中断控制器、PIT 和 HLT 由 KVM
+ * 在内核中处理；这里只模拟 COM1 串口和 ACPI 关机/复位端口，其他端口
+ * I/O 和 MMIO 都按“没有设备”处理后继续运行。
  *
- * 返回 0 表示客户机正常执行 HLT；-1 表示 KVM 出错、客户机三重故障或
- * 遇到无法处理的退出。stats 记录退出次数、串口退出次数和最后一次
+ * 返回 0 表示客户机关机/复位、执行了用户态可见的 HLT，或宿主请求停止
+ * （vcpu_request_stop）；-1 表示 KVM 出错、客户机三重故障或遇到无法
+ * 处理的退出。stats 记录退出次数、串口退出次数和最后一次
  * 退出原因，无论哪种结果都会通过 vcpu_finish() 输出。
  */
 int vcpu_run(struct vcpu *vcpu, struct serial *serial,
@@ -268,14 +358,23 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
     /* 限制“未模拟设备”日志条数，避免内核探测硬件时刷屏。 */
     unsigned ignored_io = 0;
     *stats = (struct vcpu_run_stats){ 0 };
+    vcpu->thread = pthread_self();
+    vcpu->thread_valid = 1;
     for (;;) {
+        if (vcpu->stop_requested) {
+            fprintf(stderr, "INFO: VMM stopped by host request\n");
+            return vcpu_finish(stats, "host_stop", 0);
+        }
         /*
          * KVM_RUN 会阻塞，直到发生需要用户态处理的退出。被信号打断时
-         * 返回 EINTR，这不是客户机错误，直接重新进入即可。
+         * 返回 EINTR，这不是客户机错误：若是停止请求就退出，否则重新进入。
          */
         if (ioctl(vcpu->fd, KVM_RUN, 0) < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR) {
+                if (!vcpu->stop_requested && vcpu->run)
+                    vcpu->run->immediate_exit = 0;
                 continue;
+            }
             perror("KVM_RUN");
             return vcpu_finish(stats, "kvm_error", -1);
         }
@@ -286,9 +385,9 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
         stats->exit_reason = run->exit_reason;
         switch (run->exit_reason) {
         /*
-         * 客户机执行了 HLT 且没有待处理中断。本 VMM 不注入中断，所以
-         * vCPU 不会再被唤醒，把它视为客户机运行结束（例如内核 panic
-         * 后停机或主动关机前停机），打印 RIP 便于定位停在哪里。
+         * 客户机执行了 HLT。使用内核 irqchip 时 KVM 自己等待中断，不会
+         * 产生这个退出；若仍然收到，说明 vCPU 不会再被唤醒，把它视为
+         * 客户机运行结束，打印 RIP 便于定位停在哪里。
          */
         case KVM_EXIT_HLT: {
             struct kvm_regs regs;
@@ -334,6 +433,14 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
                 return vcpu_finish(stats, "invalid_io_data", -1);
             }
             uint8_t *data = (uint8_t *)run + offset;
+            const char *event = NULL;
+            int platform = platform_handle_io(run, data, data_size, &event);
+            if (platform > 0) {
+                fprintf(stderr, "INFO: guest requested %s\n", event);
+                return vcpu_finish(stats, event, 0);
+            }
+            if (platform == 0)
+                break;
             /* no_uart 消融项让串口端口也走“未模拟设备”分支。 */
             if (!SVMM_ABLATE_UART_ENABLED && serial_handles_port(run->io.port)) {
                 ++stats->serial_exits;

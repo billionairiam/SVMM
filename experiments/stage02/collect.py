@@ -321,10 +321,13 @@ def run_timed(
     start = time.monotonic()
     timed_out = False
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        # Stage 02 实验只测到挂载根文件系统之前：不加载 initramfs，也不接控制台输入。
         process = subprocess.Popen(
             timed_command,
+            stdin=subprocess.DEVNULL,
             stdout=stdout_file,
             stderr=stderr_file,
+            env={**os.environ, "INITRAMFS_PATH": ""},
             start_new_session=True,
         )
         try:
