@@ -152,6 +152,20 @@ static void put_io_gas(uint8_t *table, size_t offset, uint16_t port)
     put64(table, offset + 4, port);
 }
 
+// RSDP
+//   |
+//   v
+// XSDT / RSDT
+//   |
+//   +----> FADT ------> DSDT
+//   |
+//   +----> MADT
+//   |
+//   +----> MCFG
+//   |
+//   +----> HPET
+//   |
+//   +----> ...
 int boot_acpi_setup(struct guest_memory *memory)
 {
     if (!memory->data || memory->size < ACPI_TABLES_END) {
@@ -160,6 +174,7 @@ int boot_acpi_setup(struct guest_memory *memory)
     }
 
     /* RSDP（ACPI 2.0 格式）：前 20 字节一个 checksum，整个 36 字节再一个。 */
+    // RSDP：ACPI 的“入口地址”
     uint8_t rsdp[RSDP_SIZE] = { 0 };
     memcpy(rsdp, "RSD PTR ", 8);
     memcpy(rsdp + 9, "SVMM  ", 6);
@@ -169,6 +184,7 @@ int boot_acpi_setup(struct guest_memory *memory)
     rsdp[8] = checksum(rsdp, 20);
     rsdp[32] = checksum(rsdp, RSDP_SIZE);
 
+    // rsdt里面就是一堆其他 ACPI table 的地址
     uint8_t rsdt[RSDT_SIZE] = { 0 };
     put_header(rsdt, "RSDT", RSDT_SIZE, 1);
     put32(rsdt, ACPI_HEADER_SIZE, ACPI_FADT_ADDR);
@@ -176,6 +192,7 @@ int boot_acpi_setup(struct guest_memory *memory)
     finish_table(rsdt, RSDT_SIZE);
 
     /* FADT 6.0：字段偏移见 ACPI 规范 5.2.9 “Fixed ACPI Description Table”。 */
+    // ACPI 平台基础配置表 + DSDT 的入口
     uint8_t fadt[FADT_SIZE] = { 0 };
     put_header(fadt, "FACP", FADT_SIZE, 6);
     put32(fadt, 40, ACPI_DSDT_ADDR);               /* DSDT */
@@ -190,7 +207,8 @@ int boot_acpi_setup(struct guest_memory *memory)
     put_io_gas(fadt, 256, ACPI_SLEEP_STATUS_PORT);
     memcpy(fadt + 268, "SVMM\0\0\0\0", 8);         /* Hypervisor Vendor Identity */
     finish_table(fadt, FADT_SIZE);
-
+    
+    // DSDT：描述“机器里有哪些设备、设备怎么工作”
     uint8_t dsdt[DSDT_SIZE] = { 0 };
     put_header(dsdt, "DSDT", DSDT_SIZE, 2);
     memcpy(dsdt + ACPI_HEADER_SIZE, dsdt_aml, sizeof(dsdt_aml));
@@ -202,6 +220,7 @@ int boot_acpi_setup(struct guest_memory *memory)
      *   type 1 I/O APIC：ID 1，MMIO 0xFEC00000，GSI 从 0 开始
      * 没有中断源覆盖条目，ISA IRQ n 直接对应 GSI n（COM1 即 GSI 4）。
      */
+    // MADT：CPU 和中断控制器拓扑
     uint8_t madt[MADT_SIZE] = { 0 };
     put_header(madt, "APIC", MADT_SIZE, 4);
     put32(madt, 36, LAPIC_ADDR);
