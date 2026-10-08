@@ -230,28 +230,34 @@ size_t boot_linux_memory_size(const struct linux_image *image)
  * 按 Linux x86 boot protocol 把已经解析过的 bzImage 放入客户机内存。
  * 本阶段不执行 16 位 setup 代码，而是直接以 32 位保护模式跳到
  * KERNEL_ADDR，并让 RSI 指向 BOOT_PARAMS_ADDR。
- *
- * 主要客户机物理地址布局（ACPI 表由 boot_acpi_setup 另行写入）：
- *
- *   +-------------------------------+ 0x00000000
- *   | IVT + BDA + 保留低内存         |
- *   +-------------------------------+ 0x00000500
- *   | 32 位启动用 GDT                |  GDT_ADDR
- *   +-------------------------------+ 0x00009000
- *   | boot_params / 零页面           |  BOOT_PARAMS_ADDR
- *   +-------------------------------+ 0x00010000
- *   | bzImage boot sector + setup   |  SETUP_CODE_ADDR（只作副本，不执行）
- *   +-------------------------------+ 0x00020000
- *   | 内核 cmdline 字符串            |  CMDLINE_ADDR
- *   +-------------------------------+ 0x000E0000
- *   | ACPI：RSDP/RSDT/FADT/DSDT/MADT |  ACPI_RSDP_ADDR；内核把 640K–1M 视为 BIOS 区保留
- *   +-------------------------------+ 0x00100000
- *   | 压缩内核载荷，32 位入口         |  KERNEL_ADDR
- *   +-------------------------------+ 至少 0x06000000
- *   | initramfs（可选）              |  boot_linux_initrd_addr()
- *   +-------------------------------+
- *   | 客户机 RAM 结束                |  至少 256 MiB
- *   +-------------------------------+
+ * 
+ * +------------------+ 0x00000000 (0)
+    |  IVT + BDA       |  E820_RESERVED
+    +------------------+ 0x00000500
+    |  GDT (legacy)    |  未使用；kernel 自己管理 GDT
+    +------------------+ 0x00009000 (36 KiB)
+    |  boot_params     |  4 KiB zero page
+    +------------------+ 0x0000A000 (40 KiB)
+    |  E820 table      |
+    +------------------+ 0x00010000 (64 KiB)
+    |  Linux setup     |  bzImage setup sectors (kernel 自己的实模式代码)
+    |  code            |  entry @ offset 0x200
+    +------------------+ 0x00020000 (128 KiB)
+    |  cmdline string  |  "console=ttyS0 init=/init ..."
+    +------------------+ 0x000E0000 (896 KiB)
+    |  ACPI tables     |  RSDP, RSDT, FADT, DSDT, MADT
+    +------------------+ 0x00100000 (1 MiB)
+    |  Linux kernel    |  bzImage protected-mode payload (vmlinux.bin)
+    +------------------+ 0x01000000 (16 MiB)
+    |  Kernel          |  解压输出区 (init_size 可达 ~80 MiB)
+    |  decompression   |
+    +------------------+ 0x06000000 (96 MiB)
+    |  initramfs       |  cpio.gz archive (max 144 MiB)
+    +------------------+ 0x0F000000 (240 MiB)
+    |  (free)          |
+    +------------------+ 0x10000000 (256 MiB)
+    |  Guest RAM end   |
+    +------------------+
  */
 int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *image,
                        const char *cmdline, const struct linux_initrd *initrd)
