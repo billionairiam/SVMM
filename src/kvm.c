@@ -29,7 +29,7 @@ int kvm_context_init(struct kvm_context *kvm)
         perror("KVM_CREATE_VM");
         return -1;
     }
-    if (ioctl(kvm->vm_fd, KVM_SET_TSS_ADDR, 0xfffbd000) < 0) {
+    if (ioctl(kvm->vm_fd, KVM_SET_TSS_ADDR, 0xfffbd000UL) < 0) {
         perror("KVM_SET_TSS_ADDR");
         return -1;
     }

@@ -25,7 +25,7 @@ hello from guest
 - `src/kvm.c`：打开 KVM 并创建 VM。
 - `src/memory.c`：分配并注册 64 KiB 客户机内存。
 - `src/vcpu.c`：配置实模式 vCPU，运行并分发 I/O 退出。
-- `src/serial.c`：处理 COM1 的 8 个端口；仅数据端口写入会输出，其余写入被忽略。
+- `src/serial.c`：处理 COM1 的 8 个端口；仅数据端口写入会输出，其余写入被忽略。16550 寄存器为 8 位宽，`out dx, ax` 等多字节写只输出低字节；跨出 COM1 范围的访问视为错误。
 - `src/guest_code.h`：输出 `hello from guest` 的实模式机器码。
 
 这个 Stage 01 示例只支持串口输出；不实现输入、LSR、IRQ，也不启动 Linux 内核。

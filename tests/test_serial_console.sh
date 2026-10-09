@@ -17,7 +17,16 @@ fi
 
 output_file=$(mktemp)
 trap 'rm -f "$output_file"' EXIT HUP INT TERM
-./bin/serial_console > "$output_file"
+status=0
+timeout 5 ./bin/serial_console > "$output_file" || status=$?
+if [ "$status" -ne 0 ]; then
+    if [ "$status" -eq 124 ]; then
+        echo 'serial_console timed out' >&2
+    else
+        echo "serial_console exited with status $status" >&2
+    fi
+    exit 1
+fi
 if ! printf 'hello from guest\n' | cmp - "$output_file"; then
     echo 'unexpected serial output' >&2
     exit 1
