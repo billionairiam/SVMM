@@ -13,7 +13,12 @@ int kvm_context_init(struct kvm_context *kvm)
     kvm->vm_fd = -1;
     kvm->system_fd = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     if (kvm->system_fd < 0) {
+        int open_errno = errno;
         perror("open /dev/kvm");
+        if (open_errno == ENOENT)
+            fprintf(stderr, "hint: load kvm_intel/kvm_amd and check that CPU virtualization is enabled\n");
+        else if (open_errno == EACCES || open_errno == EPERM)
+            fprintf(stderr, "hint: add the user to the kvm group (usermod -aG kvm \"$USER\") and log in again\n");
         return -1;
     }
     int version = ioctl(kvm->system_fd, KVM_GET_API_VERSION, 0);
@@ -29,14 +34,14 @@ int kvm_context_init(struct kvm_context *kvm)
         perror("KVM_CREATE_VM");
         return -1;
     }
-    // 在 Intel CPU 上运行实模式客户机时，KVM 需要 4 KiB 的客户机物理内存来存放任务状态段（Task State Segment，TSS）。
-    // 这是因为当客户机执行 hlt 或触发某些异常时，KVM 内部会切换到 32 位保护模式来处理这些事件，而 TSS 是保护模式切换的必要结构。
-    // VMM 必须通过 KVM_SET_TSS_ADDR 告诉 KVM 这块内存的位置。地址要求：
-    // 4 KiB 对齐
+    // KVM_SET_TSS_ADDR 指定一块 3 页（12 KiB）的客户机物理地址区域，供 Intel VMX 下的 KVM 内部使用。
+    // 当 CPU 不支持 unrestricted guest 时，VMX 无法直接运行实模式，KVM 会借助 vm86（虚拟 8086）模式模拟实模式，
+    // 而 vm86 需要一个 TSS（含中断重定向位图和 I/O 位图），这块区域就用来存放它。
+    // 支持 unrestricted guest 的 CPU 实际不会用到它，但仍应设置。地址要求：
     // 在 4 GiB 以下
-    // 不与已注册的客户机内存槽位重叠
-    // 常用的约定地址是 0xfffbd000（QEMU/kvmtool 也使用此地址），位于 32 位地址空间的顶端附近，远离我们的 64 KiB 客户机 RAM（0x0000–0xFFFF）。
-    // AMD CPU 不需要此 ioctl，但为兼容性考虑，应在所有 x86 KVM 环境中调用。
+    // 不与任何内存槽位或 MMIO 地址重叠
+    // 0xfffbd000 是 kvmtool 使用的约定地址（QEMU 用 0xfeffd000），占用 0xfffbd000–0xfffbffff，远离我们的 64 KiB 客户机 RAM（0x0000–0xFFFF）。
+    // AMD SVM 可直接运行实模式，此 ioctl 在 AMD 上是空操作，因此在所有 x86 KVM 上统一调用即可。
     if (ioctl(kvm->vm_fd, KVM_SET_TSS_ADDR, 0xfffbd000) < 0) {
         perror("KVM_SET_TSS_ADDR");
         return -1;
