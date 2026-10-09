@@ -4,11 +4,24 @@ SVMM_METRIC variant=no_uart stage=memory_mapped guest_memory_bytes=134217728
 SVMM_METRIC variant=no_uart stage=boot_prepared guest_memory_bytes=134217728
 SVMM_METRIC variant=no_uart stage=vcpu_setup guest_memory_bytes=134217728
 SVMM_METRIC variant=no_uart stage=kvm_run guest_memory_bytes=134217728
-INFO: unmodeled I/O port=0xcf8 direction=1
-INFO: unmodeled I/O port=0xcfc direction=0
-INFO: unmodeled I/O port=0x3f9 direction=0
-INFO: unmodeled I/O port=0x3f9 direction=1
-INFO: unmodeled I/O port=0x3f8 direction=1
-INFO: unmodeled I/O port=0x3fd direction=0
-INFO: unmodeled I/O port=0x3f8 direction=1
-INFO: unmodeled I/O port=0x3fd direction=0
+INFO: unmodeled I/O port=0xcf8 size=4 direction=1
+INFO: unmodeled I/O port=0xcfc size=2 direction=0
+INFO: unmodeled I/O port=0x3f9 size=1 direction=0
+INFO: unmodeled I/O port=0x3f8 size=1 direction=1
+INFO: unmodeled I/O port=0x3fd size=1 direction=0
+INFO: unmodeled I/O port=0xcfe size=2 direction=0
+INFO: unmodeled I/O port=0xa1 size=1 direction=1
+INFO: unmodeled I/O port=0x21 size=1 direction=1
+INFO: unmodeled I/O port=0x3fb size=1 direction=1
+INFO: unmodeled I/O port=0x3fa size=1 direction=1
+INFO: unmodeled I/O port=0x3fc size=1 direction=1
+INFO: unmodeled I/O port=0x43 size=1 direction=1
+INFO: unmodeled I/O port=0x40 size=1 direction=1
+INFO: unmodeled I/O port=0xcfb size=1 direction=1
+INFO: unmodeled I/O port=0xcfa size=1 direction=1
+INFO: unmodeled I/O port=0x87 size=1 direction=0
+INFO: unmodeled I/O port=0x2f9 size=1 direction=0
+INFO: unmodeled I/O port=0x3e9 size=1 direction=0
+INFO: unmodeled I/O port=0x2e9 size=1 direction=0
+INFO: unmodeled I/O port=0x64 size=1 direction=0
+INFO: unmodeled I/O port=0x60 size=1 direction=0

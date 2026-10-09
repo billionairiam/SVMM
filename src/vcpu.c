@@ -2,11 +2,14 @@
 
 #include "ablation.h"
 #include "kvm.h"
+#include "memory.h"
 #include "metrics.h"
+#include "rtc.h"
 #include "serial.h"
 
 #include <errno.h>
 #include <linux/kvm.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,11 +35,46 @@
  *
  * KVM 新建的 vCPU 默认 CPUID 表几乎为空，Linux 早期代码会用 CPUID 检查
  * 长模式、PAE 等特性；缺少这些信息时内核可能拒绝启动或走错误路径。
- * 这里直接把 KVM 支持的全集原样交给客户机，不做裁剪。
+ * 这里把 KVM 支持的全集交给客户机，只修正与本 VMM 实际平台不符的项，
+ * 见 fixup_cpuid()。
  *
  * 成功返回 0；失败返回 -1，并已打印错误信息。
  */
-static int vcpu_setup_cpuid(struct vcpu *vcpu, int system_fd)
+#define CPUID_1_EDX_APIC (1u << 9)
+#define CPUID_1_ECX_X2APIC (1u << 21)
+#define CPUID_1_ECX_TSC_DEADLINE (1u << 24)
+
+/*
+ * KVM_GET_SUPPORTED_CPUID 描述的是“KVM 能提供什么”，而本阶段没有调用
+ * KVM_CREATE_IRQCHIP，也就没有 LAPIC。如果仍宣称 APIC/x2APIC/TSC-deadline，
+ * Linux 会去访问 0xfee00000 的 LAPIC 寄存器：每次都是一次 MMIO exit，
+ * 读回的全 1 还会触发 "APIC: Stale IRR" 等错误。因此去掉这些特性位。
+ *
+ * leaf 1 的 EBX[31:24] 和 leaf 0xb/0x1f 的 EDX 是初始 APIC ID，KVM 原样
+ * 返回宿主机当前 CPU 的编号，要换成本 vCPU 的编号，否则 Linux 报告
+ * "APIC ID mismatch"。
+ */
+static void fixup_cpuid(struct kvm_cpuid2 *cpuid, unsigned vcpu_id)
+{
+    for (uint32_t i = 0; i < cpuid->nent; ++i) {
+        struct kvm_cpuid_entry2 *entry = &cpuid->entries[i];
+        switch (entry->function) {
+        case 1:
+            entry->ebx = (entry->ebx & 0x00ffffffu) | (vcpu_id << 24);
+            entry->edx &= ~CPUID_1_EDX_APIC;
+            entry->ecx &= ~(CPUID_1_ECX_X2APIC | CPUID_1_ECX_TSC_DEADLINE);
+            break;
+        case 0xb:
+        case 0x1f:
+            entry->edx = vcpu_id;
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+static int vcpu_setup_cpuid(struct vcpu *vcpu, int system_fd, unsigned vcpu_id)
 {
     /*
      * CPUID 条目数量随 CPU 型号和内核版本变化，事先无法确定。
@@ -60,6 +98,7 @@ static int vcpu_setup_cpuid(struct vcpu *vcpu, int system_fd)
          * 必须在第一次 KVM_RUN 之前完成。
          */
         if (ioctl(system_fd, KVM_GET_SUPPORTED_CPUID, cpuid) == 0) {
+            fixup_cpuid(cpuid, vcpu_id);
             int result = ioctl(vcpu->fd, KVM_SET_CPUID2, cpuid);
             if (result < 0)
                 perror("KVM_SET_CPUID2");
@@ -129,7 +168,66 @@ int vcpu_init(struct vcpu *vcpu, const struct kvm_context *kvm, unsigned id)
     /* no_cpuid 消融项保留 KVM 的默认 CPUID，用来观察缺少 CPUID 时的失败点。 */
     if (SVMM_ABLATE_CPUID_ENABLED)
         return 0;
-    return vcpu_setup_cpuid(vcpu, kvm->system_fd);
+    return vcpu_setup_cpuid(vcpu, kvm->system_fd, id);
+}
+
+/*
+ * 把段寄存器、GDTR 和控制寄存器设置成 32 位启动协议要求的状态：
+ * 保护模式、未开分页、平坦的 __BOOT_CS/__BOOT_DS。
+ */
+static void setup_protected_mode(struct kvm_sregs *sregs)
+{
+    /*
+     * kvm_segment 描述的是段寄存器的“隐藏部分”（描述符缓存）。直接
+     * 写入它就相当于 CPU 已经从 GDT 装载过这个段，所以不需要执行
+     * 客户机代码来加载段寄存器。各字段含义：
+     *   base = 0, limit = 0xffffffff  平坦段，覆盖全部 4 GiB
+     *                                 （KVM 使用字节单位的 limit）
+     *   selector = 0x10               GDT index 2，RPL 0，即 __BOOT_CS
+     *   type = 0xb                    代码段：可执行、可读、已访问
+     *   present = 1                   段存在
+     *   s = 1                         代码/数据段，而不是系统段
+     *   db = 1                        默认操作数和地址宽度为 32 位
+     *   g = 1                         4 KiB 粒度，与 GDT 描述符一致
+     * dpl 等未列出的字段为 0，即内核特权级 ring 0。
+     */
+    struct kvm_segment code = {
+        .base = 0,
+        .limit = 0xffffffff,
+        .selector = 0x10,
+        .type = 0xb,
+        .present = 1,
+        .s = 1,
+        .db = 1,
+        .g = 1,
+    };
+    /* 数据段与代码段相同，只是 selector 为 0x18（index 3，__BOOT_DS），
+     * type = 0x3 表示可读、可写、已访问的数据段。 */
+    struct kvm_segment data = code;
+    data.selector = 0x18;
+    data.type = 0x3;
+    sregs->cs = code;
+    sregs->ds = data;
+    sregs->es = data;
+    sregs->fs = data;
+    sregs->gs = data;
+    sregs->ss = data;
+    /*
+     * GDTR 指向 boot_linux_prepare() 写入的 4 项 GDT（每项 8 字节）。
+     * limit 是“最后一个有效字节的偏移”，因此是总长度减 1。内核之后
+     * 重新加载段寄存器时会从这里读取描述符，所以内容必须与上面一致。
+     */
+    sregs->gdt.base = GDT_ADDR;
+    sregs->gdt.limit = 4 * 8 - 1;
+    /*
+     * CR0.PE（bit 0）置 1 进入保护模式；CR0.PG（bit 31）清 0 关闭分页，
+     * 此时线性地址直接等于物理地址。CR3（页表基址）、CR4（PAE 等扩展）
+     * 和 EFER（含 LME 长模式使能）全部清零：进入长模式由内核自己完成。
+     */
+    sregs->cr0 = (sregs->cr0 | 1u) & ~(1u << 31);
+    sregs->cr3 = 0;
+    sregs->cr4 = 0;
+    sregs->efer = 0;
 }
 
 /*
@@ -143,82 +241,35 @@ int vcpu_init(struct vcpu *vcpu, const struct kvm_context *kvm, unsigned id)
  *   - 关闭中断；
  *   - %esi 指向 struct boot_params（zero page）；
  *   - %ebp、%edi、%ebx 为 0。
- * 对应的 GDT 内容由 boot_linux_prepare() 写到客户机物理地址 0x500。
+ * 对应的 GDT 内容由 boot_linux_prepare() 写到客户机物理地址 GDT_ADDR（0x500）。
  */
 int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
                           unsigned boot_params_addr)
 {
     /*
+     * 先读回 KVM 的当前值再改需要的字段，其他字段（IDT、LDT、TR 等）
+     * 保持默认，避免把它们意外清成非法值。
+     */
+    struct kvm_sregs sregs;
+    if (ioctl(vcpu->fd, KVM_GET_SREGS, &sregs) < 0) {
+        perror("KVM_GET_SREGS");
+        return -1;
+    }
+    /*
+     * 本阶段没有 KVM_CREATE_IRQCHIP，也就没有 LAPIC。复位后的 APIC_BASE
+     * MSR 仍处于使能状态，KVM 会据此在运行时重新置上 CPUID 的 APIC 位，
+     * 所以必须清掉使能位，客户机才会认为没有本地 APIC 并使用 8259 模式。
+     */
+    sregs.apic_base = 0;
+    /*
      * no_protected_mode 消融项跳过段寄存器和控制寄存器设置，vCPU 保持
      * KVM 默认的实模式复位状态，用来观察直接跳 32 位入口会在哪里失败。
      */
-    if (!SVMM_ABLATE_PROTECTED_MODE_ENABLED) {
-        /*
-         * 先读回 KVM 的当前值再改需要的字段，其他字段（IDT、LDT、TR、
-         * APIC base 等）保持默认，避免把它们意外清成非法值。
-         */
-        struct kvm_sregs sregs;
-        if (ioctl(vcpu->fd, KVM_GET_SREGS, &sregs) < 0) {
-            perror("KVM_GET_SREGS");
-            return -1;
-        }
-        /*
-         * The 32-bit boot protocol enters the compressed kernel directly.
-         *
-         * kvm_segment 描述的是段寄存器的“隐藏部分”（描述符缓存）。直接
-         * 写入它就相当于 CPU 已经从 GDT 装载过这个段，所以不需要执行
-         * 客户机代码来加载段寄存器。各字段含义：
-         *   base = 0, limit = 0xffffffff  平坦段，覆盖全部 4 GiB
-         *                                 （KVM 使用字节单位的 limit）
-         *   selector = 0x10               GDT index 2，RPL 0，即 __BOOT_CS
-         *   type = 0xb                    代码段：可执行、可读、已访问
-         *   present = 1                   段存在
-         *   s = 1                         代码/数据段，而不是系统段
-         *   db = 1                        默认操作数和地址宽度为 32 位
-         *   g = 1                         4 KiB 粒度，与 GDT 描述符一致
-         * dpl 等未列出的字段为 0，即内核特权级 ring 0。
-         */
-        struct kvm_segment code = {
-            .base = 0,
-            .limit = 0xffffffff,
-            .selector = 0x10,
-            .type = 0xb,
-            .present = 1,
-            .s = 1,
-            .db = 1,
-            .g = 1,
-        };
-        /* 数据段与代码段相同，只是 selector 为 0x18（index 3，__BOOT_DS），
-         * type = 0x3 表示可读、可写、已访问的数据段。 */
-        struct kvm_segment data = code;
-        data.selector = 0x18;
-        data.type = 0x3;
-        sregs.cs = code;
-        sregs.ds = data;
-        sregs.es = data;
-        sregs.fs = data;
-        sregs.gs = data;
-        sregs.ss = data;
-        /*
-         * GDTR 指向 boot_linux_prepare() 写入的 4 项 GDT（每项 8 字节）。
-         * limit 是“最后一个有效字节的偏移”，因此是总长度减 1。内核之后
-         * 重新加载段寄存器时会从这里读取描述符，所以内容必须与上面一致。
-         */
-        sregs.gdt.base = 0x500;
-        sregs.gdt.limit = 4 * 8 - 1;
-        /*
-         * CR0.PE（bit 0）置 1 进入保护模式；CR0.PG（bit 31）清 0 关闭分页，
-         * 此时线性地址直接等于物理地址。CR3（页表基址）、CR4（PAE 等扩展）
-         * 和 EFER（含 LME 长模式使能）全部清零：进入长模式由内核自己完成。
-         */
-        sregs.cr0 = (sregs.cr0 | 1u) & ~(1u << 31);
-        sregs.cr3 = 0;
-        sregs.cr4 = 0;
-        sregs.efer = 0;
-        if (ioctl(vcpu->fd, KVM_SET_SREGS, &sregs) < 0) {
-            perror("KVM_SET_SREGS");
-            return -1;
-        }
+    if (!SVMM_ABLATE_PROTECTED_MODE_ENABLED)
+        setup_protected_mode(&sregs);
+    if (ioctl(vcpu->fd, KVM_SET_SREGS, &sregs) < 0) {
+        perror("KVM_SET_SREGS");
+        return -1;
     }
     /*
      * 通用寄存器。未列出的字段由指定初始化器置 0，正好满足协议对
@@ -251,22 +302,84 @@ static int vcpu_finish(struct vcpu_run_stats *stats, const char *reason,
     return status;
 }
 
+/* 端口 0x80 是 POST 诊断端口，Linux 用写它来实现 I/O 延时（io_delay）。 */
+#define POST_PORT 0x80u
+
+enum pio_result {
+    PIO_ERROR = -1,
+    PIO_UNMODELED = 0,
+    PIO_HANDLED = 1,
+};
+
+static bool pio_serial_enabled(const struct vcpu_devices *devices, uint16_t port)
+{
+    return !SVMM_ABLATE_UART_ENABLED && devices && devices->serial &&
+           serial_handles_port(port);
+}
+
+/* 把一次 8 位端口写分发给对应设备。 */
+static enum pio_result pio_out_byte(const struct vcpu_devices *devices,
+                                    uint16_t port, uint8_t value)
+{
+    if (pio_serial_enabled(devices, port)) {
+        if (serial_handle_out(devices->serial, port, value) < 0) {
+            perror("serial output");
+            return PIO_ERROR;
+        }
+        return PIO_HANDLED;
+    }
+    if (devices && devices->rtc && rtc_handles_port(port)) {
+        rtc_handle_out(devices->rtc, port, value);
+        return PIO_HANDLED;
+    }
+    if (port == POST_PORT)
+        return PIO_HANDLED;
+    return PIO_UNMODELED;
+}
+
+/*
+ * 把一次 8 位端口读分发给对应设备。未模拟的端口返回全 1，模拟 ISA
+ * 总线上没有设备应答时的浮空值，内核探测到 0xff 通常会认为设备不存在。
+ */
+static enum pio_result pio_in_byte(const struct vcpu_devices *devices,
+                                   uint16_t port, uint8_t *value)
+{
+    *value = 0xff;
+    if (pio_serial_enabled(devices, port))
+        return serial_handle_in(devices->serial, port, value) < 0 ?
+                   PIO_ERROR : PIO_HANDLED;
+    if (devices && devices->rtc && rtc_handles_port(port)) {
+        *value = rtc_handle_in(devices->rtc, port);
+        return PIO_HANDLED;
+    }
+    if (port == POST_PORT)
+        return PIO_HANDLED;
+    return PIO_UNMODELED;
+}
+
 /*
  * 反复进入客户机，直到客户机停机或出错。
  *
  * 每次 KVM_RUN 返回代表一次 VM exit：客户机执行了 KVM 无法在内核内
- * 自行处理、需要用户态 VMM 参与的操作。本 VMM 只模拟 COM1 串口；
- * 其他端口 I/O 和 MMIO 都按“没有设备”处理后继续运行。
+ * 自行处理、需要用户态 VMM 参与的操作。本 VMM 模拟 COM1 串口和 CMOS
+ * RTC，并静默接受 POST 端口 0x80；其他端口 I/O 和 MMIO 都按“没有设备”
+ * 处理后继续运行。devices 或其中的设备可以为 NULL，此时对应端口也按
+ * 未模拟处理。
  *
  * 返回 0 表示客户机正常执行 HLT；-1 表示 KVM 出错、客户机三重故障或
  * 遇到无法处理的退出。stats 记录退出次数、串口退出次数和最后一次
  * 退出原因，无论哪种结果都会通过 vcpu_finish() 输出。
  */
-int vcpu_run(struct vcpu *vcpu, struct serial *serial,
+int vcpu_run(struct vcpu *vcpu, const struct vcpu_devices *devices,
              struct vcpu_run_stats *stats)
 {
-    /* 限制“未模拟设备”日志条数，避免内核探测硬件时刷屏。 */
-    unsigned ignored_io = 0;
+    /*
+     * 每个未模拟端口只在第一次访问时打印一行，内核反复轮询同一端口时
+     * 不会刷屏，也不会因为前几个端口占满配额而看不到后来的新端口。
+     */
+    uint8_t logged_ports[65536 / 8] = { 0 };
+    /* MMIO 地址空间太大，不逐地址去重，只限制总条数。 */
+    unsigned logged_mmio = 0;
     *stats = (struct vcpu_run_stats){ 0 };
     for (;;) {
         /*
@@ -334,37 +447,33 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
                 return vcpu_finish(stats, "invalid_io_data", -1);
             }
             uint8_t *data = (uint8_t *)run + offset;
-            /* no_uart 消融项让串口端口也走“未模拟设备”分支。 */
-            if (!SVMM_ABLATE_UART_ENABLED && serial_handles_port(run->io.port)) {
+            uint16_t port = run->io.port;
+            bool is_out = run->io.direction == KVM_EXIT_IO_OUT;
+            if (pio_serial_enabled(devices, port))
                 ++stats->serial_exits;
-                if (run->io.direction == KVM_EXIT_IO_OUT) {
-                    /* 客户机写串口：交给 UART 模型，THR 写入会输出到宿主机。 */
-                    if (serial_handle_out(serial, run->io.port, data, data_size) < 0) {
-                        perror("serial output");
+            /*
+             * 端口设备都是 8 位寄存器。宽度为 2/4 的访问相当于同时访问
+             * port、port+1……，所以把每个元素的第 j 个字节分发到 port + j；
+             * REP INS/OUTS 的每个元素都从同一个起始端口开始。
+             */
+            bool unmodeled = false;
+            for (uint32_t i = 0; i < run->io.count; ++i) {
+                for (uint8_t j = 0; j < run->io.size; ++j) {
+                    uint16_t byte_port = (uint16_t)(port + j);
+                    uint8_t *byte = data + (size_t)i * run->io.size + j;
+                    enum pio_result result = is_out ?
+                        pio_out_byte(devices, byte_port, *byte) :
+                        pio_in_byte(devices, byte_port, byte);
+                    if (result == PIO_ERROR)
                         return vcpu_finish(stats, "serial_error", -1);
-                    }
-                } else {
-                    /*
-                     * 客户机读串口：UART 寄存器都是 8 位，每次访问只填每个
-                     * 元素的第一个字节，其余字节先清零，避免返回上次的残留值。
-                     */
-                    memset(data, 0, data_size);
-                    for (size_t i = 0; i < run->io.count; ++i) {
-                        if (serial_handle_in(serial, run->io.port,
-                                             data + i * run->io.size) < 0)
-                            return vcpu_finish(stats, "serial_error", -1);
-                    }
+                    if (result == PIO_UNMODELED)
+                        unmodeled = true;
                 }
-            } else {
-                /*
-                 * 未模拟的端口：写入直接丢弃；读取返回全 1，模拟 ISA 总线上
-                 * 没有设备应答时的浮空值，内核探测到 0xff 通常会认为设备不存在。
-                 */
-                if (run->io.direction == KVM_EXIT_IO_IN)
-                    memset(data, 0xff, data_size);
-                if (ignored_io++ < 8)
-                    fprintf(stderr, "INFO: unmodeled I/O port=0x%x direction=%u\n",
-                            run->io.port, run->io.direction);
+            }
+            if (unmodeled && !(logged_ports[port / 8] & (1u << (port % 8)))) {
+                logged_ports[port / 8] |= (uint8_t)(1u << (port % 8));
+                fprintf(stderr, "INFO: unmodeled I/O port=0x%x size=%u direction=%u\n",
+                        port, run->io.size, run->io.direction);
             }
             break;
         }
@@ -380,7 +489,7 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
             }
             if (!run->mmio.is_write)
                 memset(run->mmio.data, 0xff, run->mmio.len);
-            if (ignored_io++ < 8)
+            if (logged_mmio++ < 8)
                 fprintf(stderr, "INFO: unmodeled MMIO address=0x%llx\n",
                         (unsigned long long)run->mmio.phys_addr);
             break;

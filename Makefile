@@ -3,7 +3,8 @@ CFLAGS ?= -std=c11 -Wall -Wextra -Werror -O2 -g -D_GNU_SOURCE
 CPPFLAGS += -Isrc
 .DEFAULT_GOAL := all
 
-SOURCES := src/main.c src/kvm.c src/memory.c src/vcpu.c src/serial.c src/metrics.c src/boot/linux.c
+SOURCES := src/main.c src/kvm.c src/memory.c src/vcpu.c src/serial.c src/rtc.c src/metrics.c \
+           src/boot/linux.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 DEPFILES := $(OBJECTS:.o=.d)
 
@@ -25,7 +26,7 @@ ABLATION_OBJECTS_$(1) := $(SOURCES:src/%.c=build/ablation/$(1)/%.o)
 ABLATION_DEPFILES += $$(ABLATION_OBJECTS_$(1):.o=.d)
 
 bin/ablation/$(1)/linux_boot: $$(ABLATION_OBJECTS_$(1)) | bin/ablation/$(1)
-	$$(CC) $$(CFLAGS) $$^ -o $$@
+	$$(CC) $$(CFLAGS) $$(LDFLAGS) $$^ $$(LDLIBS) -o $$@
 
 build/ablation/$(1)/%.o: src/%.c
 	@mkdir -p $$(dir $$@)
@@ -44,24 +45,34 @@ all: bin/linux_boot
 ablation: $(ABLATION_VARIANTS:%=bin/ablation/%/linux_boot)
 
 bin/linux_boot: $(OBJECTS) | bin
-	$(CC) $(CFLAGS) $(OBJECTS) -o $@
+	$(CC) $(CFLAGS) $(LDFLAGS) $(OBJECTS) $(LDLIBS) -o $@
 
-bin/test_serial: tests/test_serial.c src/serial.c src/serial.h | bin
+bin/test_serial: tests/test_serial.c tests/check.h src/serial.c src/serial.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_serial.c src/serial.c -o $@
 
-bin/test_uart: tests/test_uart.c src/serial.c src/serial.h | bin
+bin/test_uart: tests/test_uart.c tests/check.h src/serial.c src/serial.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_uart.c src/serial.c -o $@
 
-bin/test_boot: tests/test_boot.c src/boot/linux.c src/boot/linux.h src/memory.c src/memory.h | bin
+bin/test_rtc: tests/test_rtc.c tests/check.h src/rtc.c src/rtc.h | bin
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_rtc.c src/rtc.c -o $@
+
+bin/test_boot: tests/test_boot.c tests/check.h src/boot/linux.c src/boot/linux.h src/memory.c src/memory.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_boot.c src/boot/linux.c src/memory.c -o $@
 
-bin/test_metrics: tests/test_metrics.c src/metrics.c src/metrics.h src/vcpu.h | bin
+bin/test_metrics: tests/test_metrics.c tests/check.h src/metrics.c src/metrics.h src/vcpu.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_metrics.c src/metrics.c -o $@
 
-bin/test_vcpu_errors: tests/test_vcpu_errors.c src/vcpu.c src/vcpu.h \
-                      src/serial.c src/serial.h src/metrics.c src/metrics.h | bin
+bin/test_vcpu_errors: tests/test_vcpu_errors.c tests/check.h src/vcpu.c src/vcpu.h src/memory.h \
+                      src/serial.c src/serial.h src/rtc.c src/rtc.h \
+                      src/metrics.c src/metrics.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_vcpu_errors.c src/vcpu.c \
-		src/serial.c src/metrics.c -Wl,--wrap=ioctl -o $@
+		src/serial.c src/rtc.c src/metrics.c -Wl,--wrap=ioctl -o $@
+
+bin/test_vcpu_pio: tests/test_vcpu_pio.c tests/check.h src/vcpu.c src/vcpu.h src/memory.h \
+                   src/serial.c src/serial.h src/rtc.c src/rtc.h \
+                   src/metrics.c src/metrics.h | bin
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_vcpu_pio.c src/vcpu.c \
+		src/serial.c src/rtc.c src/metrics.c -Wl,--wrap=ioctl -o $@
 
 build/%.o: src/%.c | build
 	@mkdir -p $(dir $@)
@@ -76,9 +87,10 @@ bin/ablation/%:
 run: all
 	@./bin/linux_boot
 
-test: bin/test_metrics bin/test_vcpu_errors
+test: bin/test_metrics bin/test_vcpu_errors bin/test_vcpu_pio
 	./bin/test_metrics
 	./bin/test_vcpu_errors
+	./bin/test_vcpu_pio
 	python3 -m unittest -v tests/test_ablation_collect.py
 	sh tests/test_loader_ablations.sh
 	sh tests/test_linux_boot.sh

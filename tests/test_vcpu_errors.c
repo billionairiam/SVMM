@@ -1,6 +1,6 @@
+#include "check.h"
 #include "vcpu.h"
 
-#include <assert.h>
 #include <linux/kvm.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,7 +11,7 @@
 int __wrap_ioctl(int fd, unsigned long request, ...)
 {
     (void)fd;
-    assert(request == KVM_RUN);
+    CHECK(request == KVM_RUN);
     return 0;
 }
 
@@ -25,38 +25,38 @@ static void check_error_exit(struct kvm_run *run, size_t run_size,
     };
     struct vcpu_run_stats stats;
     FILE *capture = tmpfile();
-    assert(capture);
+    CHECK(capture);
     int saved_stderr = dup(STDERR_FILENO);
-    assert(saved_stderr >= 0);
-    assert(dup2(fileno(capture), STDERR_FILENO) >= 0);
+    CHECK(saved_stderr >= 0);
+    CHECK(dup2(fileno(capture), STDERR_FILENO) >= 0);
 
-    assert(vcpu_run(&vcpu, NULL, &stats) == -1);
-    assert(fflush(stderr) == 0);
-    assert(dup2(saved_stderr, STDERR_FILENO) >= 0);
+    CHECK(vcpu_run(&vcpu, NULL, &stats) == -1);
+    CHECK(fflush(stderr) == 0);
+    CHECK(dup2(saved_stderr, STDERR_FILENO) >= 0);
     close(saved_stderr);
 
-    assert(stats.entered == 1);
-    assert(stats.exits == 1);
-    assert(stats.exit_reason == run->exit_reason);
-    assert(fseek(capture, 0, SEEK_SET) == 0);
+    CHECK(stats.entered == 1);
+    CHECK(stats.exits == 1);
+    CHECK(stats.exit_reason == run->exit_reason);
+    CHECK(fseek(capture, 0, SEEK_SET) == 0);
     char output[1024] = { 0 };
     size_t bytes = fread(output, 1, sizeof(output) - 1, capture);
-    assert(bytes > 0);
+    CHECK(bytes > 0);
     fclose(capture);
 
     char expected[128];
     int length = snprintf(expected, sizeof(expected),
                           "stage=vcpu_exit reason=%s entered=1 exits=1",
                           reason);
-    assert(length > 0 && (size_t)length < sizeof(expected));
-    assert(strstr(output, expected));
+    CHECK(length > 0 && (size_t)length < sizeof(expected));
+    CHECK(strstr(output, expected));
 }
 
 int main(void)
 {
     const size_t run_size = sizeof(struct kvm_run) + 64;
     struct kvm_run *run = calloc(1, run_size);
-    assert(run);
+    CHECK(run);
 
     run->exit_reason = KVM_EXIT_IO;
     run->io.size = 3;

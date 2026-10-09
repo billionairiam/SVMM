@@ -16,12 +16,12 @@
 
 | 内核 | 变体 | 结果 | Linux 日志 | e820 | 串口输出 | KVM exits | 超时 |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| primary | baseline | halted | 1 | 1 | 1 | 209384 | 0 |
+| primary | baseline | halted | 1 | 1 | 1 | 29786 | 0 |
 | primary | no_cpuid | halted | 0 | 0 | 0 | 1 | 0 |
 | primary | fixed_32m | loader_rejected | 0 | 0 | 0 | 0 | 0 |
 | primary | no_boot_params | triple_fault | 0 | 0 | 0 | 1 | 0 |
 | primary | no_e820 | panic | 1 | 0 | 1 | 未记录 | 1 |
-| primary | no_cmdline | halted | 0 | 0 | 0 | 179477 | 0 |
+| primary | no_cmdline | halted | 0 | 0 | 0 | 191 | 0 |
 | primary | no_protected_mode | timeout | 0 | 0 | 0 | 未记录 | 1 |
 | primary | no_uart | timeout | 0 | 0 | 0 | 未记录 | 1 |
 | compat | baseline | panic | 1 | 1 | 1 | 未记录 | 1 |
@@ -37,8 +37,8 @@
 
 | 变体 | 次数 | 终点识别率 | 超时次数 | 时间均值 ms | 时间范围 ms | exits 均值 | RSS 均值 KiB |
 | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |
-| baseline | 10 | 1.000 | 0 | 2160.000 | 1820–2490 | 209384.000 | 91212.800 |
-| no_e820 | 10 | 1.000 | 10 | 15002.000 | 15002–15002 |  |  |
+| baseline | 10 | 1.000 | 0 | 377.000 | 370–380 | 29786.000 | 91346.400 |
+| no_e820 | 10 | 1.000 | 10 | 15027.200 | 15022–15033 |  |  |
 
 ## 逐项解释
 
