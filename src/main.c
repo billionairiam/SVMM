@@ -3,6 +3,7 @@
 #include "kvm.h"
 #include "memory.h"
 #include "metrics.h"
+#include "rtc.h"
 #include "serial.h"
 #include "vcpu.h"
 
@@ -34,6 +35,7 @@ int main(int argc, char **argv)
     struct guest_memory memory = { 0 };
     struct vcpu vcpu = { .fd = -1 };
     struct serial serial;
+    struct rtc rtc;
     struct linux_image image = { 0 };
     size_t memory_size = 0;
     int status = 1;
@@ -75,9 +77,11 @@ int main(int argc, char **argv)
     metric_stage(stderr, SVMM_VARIANT_NAME, "vcpu_setup", memory_size);
 
     serial_init(&serial, STDOUT_FILENO);
+    rtc_init(&rtc);
+    struct vcpu_devices devices = { .serial = &serial, .rtc = &rtc };
     struct vcpu_run_stats run_stats = { 0 };
     metric_stage(stderr, SVMM_VARIANT_NAME, "kvm_run", memory_size);
-    int run_result = vcpu_run(&vcpu, &serial, &run_stats);
+    int run_result = vcpu_run(&vcpu, &devices, &run_stats);
     if (run_result == 0) {
         fprintf(stderr, "INFO: Stage 02 completed\n");
         status = 0;

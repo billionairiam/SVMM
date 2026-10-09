@@ -11,32 +11,32 @@
 [    0.000000] DMI not present or invalid.
 [    0.000000] Hypervisor detected: KVM
 [    0.000000] kvm-clock: Using msrs 4b564d01 and 4b564d00
-[    0.000000] kvm-clock: using sched offset of 304696768 cycles
-[    0.000523] clocksource: kvm-clock: mask: 0xffffffffffffffff max_cycles: 0x1cd42e4dffb, max_idle_ns: 881590591483 ns
-[    0.002150] tsc: Detected 2200.000 MHz processor
-[    0.002711] .text .data .bss are not marked as E820_TYPE_RAM!
-[    0.003292] last_pfn = 0x3630 max_arch_pfn = 0x10000000000
-[    0.003891] MTRRs disabled by BIOS
-[    0.004232] x86/PAT: Configuration [0-7]: WB  WC  UC- UC  WB  WP  UC- WT  
-[    0.021026] Using GB pages for direct mapping
-[    0.021548] Failed to release memory for alloc_low_pages()
-[    0.021581] Kernel panic - not syncing: alloc_low_pages: can not alloc memory
-[    0.022926] CPU: 0 UID: 0 PID: 0 Comm: swapper Not tainted 6.16.0 #1 PREEMPT(undef) 
-[    0.023704] Call Trace:
-[    0.023947]  <TASK>
-[    0.024157]  ? panic+0x325/0x380
-[    0.024483]  ? alloc_low_pages+0x5c/0x150
-[    0.024888]  ? phys_pmd_init+0x200/0x3a0
-[    0.025282]  ? phys_pud_init+0x361/0x390
-[    0.025678]  ? phys_p4d_init+0x98/0x330
-[    0.026063]  ? __kernel_physical_mapping_init+0xa5/0x370
-[    0.026594]  ? init_memory_mapping+0x14d/0x3d0
-[    0.027041]  ? init_range_memory_mapping+0xd7/0x170
-[    0.027529]  ? init_mem_mapping+0x2c0/0x370
-[    0.027980]  ? setup_arch+0x765/0xd80
-[    0.028347]  ? start_kernel+0x5b/0x7e0
-[    0.028725]  ? x86_64_start_reservations+0x18/0x30
-[    0.029204]  ? x86_64_start_kernel+0x103/0x120
-[    0.029653]  ? common_startup_64+0x13e/0x148
-[    0.030081]  </TASK>
-[    0.030301] ---[ end Kernel panic - not syncing: alloc_low_pages: can not alloc memory ]---
+[    0.000001] kvm-clock: using sched offset of 301885937 cycles
+[    0.000524] clocksource: kvm-clock: mask: 0xffffffffffffffff max_cycles: 0x1cd42e4dffb, max_idle_ns: 881590591483 ns
+[    0.002143] tsc: Detected 2200.000 MHz processor
+[    0.002700] .text .data .bss are not marked as E820_TYPE_RAM!
+[    0.003283] last_pfn = 0x3630 max_arch_pfn = 0x10000000000
+[    0.003876] MTRRs disabled by BIOS
+[    0.004215] x86/PAT: Configuration [0-7]: WB  WC  UC- UC  WB  WP  UC- WT  
+[    0.020919] Using GB pages for direct mapping
+[    0.021387] Failed to release memory for alloc_low_pages()
+[    0.021426] Kernel panic - not syncing: alloc_low_pages: can not alloc memory
+[    0.022682] CPU: 0 UID: 0 PID: 0 Comm: swapper Not tainted 6.16.0 #1 PREEMPT(undef) 
+[    0.023455] Call Trace:
+[    0.023699]  <TASK>
+[    0.023907]  ? panic+0x325/0x380
+[    0.024232]  ? alloc_low_pages+0x5c/0x150
+[    0.024636]  ? phys_pmd_init+0x200/0x3a0
+[    0.025029]  ? phys_pud_init+0x361/0x390
+[    0.025424]  ? phys_p4d_init+0x98/0x330
+[    0.025806]  ? __kernel_physical_mapping_init+0xa5/0x370
+[    0.026340]  ? init_memory_mapping+0x14d/0x3d0
+[    0.026783]  ? init_range_memory_mapping+0xd7/0x170
+[    0.027269]  ? init_mem_mapping+0x2c0/0x370
+[    0.027689]  ? setup_arch+0x765/0xd80
+[    0.028055]  ? start_kernel+0x5b/0x7e0
+[    0.028433]  ? x86_64_start_reservations+0x18/0x30
+[    0.028909]  ? x86_64_start_kernel+0x103/0x120
+[    0.029354]  ? common_startup_64+0x13e/0x148
+[    0.029780]  </TASK>
+[    0.029998] ---[ end Kernel panic - not syncing: alloc_low_pages: can not alloc memory ]---

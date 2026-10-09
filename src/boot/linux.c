@@ -53,7 +53,8 @@ static uint64_t align_up(uint64_t value, uint64_t alignment)
  *
  * 本函数只负责读取和验证镜像。把各部分复制进客户机内存的工作由
  * boot_linux_prepare() 完成。
- *  * boot_params 中本函数关心的协议偏移：
+ *
+ * boot_params 中本函数关心的协议偏移：
  *
  *   0x1e8  e820_entries           e820 条目数
  *   0x1f1  hdr.setup_sects        setup 扇区数
@@ -203,30 +204,24 @@ size_t boot_linux_memory_size(const struct linux_image *image)
  * 本阶段不执行 16 位 setup 代码，而是直接以 32 位保护模式跳到
  * KERNEL_ADDR，并让 RSI 指向 BOOT_PARAMS_ADDR。
  *
- * 主要客户机物理地址布局：
+ * 客户机物理地址布局（e820 表直接写在 boot_params 内部，没有单独的副本）：
  *
- *   0x00000500  GDT
- *   0x00009000  struct boot_params（zero page）
- *   0x00010000  bzImage 的 boot sector 和 setup 代码副本
- *   0x00020000  以 NUL 结尾的内核命令行
- *   0x00100000  压缩内核载荷，即 32 位入口
- *  +-------------------------------+ 0x00000000
- *  | IVT + BDA + 保留低内存         |
+ *   +-------------------------------+ 0x00000000
+ *   | IVT + BDA，e820 中标为保留     |
  *   +-------------------------------+ 0x00000500
- *   | 辅助 GDT 位置                  |  GDT_ADDR，遗留/辅助区域
+ *   | GDT（null、null、CS、DS）       |  GDT_ADDR
  *   +-------------------------------+ 0x00009000
- *   | boot_params / 零页面           |  BOOT_PARAMS_ADDR
- *   +-------------------------------+ 0x0000A000
- *   | e820 表镜像                    |  E820_ADDR
+ *   | struct boot_params（零页）     |  BOOT_PARAMS_ADDR，RSI 指向这里
  *   +-------------------------------+ 0x00010000
- *   | Linux 实模式设置代码            |  SETUP_CODE_ADDR，入口在偏移 0x200
+ *   | boot sector + setup 代码副本   |  SETUP_CODE_ADDR，只作数据，不执行
  *   +-------------------------------+ 0x00020000
- *   | 内核 cmdline 字符串            |  CMDLINE_ADDR，"console=ttyS0"
+ *   | 以 NUL 结尾的内核命令行        |  CMDLINE_ADDR
+ *   +-------------------------------+ 0x00090000
+ *   | 32 位入口使用的临时栈（向下长）|  见 vcpu_setup_linux_boot()
  *   +-------------------------------+ 0x00100000
- *   | 压缩内核载荷                   |  KERNEL_ADDR
- *   +-------------------------------+ 0x02000000
- *   | 客户机 RAM 结束                |  32 MiB
- *   +-------------------------------+
+ *   | 压缩内核载荷，即 32 位入口      |  KERNEL_ADDR
+ *   +-------------------------------+ boot_linux_memory_size()
+ *   客户机 RAM 结束：至少 128 MiB，并覆盖内核解压后的运行窗口
  */
 int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *image,
                        const char *cmdline)
@@ -346,7 +341,7 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
         UINT64_C(0x00cf9b000000ffff),
         UINT64_C(0x00cf93000000ffff),
     };
-    if (guest_memory_load(memory, 0x500, gdt, sizeof(gdt)) < 0)
+    if (guest_memory_load(memory, GDT_ADDR, gdt, sizeof(gdt)) < 0)
         return -1;
 
     /*

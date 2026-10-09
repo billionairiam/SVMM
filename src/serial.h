@@ -2,7 +2,6 @@
 #define SERIAL_H
 
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
 
 #define COM1_PORT 0x3f8u
@@ -21,8 +20,7 @@ struct serial {
 
 void serial_init(struct serial *serial, int out_fd);
 bool serial_handles_port(uint16_t port);
-int serial_handle_out(struct serial *serial, uint16_t port,
-                      const uint8_t *data, size_t size);
+int serial_handle_out(struct serial *serial, uint16_t port, uint8_t value);
 int serial_handle_in(struct serial *serial, uint16_t port, uint8_t *value);
 
 #endif

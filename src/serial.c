@@ -29,7 +29,7 @@
  *   6     -     MSR modem 状态           （只读，写入忽略）
  *   7     -     SCR 暂存寄存器           SCR
  *
- * 所有 UART 寄存器都是 8 位，因此每次访问只使用第一个字节。
+ * 所有 UART 寄存器都是 8 位，本模块的接口也按单字节访问。
  */
 
 /* 清空所有寄存器（相当于上电复位），并记录输出目标文件描述符。 */
@@ -46,29 +46,26 @@ bool serial_handles_port(uint16_t port)
 }
 
 /*
- * 处理客户机对 COM1 的 OUT 指令。data/size 来自 KVM_EXIT_IO 的数据缓冲区：
- * 寄存器写入只看 data[0]；THR 写入则把全部 size 个字节依次写出，
- * 这样 REP OUTSB 一次带出的多个字符也能完整输出。
+ * 处理客户机向 COM1 某个 8 位寄存器写入一个字节。宽度大于 1 的 OUT
+ * 或 REP OUTS 由运行循环拆成逐字节访问：第 j 个字节落在 port + j，
+ * 与真实 8 位 ISA 设备的行为一致。
  *
  * 成功返回 0；端口不属于 COM1 时返回 -1 且 errno = EINVAL；
  * 写 out_fd 失败时返回 -1 并保留 write() 设置的 errno。
  */
-int serial_handle_out(struct serial *serial, uint16_t port,
-                      const uint8_t *data, size_t size)
+int serial_handle_out(struct serial *serial, uint16_t port, uint8_t value)
 {
     if (!serial_handles_port(port)) {
         errno = EINVAL;
         return -1;
     }
-    if (size == 0)
-        return 0;
 
     /* 除了 DLAB=0 时的偏移 0（THR）会跳出 switch 去输出，其余情况都在这里返回。 */
     switch (port - COM1_PORT) {
     case 0:
         /* DLAB=1 时偏移 0 是除数锁存器低字节，只保存不输出。 */
         if (serial->lcr & 0x80) {
-            serial->dll = data[0];
+            serial->dll = value;
             return 0;
         }
         /* DLAB=0 时是 THR：跳出 switch，把字符写到宿主机。 */
@@ -80,53 +77,45 @@ int serial_handle_out(struct serial *serial, uint16_t port,
          * 保留为 0。虽然本模型从不产生中断，仍保存该值供驱动读回校验。
          */
         if (serial->lcr & 0x80)
-            serial->dlm = data[0];
+            serial->dlm = value;
         else
-            serial->ier = data[0] & 0x0f;
+            serial->ier = value & 0x0f;
         return 0;
     case 2:
         /*
          * 写方向是 FCR。只记录 bit 0（FIFO 使能），它决定读 IIR 时 bit 7:6
          * 是否报告 FIFO 已启用；清空 FIFO、触发阈值等位没有意义，直接丢弃。
          */
-        serial->fcr = data[0] & 0x01;
+        serial->fcr = value & 0x01;
         return 0;
     case 3:
         /* LCR：数据位/停止位/校验等格式配置，bit 7 是 DLAB，切换偏移 0/1 的含义。 */
-        serial->lcr = data[0];
+        serial->lcr = value;
         return 0;
     case 4:
         /* MCR：DTR、RTS、OUT1、OUT2、LOOP 等控制位，读 MSR 时会用到。 */
-        serial->mcr = data[0];
+        serial->mcr = value;
         return 0;
     case 7:
         /* SCR 是没有任何硬件作用的暂存寄存器，驱动会写入再读回以探测 UART 是否存在。 */
-        serial->scr = data[0];
+        serial->scr = value;
         return 0;
     default:
         /* 偏移 5（LSR）和 6（MSR）是只读寄存器，写入被忽略。 */
         return 0;
     }
 
-    /*
-     * THR 写入：把字符写到 out_fd。write() 可能被信号打断（EINTR）或只写
-     * 一部分，因此循环直到全部写完。返回 0 表示无法继续写入，按 I/O 错误处理。
-     */
-    size_t written = 0;
-    while (written < size) {
-        ssize_t n = write(serial->out_fd, data + written, size - written);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (n == 0) {
+    /* THR 写入：write() 可能被信号打断（EINTR），返回 0 表示无法继续写入。 */
+    for (;;) {
+        ssize_t n = write(serial->out_fd, &value, 1);
+        if (n == 1)
+            return 0;
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n == 0)
             errno = EIO;
-            return -1;
-        }
-        written += (size_t)n;
+        return -1;
     }
-    return 0;
 }
 
 /*
@@ -168,7 +157,7 @@ int serial_handle_in(struct serial *serial, uint16_t port, uint8_t *value)
          * 恒为 1，表示随时可以写下一个字符，轮询发送的驱动不会卡住；
          * bit 0 DR（有接收数据）恒为 0，错误位也都为 0。
          */
-        *value = 0x60; /* THR empty, transmitter empty */
+        *value = 0x60; /* THRE | TEMT */
         break;
     case 6:
         /*
@@ -191,7 +180,7 @@ int serial_handle_in(struct serial *serial, uint16_t port, uint8_t *value)
                      ((serial->mcr & 0x04) ? 0x40 : 0) |
                      ((serial->mcr & 0x08) ? 0x80 : 0);
         } else {
-            *value = 0xb0; /* CTS, DSR and DCD asserted */
+            *value = 0xb0; /* CTS、DSR、DCD 有效 */
         }
         break;
     case 7:
