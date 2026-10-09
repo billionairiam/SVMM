@@ -234,6 +234,30 @@ static void setup_protected_mode(struct kvm_sregs *sregs)
  * 按 Linux x86 32 位启动协议设置 vCPU 的初始状态，使第一次 KVM_RUN
  * 直接从 kernel_addr（压缩内核的 code32_start）开始执行。
  *
+ * 背景：x86 CPU 复位后处于 16 位“实模式”，地址 = 段寄存器 * 16 + 偏移，
+ * 只能访问 1 MiB。操作系统要先切换到 32 位“保护模式”（通过 GDT 描述段、
+ * 置 CR0.PE），64 位内核还要再进入“长模式”（开 PAE、页表、EFER.LME、
+ * CR0.PG）。在真实机器上，这些切换由 bzImage 的 16 位 setup 代码和
+ * 解压器逐步完成。
+ *
+ * Linux 提供了几个可选入口：
+ *   - 16 位入口（setup 代码，文件偏移 0x200）：教程的做法，设置
+ *     CS=DS=ES=0x1000、SS=0x900、IP=0x200。setup 代码会调用 BIOS 中断
+ *     （int 0x15 查询 e820、int 0x10 设置显示模式等）。KVM 虚拟机里没有
+ *     BIOS，中断向量表全是 0，int 指令会跳到地址 0 执行无意义的字节。
+ *     实测 15 秒内既没有串口输出也没有任何 VM exit。
+ *   - 32 位入口（code32_start，本函数使用）：引导器自己完成 setup 的
+ *     工作（boot_params、e820），把 CPU 设成平坦保护模式后跳到 1 MiB。
+ *     QEMU 不带固件直接启动内核时也采用类似思路。
+ *   - 64 位入口（1 MiB + 0x200）：还要求引导器建立页表并进入长模式。
+ *   - UEFI 入口（EFI stub）：需要 UEFI 固件，不适用。
+ *
+ * 跳进 32 位入口之后，剩下的都是内核自己的事：
+ *   startup_32（arch/x86/boot/compressed/head_64.S）建立恒等映射页表、
+ *   进入长模式 -> 把压缩内核搬到安全位置 -> extract_kernel() 解压到
+ *   pref_address 并处理重定位 -> 跳到真正内核的 startup_64 ->
+ *   start_kernel()，此后开始通过串口打印 "Linux version ..."。
+ *
  * 协议要求进入 32 位入口时：
  *   - 处于保护模式、未开启分页；
  *   - GDT 中 __BOOT_CS(0x10) 和 __BOOT_DS(0x18) 都是基址 0、界限 4 GiB 的
