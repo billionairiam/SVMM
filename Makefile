@@ -6,6 +6,7 @@ BUILD_DIR := build
 BIN := $(BUILD_DIR)/stage-00-kvm-hello
 SRCS := src/main.c src/kvm.c src/memory.c src/vcpu.c
 OBJS := $(SRCS:src/%.c=$(BUILD_DIR)/%.o)
+DEPS := $(OBJS:.o=.d)
 
 .PHONY: all run test clean
 
@@ -15,10 +16,12 @@ $(BIN): $(OBJS)
 	$(CC) $(CFLAGS) $(OBJS) -o $@
 
 $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR):
 	mkdir -p $@
+
+-include $(DEPS)
 
 run: all
 	@./$(BIN)

@@ -107,6 +107,14 @@ int vcpu_run(struct vcpu *vcpu, int out_fd)
             }
             break;
         }
+        case KVM_EXIT_FAIL_ENTRY:
+            fprintf(stderr, "KVM_EXIT_FAIL_ENTRY: hardware_entry_failure_reason=0x%llx\n",
+                    (unsigned long long)run->fail_entry.hardware_entry_failure_reason);
+            return -1;
+        case KVM_EXIT_INTERNAL_ERROR:
+            fprintf(stderr, "KVM_EXIT_INTERNAL_ERROR: suberror=%u\n",
+                    run->internal.suberror);
+            return -1;
         default:
             fprintf(stderr, "unexpected KVM exit reason: %u\n", run->exit_reason);
             return -1;
