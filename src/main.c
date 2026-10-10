@@ -96,6 +96,7 @@ int main(int argc, char **argv)
     struct serial serial;
     struct console console = { 0 };
     struct linux_image image = { 0 };
+    struct vcpu_run_stats run_stats = { 0 };
     size_t memory_size = 0;
     int serial_ready = 0;
     int status = 1;
@@ -162,17 +163,16 @@ int main(int argc, char **argv)
         goto done;
     }
 
-    struct vcpu_run_stats run_stats = { 0 };
     metric_stage(stderr, SVMM_VARIANT_NAME, "kvm_run", memory_size);
-    int run_result = vcpu_run(&vcpu, &serial, &run_stats);
-    console_stop(&console);
-    if (run_result == 0) {
-        fprintf(stderr, "INFO: Stage 03 completed\n");
+    if (vcpu_run(&vcpu, &serial, &run_stats) == 0)
         status = 0;
-    }
 
 done:
+    /* 先恢复终端模式，再打印统计；raw 模式下 "\n" 不会回到行首。 */
     console_stop(&console);
+    metric_exit_breakdown(stderr, &run_stats);
+    if (status == 0)
+        fprintf(stderr, "INFO: Stage 03 completed\n");
     signal_vcpu = NULL;
     vcpu_destroy(&vcpu);
     if (serial_ready)

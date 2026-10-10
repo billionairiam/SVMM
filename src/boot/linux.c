@@ -19,29 +19,35 @@
 #define BOOT_PROTOCOL_MIN 0x020cu
 #define E820_RAM 1u
 #define E820_RESERVED 2u
+/* setup_header 在 bzImage 文件和 boot_params（zero page）中都位于偏移 0x1f1。 */
+#define SETUP_HEADER_OFFSET 0x1f1u
+/* 本加载器最后读取的字段是 init_size（0x260–0x263），启动头至少要到 0x264。 */
+#define SETUP_HEADER_MIN_END 0x264u
 
-_Static_assert(offsetof(struct boot_params, hdr) == 0x1f1,
+_Static_assert(offsetof(struct boot_params, hdr) == SETUP_HEADER_OFFSET,
                "unexpected Linux boot header layout");
 _Static_assert(offsetof(struct boot_params, e820_table) == 0x2d0,
                "unexpected Linux e820 layout");
-
-static uint16_t read_le16(const uint8_t *data)
-{
-    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
-}
-
-static uint64_t read_le64(const uint8_t *data)
-{
-    uint64_t value = 0;
-    for (unsigned i = 0; i < 8; ++i)
-        value |= (uint64_t)data[i] << (8 * i);
-    return value;
-}
+_Static_assert(SETUP_HEADER_OFFSET + offsetof(struct setup_header, init_size) +
+                   sizeof(((struct setup_header *)0)->init_size) ==
+                   SETUP_HEADER_MIN_END,
+               "unexpected init_size offset");
 
 /* alignment 必须是 2 的幂。 */
 static uint64_t align_up(uint64_t value, uint64_t alignment)
 {
     return (value + alignment - 1) & ~(alignment - 1);
+}
+
+/*
+ * 文件偏移 0x200 是一条两字节短跳转指令 `EB xx`（即 setup_header.jump，
+ * 按小端读出后 xx 在高字节），xx 是以 0x202 为基准的 8 位相对位移。
+ * 合法 bzImage 用它跳过启动头、到达 setup 代码入口，所以启动头在
+ * 0x202 + xx 处结束。较新的协议版本会在末尾追加字段，启动头随之变长。
+ */
+static size_t setup_header_end(const struct setup_header *hdr)
+{
+    return 0x202u + (hdr->jump >> 8);
 }
 
 /*
@@ -53,19 +59,24 @@ static uint64_t align_up(uint64_t value, uint64_t alignment)
  *
  * 本函数只负责读取和验证镜像。把各部分复制进客户机内存的工作由
  * boot_linux_prepare() 完成。
- *  * boot_params 中本函数关心的协议偏移：
+ *
+ * 启动头字段使用内核头文件 <asm/bootparam.h> 中 struct setup_header 的
+ * 字段名。boot_params 中本加载器关心的协议偏移：
  *
  *   0x1e8  e820_entries           e820 条目数
  *   0x1f1  hdr.setup_sects        setup 扇区数
+ *   0x200  hdr.jump               跳过启动头的短跳转，决定启动头长度
+ *   0x202  hdr.header             魔数 "HdrS"
+ *   0x206  hdr.version            启动协议版本
  *   0x210  hdr.type_of_loader     引导加载器 ID
- *   0x211  hdr.loadflags          CAN_USE_HEAP 等标志
+ *   0x211  hdr.loadflags          LOADED_HIGH、CAN_USE_HEAP 等标志
+ *   0x218  hdr.ramdisk_image      initramfs 客户机物理地址（由加载器填写）
+ *   0x21c  hdr.ramdisk_size       initramfs 字节数（由加载器填写）
  *   0x228  hdr.cmd_line_ptr       命令行客户机物理地址
+ *   0x22c  hdr.initrd_addr_max    initramfs 最后一个字节允许的最高地址
  *   0x230  hdr.kernel_alignment   可重定位内核的对齐要求
  *   0x234  hdr.relocatable_kernel 可重定位标志
  *   0x238  hdr.cmdline_size       镜像允许的最大命令行长度
- *   0x218  hdr.ramdisk_image      initramfs 客户机物理地址（由加载器填写）
- *   0x21c  hdr.ramdisk_size       initramfs 字节数（由加载器填写）
- *   0x22c  hdr.initrd_addr_max    initramfs 最后一个字节允许的最高地址
  *   0x258  hdr.pref_address       内核首选运行地址
  *   0x260  hdr.init_size          早期初始化内存窗口大小
  *   0x2d0  e820_table             BIOS 风格物理内存表
@@ -82,12 +93,13 @@ int boot_linux_load(const char *path, struct linux_image *image)
         return -1;
     }
     /*
-     * 在分配内存前检查文件大小：0x264 是当前会读取到的最后一个
-     * 启动头字段 init_size 的末尾，512 MiB 是本程序设置的安全上限。
+     * 在分配内存前检查文件大小：文件至少要包含到 init_size 为止的启动头，
+     * 512 MiB 是本程序设置的安全上限。
      */
     struct stat statbuf;
     if (fstat(fd, &statbuf) < 0 || statbuf.st_size < 0 ||
-        statbuf.st_size > BZIMAGE_MAX_SIZE || statbuf.st_size < 0x264) {
+        statbuf.st_size > BZIMAGE_MAX_SIZE ||
+        statbuf.st_size < SETUP_HEADER_MIN_END) {
         fprintf(stderr, "invalid bzImage file size\n");
         close(fd);
         return -1;
@@ -116,46 +128,51 @@ int boot_linux_load(const char *path, struct linux_image *image)
     close(fd);
 
     /*
-     * setup_sects 位于文件偏移 0x1f1，记录 boot sector 后面还有多少个
-     * setup 扇区。协议规定值为 0 时按 4 处理；再加 1 才包含 boot sector。
-     * 所以 setup_size 同时也是压缩内核载荷在文件中的起始偏移。
+     * 把文件偏移 0x1f1 处的启动头复制到本地结构体，之后用字段名访问，
+     * 不再手写偏移。struct setup_header 在内核头文件里是 packed 的，
+     * 字段布局与协议文档逐字节一致。文件比整个结构体短时，多出的尾部
+     * 字段保持为 0（前面已保证文件至少包含到 init_size）。
      */
-    size_t setup_sectors = data[0x1f1] ? data[0x1f1] : 4;
+    struct setup_header hdr = { 0 };
+    size_t hdr_bytes = size - SETUP_HEADER_OFFSET;
+    memcpy(&hdr, data + SETUP_HEADER_OFFSET,
+           hdr_bytes < sizeof(hdr) ? hdr_bytes : sizeof(hdr));
+
+    /*
+     * setup_sects：boot sector 后面还有多少个 setup 扇区。协议规定值为 0
+     * 时按 4 处理；再加 1 才包含 boot sector。所以 setup_size 同时也是
+     * 压缩内核载荷在文件中的起始偏移。
+     */
+    size_t setup_sectors = hdr.setup_sects ? hdr.setup_sects : 4;
     size_t setup_size = (setup_sectors + 1) * 512;
 
-    /* 下面这些偏移都来自 Linux x86 boot protocol 的 setup_header。 */
-    uint16_t version = read_le16(data + 0x206);
-
     /*
-     * init_size（偏移 0x260，单位：字节）：内核在能够读取 e820 内存表前，
-     * 从 runtime_start 开始所需的连续内存长度。它不是启动 Linux 所需的
+     * init_size（单位：字节）：内核在能够读取 e820 内存表前，从
+     * runtime_start 开始所需的连续内存长度。它不是启动 Linux 所需的
      * 总内存大小，而是内核早期初始化阶段必须保证可用的内存窗口大小。
      */
-    uint32_t init_size;
-    memcpy(&init_size, data + 0x260, sizeof(init_size));
+    uint32_t init_size = hdr.init_size;
 
     /*
-     * preferred（pref_address，偏移 0x258，单位：客户机物理地址）：内核
-     * 希望最终运行的位置。不可重定位内核必须在这里运行；可重定位内核在
-     * 当前载入地址低于该地址时，也会把自己移动到这里。
+     * pref_address（客户机物理地址）：内核希望最终运行的位置。不可重定位
+     * 内核必须在这里运行；可重定位内核在当前载入地址低于该地址时，也会
+     * 把自己移动到这里。
      */
-    uint64_t preferred = read_le64(data + 0x258);
+    uint64_t preferred = hdr.pref_address;
 
     /*
-     * initrd_addr_max（偏移 0x22c）：内核能访问的 initramfs 最高字节地址。
-     * 它是内核告诉加载器的限制，加载器只读取并遵守，不应改写。
+     * initrd_addr_max：内核能访问的 initramfs 最高字节地址。它是内核告诉
+     * 加载器的限制，加载器只读取并遵守，不应改写。
      */
-    uint32_t initrd_addr_max;
-    memcpy(&initrd_addr_max, data + 0x22c, sizeof(initrd_addr_max));
+    uint32_t initrd_addr_max = hdr.initrd_addr_max;
 
     /*
-     * kernel_alignment（偏移 0x230，单位：字节）：可重定位
-     * 内核运行地址必须满足的对齐值，例如 0x200000 表示按 2 MiB 对齐。
-     * 协议要求它是 2 的幂，后面据此把 runtime_start 向上取整。
+     * kernel_alignment（单位：字节）：可重定位内核运行地址必须满足的
+     * 对齐值，例如 0x200000 表示按 2 MiB 对齐。协议要求它是 2 的幂，
+     * 后面据此把 runtime_start 向上取整。
      */
-    uint32_t kernel_alignment;
-    memcpy(&kernel_alignment, data + 0x230, sizeof(kernel_alignment));
-    int relocatable = data[0x234] != 0;
+    uint32_t kernel_alignment = hdr.kernel_alignment;
+    int relocatable = hdr.relocatable_kernel != 0;
 
     /*
      * init_size 从“内核最终运行地址”开始计算，而不是固定从 1 MiB 计算。
@@ -170,12 +187,14 @@ int boot_linux_load(const char *path, struct linux_image *image)
 
     /*
      * 只接受本阶段支持的镜像：带 HdrS 的现代 bzImage、启动协议至少 2.12、
-     * 使用高地址载入，并且 setup、压缩载荷及初始化内存窗口均在合法范围内。
+     * 使用高地址载入、启动头长到包含 init_size，并且 setup、压缩载荷及
+     * 初始化内存窗口均在合法范围内。
      * kernel_alignment 必须是 2 的幂，才能交给 align_up() 计算。
      */
-    if (memcmp(data + 0x202, "HdrS", 4) != 0 ||
-        version < BOOT_PROTOCOL_MIN || !(data[0x211] & LOADED_HIGH) ||
-        data[0x201] < 0x62 || setup_size > 0x10000 || setup_size >= size ||
+    if (memcmp(&hdr.header, "HdrS", 4) != 0 ||
+        hdr.version < BOOT_PROTOCOL_MIN || !(hdr.loadflags & LOADED_HIGH) ||
+        setup_header_end(&hdr) < SETUP_HEADER_MIN_END ||
+        setup_size > 0x10000 || setup_size >= size ||
         init_size == 0 || init_size > BZIMAGE_MAX_SIZE ||
         init_size < size - setup_size || preferred > UINT32_MAX ||
         (relocatable && (!kernel_alignment ||
@@ -230,34 +249,28 @@ size_t boot_linux_memory_size(const struct linux_image *image)
  * 按 Linux x86 boot protocol 把已经解析过的 bzImage 放入客户机内存。
  * 本阶段不执行 16 位 setup 代码，而是直接以 32 位保护模式跳到
  * KERNEL_ADDR，并让 RSI 指向 BOOT_PARAMS_ADDR。
- * 
- * +------------------+ 0x00000000 (0)
-    |  IVT + BDA       |  E820_RESERVED
-    +------------------+ 0x00000500
-    |  GDT (legacy)    |  未使用；kernel 自己管理 GDT
-    +------------------+ 0x00009000 (36 KiB)
-    |  boot_params     |  4 KiB zero page
-    +------------------+ 0x0000A000 (40 KiB)
-    |  E820 table      |
-    +------------------+ 0x00010000 (64 KiB)
-    |  Linux setup     |  bzImage setup sectors (kernel 自己的实模式代码)
-    |  code            |  entry @ offset 0x200
-    +------------------+ 0x00020000 (128 KiB)
-    |  cmdline string  |  "console=ttyS0 init=/init ..."
-    +------------------+ 0x000E0000 (896 KiB)
-    |  ACPI tables     |  RSDP, RSDT, FADT, DSDT, MADT
-    +------------------+ 0x00100000 (1 MiB)
-    |  Linux kernel    |  bzImage protected-mode payload (vmlinux.bin)
-    +------------------+ 0x01000000 (16 MiB)
-    |  Kernel          |  解压输出区 (init_size 可达 ~80 MiB)
-    |  decompression   |
-    +------------------+ 0x06000000 (96 MiB)
-    |  initramfs       |  cpio.gz archive (max 144 MiB)
-    +------------------+ 0x0F000000 (240 MiB)
-    |  (free)          |
-    +------------------+ 0x10000000 (256 MiB)
-    |  Guest RAM end   |
-    +------------------+
+ *
+ * 客户机物理内存布局（地址从低到高）：
+ *
+ *   e820 [0, 64 KiB) 保留 —— 没有 BIOS，这里只放 VMM 写入的数据
+ *     0x00000500  临时 GDT（4 项，32 字节）  BOOT_GDT_ADDR，GDTR 指向这里
+ *     0x00009000  boot_params（4 KiB）       BOOT_PARAMS_ADDR，RSI 指向这里；
+ *                   +0x1f1 setup_header      e820 表就在 boot_params 内部，
+ *                   +0x2d0 e820_table        不是单独的一块内存
+ *
+ *   e820 [64 KiB, 1 MiB) 可用
+ *     0x00010000  setup 代码副本             SETUP_CODE_ADDR，只供检查，不执行
+ *     0x00020000  内核命令行（≤ 4 KiB）      CMDLINE_ADDR
+ *     0x00090000  入口临时栈顶，向下增长     BOOT_STACK_ADDR，RSP 初值
+ *     0x000e0000  ACPI 表                    内核把 640K–1M 视为 BIOS 区并保留
+ *
+ *   e820 [1 MiB, memory->size) 可用
+ *     0x00100000  压缩内核载荷               KERNEL_ADDR，RIP 从这里开始
+ *     runtime_start  内核运行窗口            内核把自己解压到这里，长度 init_size；
+ *                                            地址由启动头算出，常见为 16 MiB
+ *     initrd 地址    initramfs（≤ 144 MiB）  max(96 MiB, 窗口末尾按 2 MiB 对齐)，
+ *                                            见 boot_linux_initrd_addr()
+ *     memory->size   客户机内存末尾          至少 256 MiB
  */
 int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *image,
                        const char *cmdline, const struct linux_initrd *initrd)
@@ -299,7 +312,7 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
      */
     size_t cmdline_len = strlen(cmdline);
     const struct setup_header *source_hdr =
-        (const struct setup_header *)(image->data + 0x1f1);
+        (const struct setup_header *)(image->data + SETUP_HEADER_OFFSET);
     if (!SVMM_ABLATE_CMDLINE_ENABLED &&
         (cmdline_len >= CMDLINE_MAX_LEN ||
          (source_hdr->cmdline_size && cmdline_len > source_hdr->cmdline_size))) {
@@ -310,18 +323,11 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
     /*
      * zero page 必须先清零，再只复制镜像声明存在的 setup_header 字节。
      * 这样旧协议中不存在的尾部字段保持为 0，也不会越过本地结构体。
-     *
-     * 文件偏移 0x200 是一条两字节的短跳转指令 `EB xx`，0x201 的 xx
-     * 是以 0x202（该指令结束后的地址）为基准的 8 位相对位移。合法
-     * bzImage 在这里向前跳到 setup 代码入口，也就是实际启动头的末尾。因此：
-     *
-     *   启动头末尾 = 0x202 + image->data[0x201]
-     *   启动头长度 = 启动头末尾 - setup_header 起点 0x1f1
-     *
-     * 这个长度来自镜像本身，最后仍用 sizeof(params.hdr) 限制复制范围。
+     * 启动头长度由镜像自己的 jump 指令决定（见 setup_header_end()），
+     * 最后仍用 sizeof(params.hdr) 限制复制范围。
      */
     struct boot_params params = { 0 };
-    size_t header_size = image->data[0x201] + 0x202 - 0x1f1;
+    size_t header_size = setup_header_end(source_hdr) - SETUP_HEADER_OFFSET;
     if (header_size > sizeof(params.hdr))
         header_size = sizeof(params.hdr);
     memcpy(&params.hdr, source_hdr, header_size);
@@ -387,21 +393,22 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
 
     /*
      * 保护模式下，CS/DS/SS 保存的是 GDT selector，而不是段基址。
-     * vcpu_setup_linux_boot() 会把 CS 设为 0x10（GDT index 2），把数据段
-     * 设为 0x18（index 3）。两个描述符的 base 都是 0，limit 都覆盖 4 GiB：
+     * selector 除以 8 就是 GDT 下标：vcpu_setup_linux_boot() 把 CS 设为
+     * BOOT_CS_SELECTOR（0x10，index 2），数据段设为 BOOT_DS_SELECTOR
+     * （0x18，index 3）。两个描述符的 base 都是 0，limit 都覆盖 4 GiB：
      *
-     *   index 0  0x0000000000000000  空描述符
-     *   index 1  0x0000000000000000  保留
+     *   index 0  0x0000000000000000  空描述符（CPU 要求第 0 项为空）
+     *   index 1  0x0000000000000000  未使用
      *   index 2  0x00cf9b000000ffff  32 位可执行代码段
      *   index 3  0x00cf93000000ffff  32 位可写数据段
+     *
+     * 描述符各位的含义与 vcpu.c 中 struct kvm_segment 的字段一一对应：
+     * 0x9b/0x93 是 present=1、dpl=0、s=1 加 type=0xb/0x3；0xc 是 g=1、db=1。
      */
-    const uint64_t gdt[4] = {
-        0,
-        0,
-        UINT64_C(0x00cf9b000000ffff),
-        UINT64_C(0x00cf93000000ffff),
-    };
-    if (guest_memory_load(memory, 0x500, gdt, sizeof(gdt)) < 0)
+    uint64_t gdt[BOOT_GDT_ENTRIES] = { 0 };
+    gdt[BOOT_CS_SELECTOR / 8] = UINT64_C(0x00cf9b000000ffff);
+    gdt[BOOT_DS_SELECTOR / 8] = UINT64_C(0x00cf93000000ffff);
+    if (guest_memory_load(memory, BOOT_GDT_ADDR, gdt, sizeof(gdt)) < 0)
         return -1;
 
     /*
@@ -409,7 +416,7 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
      * 启动头。zero page 和 setup 副本由此不会显示互相矛盾的入口、堆和
      * 命令行信息；即使 no_boot_params 跳过 zero page，该副本仍可供检查。
      */
-    memcpy(memory->data + SETUP_CODE_ADDR + 0x1f1,
+    memcpy(memory->data + SETUP_CODE_ADDR + SETUP_HEADER_OFFSET,
            &params.hdr, sizeof(params.hdr));
     return 0;
 }

@@ -62,10 +62,11 @@ bin/test_uart: tests/test_uart.c src/serial.c src/serial.h | bin
 bin/test_boot: tests/test_boot.c src/boot/linux.c src/boot/linux.h src/memory.c src/memory.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_boot.c src/boot/linux.c src/memory.c -o $@
 
-bin/test_metrics: tests/test_metrics.c src/metrics.c src/metrics.h src/vcpu.h | bin
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_metrics.c src/metrics.c -o $@
+bin/test_metrics: tests/test_metrics.c src/metrics.c src/metrics.h src/vcpu.h \
+                  src/serial.c src/serial.h src/boot/acpi.h | bin
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_metrics.c src/metrics.c src/serial.c -o $@
 
-bin/test_vcpu_errors: tests/test_vcpu_errors.c src/vcpu.c src/vcpu.h src/boot/acpi.h \
+bin/test_vcpu_errors: tests/test_vcpu_errors.c src/vcpu.c src/vcpu.h src/boot/acpi.h src/memory.h \
                       src/serial.c src/serial.h src/metrics.c src/metrics.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_vcpu_errors.c src/vcpu.c \
 		src/serial.c src/metrics.c -Wl,--wrap=ioctl -o $@

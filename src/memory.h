@@ -12,6 +12,17 @@
 #else
 #define GUEST_MEMORY_MIN_SIZE (256u * 1024u * 1024u)
 #endif
+/*
+ * 32 位启动协议用的临时 GDT。boot_linux_prepare() 把描述符写到这里，
+ * vcpu_setup_linux_boot() 让 GDTR 指向这里，并把 CS/DS 设成下面两个
+ * selector。selector 的高 13 位是 GDT 下标，所以 0x10 是第 2 项、0x18 是第 3 项。
+ */
+#define BOOT_GDT_ADDR 0x00000500u
+#define BOOT_GDT_ENTRIES 4u
+#define BOOT_CS_SELECTOR 0x10u /* Linux 的 __BOOT_CS */
+#define BOOT_DS_SELECTOR 0x18u /* Linux 的 __BOOT_DS */
+/* 进入内核时的临时栈顶，位于 e820 可用区（64 KiB–1 MiB）内，向下增长。 */
+#define BOOT_STACK_ADDR 0x00090000u
 #define KERNEL_ADDR 0x00100000u
 #define SETUP_CODE_ADDR 0x00010000u
 #define BOOT_PARAMS_ADDR 0x00009000u
