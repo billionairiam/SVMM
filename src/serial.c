@@ -42,8 +42,16 @@
 #define IIR_FIFO 0xc0u
 #define FCR_ENABLE 0x01u
 #define FCR_CLEAR_RCVR 0x02u
+#define LCR_DLAB 0x80u  /* Divisor Latch Access：置位时偏移 0/1 变成除数锁存器 */
+#define MCR_DTR 0x01u
+#define MCR_RTS 0x02u
+#define MCR_OUT1 0x04u
 #define MCR_OUT2 0x08u
 #define MCR_LOOP 0x10u
+#define MSR_CTS 0x10u
+#define MSR_DSR 0x20u
+#define MSR_RI 0x40u
+#define MSR_DCD 0x80u
 #define UART_FIFO_SIZE 16u
 #define LSR_DR 0x01u
 #define LSR_THRE_TEMT 0x60u
@@ -175,7 +183,7 @@ int serial_handle_out(struct serial *serial, uint16_t port,
     pthread_mutex_lock(&serial->lock);
     switch (port - COM1_PORT) {
     case 0:
-        if (serial->lcr & 0x80) {
+        if (serial->lcr & LCR_DLAB) {
             /* DLAB=1 时偏移 0 是除数锁存器低字节，只保存不输出。 */
             serial->dll = data[0];
         } else {
@@ -206,7 +214,7 @@ int serial_handle_out(struct serial *serial, uint16_t port,
          * 真实 16550 在 THRI 由 0 变 1 且 THR 为空时立即报告 THR 空中断，
          * Linux 的 THRE 自检和 start_tx 都依赖这一点。
          */
-        if (serial->lcr & 0x80) {
+        if (serial->lcr & LCR_DLAB) {
             serial->dlm = data[0];
         } else {
             uint8_t ier = data[0] & 0x0f;
@@ -281,7 +289,7 @@ int serial_handle_in(struct serial *serial, uint16_t port, uint8_t *value)
     switch (port - COM1_PORT) {
     case 0:
         /* DLAB=1 读回除数低字节；DLAB=0 是 RBR，取出一个输入字节，队列空时读 0。 */
-        if (serial->lcr & 0x80) {
+        if (serial->lcr & LCR_DLAB) {
             *value = serial->dll;
         } else if (serial->rx_count) {
             *value = serial->rx[serial->rx_head];
@@ -294,7 +302,7 @@ int serial_handle_in(struct serial *serial, uint16_t port, uint8_t *value)
         break;
     case 1:
         /* DLAB=1 读回除数高字节；否则读回 IER。 */
-        *value = (serial->lcr & 0x80) ? serial->dlm : serial->ier;
+        *value = (serial->lcr & LCR_DLAB) ? serial->dlm : serial->ier;
         break;
     case 2:
         /* 读方向是 IIR。读到 THR 空中断即表示驱动已确认，挂起状态随之清除。 */
@@ -331,13 +339,13 @@ int serial_handle_in(struct serial *serial, uint16_t port, uint8_t *value)
          *
          * 非回环模式下假装对端已连接：CTS、DSR、DCD 有效，RI 无效。
          */
-        if (serial->mcr & 0x10) {
-            *value = ((serial->mcr & 0x02) ? 0x10 : 0) |
-                     ((serial->mcr & 0x01) ? 0x20 : 0) |
-                     ((serial->mcr & 0x04) ? 0x40 : 0) |
-                     ((serial->mcr & 0x08) ? 0x80 : 0);
+        if (serial->mcr & MCR_LOOP) {
+            *value = ((serial->mcr & MCR_RTS) ? MSR_CTS : 0) |
+                     ((serial->mcr & MCR_DTR) ? MSR_DSR : 0) |
+                     ((serial->mcr & MCR_OUT1) ? MSR_RI : 0) |
+                     ((serial->mcr & MCR_OUT2) ? MSR_DCD : 0);
         } else {
-            *value = 0xb0; /* CTS, DSR and DCD asserted */
+            *value = MSR_CTS | MSR_DSR | MSR_DCD;
         }
         break;
     case 7:

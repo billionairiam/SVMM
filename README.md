@@ -37,16 +37,43 @@ BZIMAGE_PATH=/boot/vmlinuz-6.16.0 make test        # 加上 KVM 端到端测试
 
 | 地址 | 内容 |
 | --- | --- |
-| `0x500` | 32 位启动用 GDT |
-| `0x9000` | `boot_params` / zero page |
-| `0x10000` | bzImage setup 段副本 |
+| `0x500` | 32 位启动用 GDT（GDTR 指向这里，CS=0x10、DS=0x18 取自其中两项） |
+| `0x9000` | `boot_params` / zero page（e820 表在其内部偏移 0x2d0） |
+| `0x10000` | bzImage setup 段副本（只供检查，不执行） |
 | `0x20000` | 内核命令行 |
+| `0x90000` | 入口临时栈顶（RSP 初值） |
 | `0xE0000` | RSDP（ACPI 2.0，只有 RSDT） |
 | `0xE1000` / `0xE2000` / `0xE3000` / `0xE4000` | RSDT / FADT / DSDT / MADT |
 | `0x100000` | bzImage 压缩内核载荷及入口 |
 | `0x6000000`（96 MiB） | initramfs（`ramdisk_image` / `ramdisk_size`） |
 
 客户机内存至少 256 MiB。initramfs 默认放在 96 MiB 处；如果内核首选运行地址加 `init_size` 越过这个位置，就改放到运行窗口之后，按 2 MiB 对齐。加载前检查 initramfs 不与内核运行窗口重叠、完整落在客户机内存里、不超过内核报告的 `initrd_addr_max`，内存大小也随之增加。e820 表仍是三项；0xE0000 处的 ACPI 表在内核眼里属于 640K–1M 的 BIOS 区，会被保留。
+
+这些地址集中定义在 `src/memory.h` 和 `src/boot/acpi.h`；`src/boot/linux.c` 中 `boot_linux_prepare()` 前的注释画出了完整布局。
+
+## 看懂 VM exit
+
+VMM 的核心是 `vcpu_run()` 里的循环：`KVM_RUN` 让客户机在真实 CPU 上运行，直到客户机做了一件 KVM 需要用户态帮忙的事（例如访问串口端口），这时 `KVM_RUN` 返回，这就是一次 VM exit。VMM 模拟完这次访问后再次调用 `KVM_RUN`。
+
+每次运行结束时，VMM 在 stderr 打印退出统计：按退出原因分类，I/O 退出再按端口分类，并标出端口属于哪个设备、是否有模拟。下面是不带 initramfs 启动 6.16 内核的输出节选：
+
+```text
+VM exits handled by the VMM: 38526 (exits KVM handles in the kernel are not counted)
+  exit reason                     exits    share
+  KVM_EXIT_IO                     38526  100.00%
+  I/O exits by port (one REP INS/OUTS counts once):
+  port     dir       exits  device
+  0x03f8   out       19405  COM1 THR/DLL (transmit byte)
+  0x03fd   in        18278  COM1 LSR (line status)
+  0x0cf8   out          69  PCI config address (not emulated)
+  ...
+```
+
+可以从中读出：
+
+- 内核约 19 KB 的串口输出，带来约 3.8 万次退出：每输出一个字符，先读一次 LSR 确认可以发送，再写一次 THR。逐字节陷出的端口 I/O 很昂贵，这也是 virtio 这类半虚拟化设备要批量传输的原因。
+- 没有模拟的设备（PCI、COM2–4 等）只会被探测几次：读到 0xff 后，内核就认为设备不存在。
+- 表里只有退出到用户态的那部分。中断控制器、PIT、HLT、EPT 缺页等由 KVM 在内核里处理，不会出现在这里；要看它们可以用 `perf kvm stat`。
 
 ## 与教程的差异
 
@@ -70,5 +97,7 @@ python3 experiments/stage02/collect.py --validate-results
 ```
 
 默认主内核为 `/boot/vmlinuz-6.16.0`，兼容性内核为 `/boot/vmlinuz-6.18.0.bak`，单次运行上限为 15 秒。可以使用 `--primary-kernel`、`--compat-kernel`、`--performance-runs` 和 `--timeout` 覆盖这些值。完整实验通常需要约 2–5 分钟，具体取决于进入超时路径的变体数量。
+
+注意：`experiments/stage02/results/` 里的数据是 Stage 02 时采集的，当时还没有内核 irqchip，HLT 等也会退出到 VMM，所以 exit 数（约 21 万次）比现在多得多。
 
 结果保存在 `experiments/stage02/results/`：`raw.csv` 记录每次运行，`summary.csv` 保存聚合指标，`report.md` 给出结论，`logs/` 保留对应的 stdout 和 stderr。功能表覆盖全部变体；性能表只统计确认进入 Linux 且到达可识别终点的变体，loader 拒绝、三重故障和纯超时不会与正常启动耗时混合计算。

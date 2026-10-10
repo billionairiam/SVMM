@@ -3,6 +3,7 @@
 #include "ablation.h"
 #include "boot/acpi.h"
 #include "kvm.h"
+#include "memory.h"
 #include "metrics.h"
 #include "serial.h"
 
@@ -28,6 +29,9 @@
  * 调用 KVM_RUN，内核会把 VMM 填写的结果（例如 IN 指令读到的值）
  * 交还给客户机并继续执行。
  */
+
+#define X86_CR0_PE (1u << 0)  /* Protection Enable：保护模式 */
+#define X86_CR0_PG (1u << 31) /* Paging：分页 */
 
 /*
  * 从 /dev/kvm 查询宿主机支持的 CPUID 项，再安装到当前 vCPU；
@@ -169,7 +173,7 @@ int vcpu_init(struct vcpu *vcpu, const struct kvm_context *kvm, unsigned id)
  *   - 关闭中断；
  *   - %esi 指向 struct boot_params（zero page）；
  *   - %ebp、%edi、%ebx 为 0。
- * 对应的 GDT 内容由 boot_linux_prepare() 写到客户机物理地址 0x500。
+ * 对应的 GDT 内容由 boot_linux_prepare() 写到 BOOT_GDT_ADDR（0x500）。
  */
 int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
                           unsigned boot_params_addr)
@@ -196,7 +200,7 @@ int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
          * 客户机代码来加载段寄存器。各字段含义：
          *   base = 0, limit = 0xffffffff  平坦段，覆盖全部 4 GiB
          *                                 （KVM 使用字节单位的 limit）
-         *   selector = 0x10               GDT index 2，RPL 0，即 __BOOT_CS
+         *   selector = BOOT_CS_SELECTOR   0x10：GDT index 2，RPL 0，即 __BOOT_CS
          *   type = 0xb                    代码段：可执行、可读、已访问
          *   present = 1                   段存在
          *   s = 1                         代码/数据段，而不是系统段
@@ -207,7 +211,7 @@ int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
         struct kvm_segment code = {
             .base = 0,
             .limit = 0xffffffff,
-            .selector = 0x10,
+            .selector = BOOT_CS_SELECTOR,
             .type = 0xb,
             .present = 1,
             .s = 1,
@@ -217,7 +221,7 @@ int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
         /* 数据段与代码段相同，只是 selector 为 0x18（index 3，__BOOT_DS），
          * type = 0x3 表示可读、可写、已访问的数据段。 */
         struct kvm_segment data = code;
-        data.selector = 0x18;
+        data.selector = BOOT_DS_SELECTOR;
         data.type = 0x3;
         sregs.cs = code;
         sregs.ds = data;
@@ -230,14 +234,14 @@ int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
          * limit 是“最后一个有效字节的偏移”，因此是总长度减 1。内核之后
          * 重新加载段寄存器时会从这里读取描述符，所以内容必须与上面一致。
          */
-        sregs.gdt.base = 0x500;
-        sregs.gdt.limit = 4 * 8 - 1;
+        sregs.gdt.base = BOOT_GDT_ADDR;
+        sregs.gdt.limit = BOOT_GDT_ENTRIES * 8 - 1;
         /*
          * CR0.PE（bit 0）置 1 进入保护模式；CR0.PG（bit 31）清 0 关闭分页，
          * 此时线性地址直接等于物理地址。CR3（页表基址）、CR4（PAE 等扩展）
          * 和 EFER（含 LME 长模式使能）全部清零：进入长模式由内核自己完成。
          */
-        sregs.cr0 = (sregs.cr0 | 1u) & ~(1u << 31);
+        sregs.cr0 = (sregs.cr0 | X86_CR0_PE) & ~X86_CR0_PG;
         sregs.cr3 = 0;
         sregs.cr4 = 0;
         sregs.efer = 0;
@@ -252,15 +256,14 @@ int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
      *   rip    = 32 位内核入口，即压缩内核被载入的地址
      *   rflags = 0x2：bit 1 是保留位，硬件要求恒为 1；IF = 0 表示关中断
      *   rsi    = zero page 的客户机物理地址
-     *   rsp    = 0x90000：给入口代码一个位于 e820 可用区（64 KiB–1 MiB）
-     *            内的临时栈，向下增长，不会碰到 0x20000 处的命令行。
-     *            内核很快会切换到自己的栈。
+     *   rsp    = BOOT_STACK_ADDR（0x90000）：给入口代码一个临时栈，向下增长，
+     *            不会碰到 0x20000 处的命令行。内核很快会切换到自己的栈。
      */
     struct kvm_regs regs = {
         .rip = kernel_addr,
         .rflags = 0x2,
         .rsi = boot_params_addr,
-        .rsp = 0x90000,
+        .rsp = BOOT_STACK_ADDR,
     };
     if (ioctl(vcpu->fd, KVM_SET_REGS, &regs) < 0) {
         perror("KVM_SET_REGS");
@@ -275,6 +278,26 @@ static int vcpu_finish(struct vcpu_run_stats *stats, const char *reason,
 {
     metric_exit(stderr, SVMM_VARIANT_NAME, reason, stats);
     return status;
+}
+
+/* 给（端口, 方向）的 I/O 退出计数；新端口追加到表尾，表满后只计总数。 */
+static void vcpu_count_io(struct vcpu_run_stats *stats, uint16_t port,
+                          uint8_t direction)
+{
+    for (unsigned i = 0; i < stats->io_port_count; ++i) {
+        struct vcpu_io_port_stat *entry = &stats->io_ports[i];
+        if (entry->port == port && entry->direction == direction) {
+            ++entry->exits;
+            return;
+        }
+    }
+    if (stats->io_port_count == VCPU_IO_PORT_SLOTS) {
+        ++stats->io_other_exits;
+        return;
+    }
+    stats->io_ports[stats->io_port_count++] = (struct vcpu_io_port_stat){
+        .port = port, .direction = direction, .exits = 1,
+    };
 }
 
 /*
@@ -383,6 +406,8 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
         stats->entered = 1;
         ++stats->exits;
         stats->exit_reason = run->exit_reason;
+        ++stats->reason_exits[run->exit_reason < VCPU_EXIT_REASON_SLOTS ?
+                              run->exit_reason : VCPU_EXIT_REASON_SLOTS - 1];
         switch (run->exit_reason) {
         /*
          * 客户机执行了 HLT。使用内核 irqchip 时 KVM 自己等待中断，不会
@@ -422,6 +447,7 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
                 fprintf(stderr, "invalid I/O width: %u\n", run->io.size);
                 return vcpu_finish(stats, "invalid_io_width", -1);
             }
+            vcpu_count_io(stats, run->io.port, run->io.direction);
             /*
              * 数据缓冲区位于共享映射内部。访问前确认 [offset, offset + size)
              * 完全落在映射范围里；用减法比较以避免 offset + size 溢出。
