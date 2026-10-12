@@ -7,7 +7,10 @@ CPPFLAGS += -Isrc
 SOURCES := src/main.c src/cli.c src/sandbox.c src/kvm.c src/memory.c src/vcpu.c \
            src/serial.c src/console.c src/metrics.c src/boot/linux.c src/boot/acpi.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
-DEPFILES := $(OBJECTS:.o=.d)
+# Stage 05 的 virtqueue 是纯用户态代码，不依赖 KVM，单独编进 virtq-demo。
+VIRTIO_SOURCES := src/virtio/virtq.c src/virtio/virtio.c
+VIRTIO_OBJECTS := $(VIRTIO_SOURCES:src/%.c=build/%.o)
+DEPFILES := $(OBJECTS:.o=.d) $(VIRTIO_OBJECTS:.o=.d) build/virtio/demo.d
 
 ABLATION_VARIANTS := baseline no_cpuid fixed_32m no_boot_params no_e820 \
                      no_cmdline no_protected_mode no_uart
@@ -39,14 +42,14 @@ $(foreach variant,$(ABLATION_VARIANTS),$(eval $(call ABLATION_template,$(variant
 
 -include $(DEPFILES) $(ABLATION_DEPFILES)
 
-.PHONY: all ablation initramfs run test clean
+.PHONY: all ablation initramfs run run-virtq test clean
 
 # make run KERNEL=/boot/vmlinuz-6.16.0 MEM=512
 KERNEL ?= images/bzImage
 INITRD ?= build/initramfs.cpio.gz
 MEM ?= 256
 
-all: bin/svmm
+all: bin/svmm bin/virtq-demo
 
 ablation: $(ABLATION_VARIANTS:%=bin/ablation/%/svmm)
 
@@ -57,6 +60,12 @@ build/initramfs.cpio.gz: rootfs/build-rootfs.sh | build
 
 bin/svmm: $(OBJECTS) | bin
 	$(CC) $(CFLAGS) $(OBJECTS) -o $@
+
+bin/virtq-demo: build/virtio/demo.o $(VIRTIO_OBJECTS) | bin
+	$(CC) $(CFLAGS) $^ -o $@
+
+bin/test_virtq: tests/test_virtq.c $(VIRTIO_SOURCES) src/virtio/virtq.h src/virtio/virtio.h | bin
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_virtq.c $(VIRTIO_SOURCES) -o $@
 
 bin/test_serial: tests/test_serial.c src/serial.c src/serial.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_serial.c src/serial.c -o $@
@@ -89,7 +98,12 @@ bin/ablation/%:
 run: all initramfs
 	@./bin/svmm run --kernel $(KERNEL) --initrd $(INITRD) --mem $(MEM)
 
-test: bin/test_metrics bin/test_vcpu_errors
+run-virtq: bin/virtq-demo
+	@./bin/virtq-demo
+
+test: bin/test_metrics bin/test_vcpu_errors bin/test_virtq
+	./bin/test_virtq
+	python3 -m unittest -v tests/test_virtq_demo.py
 	./bin/test_metrics
 	./bin/test_vcpu_errors
 	python3 -m unittest -v tests/test_ablation_collect.py

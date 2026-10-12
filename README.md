@@ -1,4 +1,50 @@
-# Stage 04：最小 Sandbox API
+# Stage 05：Virtqueue
+
+根据 [Runra Stage 05 教程](https://runra.dev/zh/blog/sandbox-from-scratch-05-virtio-queue) 实现 virtio 的核心数据结构 split virtqueue（Virtio 1.0 §2.6）和一个最小的设备模型。本阶段不碰 KVM：driver 和 device 在同一个进程里，doorbell 和中断都是函数调用，先把队列语义弄清楚；Stage 06 再把队列放进客户机内存、接上 transport 和 virtio-blk 协议。`svmm` 本身的行为与 Stage 04 相同。
+
+代码在 `src/virtio/`：
+
+- `virtq.h` / `virtq.c`：descriptor table、available ring、used ring 及两端的私有计数器。driver 侧 `virtq_desc_fill()`、`virtq_avail_submit()`、`virtq_used_pop()`；device 侧 `virtq_avail_peek()` / `virtq_avail_consume()`、`virtq_walk_chain()`、`virtq_used_push()`；调试用 `virtq_dump()`、`virtq_dump_chain()`、`virtq_avail_count()`、`virtq_used_count()`。
+- `virtio.h` / `virtio.c`：设备 = 设备类型（net/blk/console）+ 一个队列 + 客户机内存视图 + `on_notify` / `on_process` / `on_interrupt` 三个回调。`virtio_device_kick()` 依次调用它们；`virtio_gpa()` 把描述符里的 GPA 翻译成宿主指针并做越界检查。
+- `demo.c`：`bin/virtq-demo`，在 64 KiB 模拟客户机内存上跑两个场景，每一步之后打印队列状态：
+  1. virtio-blk 风格的读：header(RO) + 512 字节 buffer(WO)，读第 3 扇区；
+  2. scatter/gather 写：header(RO) + 三段不相邻的 64 字节数据(RO)，写第 5 扇区，device 按链顺序把三段收集进磁盘。
+
+```sh
+make bin/virtq-demo && ./bin/virtq-demo    # 或 make run-virtq
+```
+
+它只依赖 C11 和 libc，不需要 `/dev/kvm`、root 或内核镜像。
+
+### 两端互不信任
+
+virtqueue 在共享内存里，两端都不能信任对方写的内容。实现里的检查：
+
+- 队列大小必须是 2 的幂（2–256），槽位为 `计数器 & (qsz - 1)`；`avail.idx` / `used.idx` 是 16 位单调计数器，差值按 16 位回绕计算，跨过 65535 → 0 也正确。
+- 每端只用自己的私有计数器和共享的 idx 做判断。driver 在途（已发布、未回收）的链达到 qsz 时拒绝再发布；device 只能完成“已取走、未完成”的链，所以 used ring 不会溢出。
+- device 发现 `avail.idx` 一次前进超过 qsz 时报错；driver 发现 `used.idx` 超过在途数量或 `used.id` 越界时报错。
+- `virtq_walk_chain()` 先把整条链校验并拷贝成快照，再对快照调用回调：下标越界、成环（visited 表）、`INDIRECT`、可写描述符之后出现只读描述符都直接拒绝，回调一次都不会被调用，设备不会做一半 I/O；之后客户机再改共享描述符表也影响不到这次处理。
+- `virtio_gpa()` 用减法比较，`gpa + len` 溢出回绕也会被拒绝。
+- 发布 idx 用 release 语义，读取 idx 用 acquire 语义，与多线程 VMM 中的屏障位置一致。
+- `on_process` 中途出错时，已经发布的完成项仍会触发中断；driver 在 `avail.flags` 设置 `VRING_AVAIL_F_NO_INTERRUPT` 时不发中断。
+
+### 与教程的差异
+
+- **描述符地址是 GPA，不是宿主指针**。demo 用一个静态数组模拟客户机内存，device 访问前都经过 `virtio_gpa()`。这样输出里的地址是固定的，也更接近 Stage 06。
+- **满/空判断各用各的状态**。教程里 driver 用 device 的 `last_seen_avail` 判断 avail ring 是否已满，device 也能凭空写 used ring；真实系统中两端看不到对方的私有状态，这里改为 driver 限制在途链数、device 只能完成已取走的链。
+- **非法链校验更严格**：除了越界和成环，还拒绝 `INDIRECT`（教程是忽略）和“只读跟在可写之后”（规范 §2.6.4.2），并且先校验整条链再回调。
+- **请求头沿用 virtio-blk 的 16 字节布局**，但和教程一样省略了链尾的 status 字节。
+- **测试**：不照搬教程的 127 个单元测试和地址归一化后的 golden 文件，而是先列失败方式再写测试，见下文。
+- 代码放在 `src/virtio/`，演示程序是独立的 `bin/virtq-demo`，没有替换 `svmm` 的 `main.c`。
+
+### 测试
+
+- `tests/test_virtq.c`（`bin/test_virtq`）：文件开头列出 11 种失败方式，每个测试对应其中一条，例如批量请求跨 16 位回绕、driver 超发、device 伪造完成、恶意链（自环、不经过链头的环、越界 next、INDIRECT、RO 跟在 WO 后、越界链头）、`avail.idx` 跳跃、伪造 used 项、GPA 溢出、中断合并与 `NO_INTERRUPT`。
+- `tests/test_virtq_demo.py`：端到端运行 `bin/virtq-demo`，在不带 KVM 的环境里检查 driver 真的读到了第 3 扇区、used.len 不含只读字节、三段数据按顺序写进第 5 扇区且没有越界、每一步的 idx 和两侧计数、每个场景恰好一次中断。
+
+两者都包含在 `make test` 中。
+
+## Stage 04：最小 Sandbox API
 
 根据 [Runra Stage 04 教程](https://runra.dev/zh/blog/sandbox-from-scratch-04-minimal-sandbox-api) 实现：把写死在 `main()` 里的启动流程整理成一个可配置的命令行工具 `svmm run`。内核、initramfs、内存大小和内核命令行都由参数决定，客户机内存布局随内存大小计算。它建立在 [Stage 03](https://runra.dev/zh/blog/sandbox-from-scratch-03-initramfs-shell)（initramfs + 交互 shell）和 [Stage 02](https://runra.dev/zh/blog/sandbox-from-scratch-02-linux-boot)（bzImage 加载器）之上。
 
@@ -45,7 +91,7 @@ make all initramfs           # 生成 bin/svmm 和 build/initramfs.cpio.gz
 ## 测试
 
 ```sh
-make test                                          # 单元测试；没有内核镜像时跳过 KVM 测试
+make test                                          # 单元测试和 virtqueue 测试；没有内核镜像时跳过 KVM 测试
 BZIMAGE_PATH=/boot/vmlinuz-6.16.0 make test        # 加上 KVM 端到端测试
 ```
 
