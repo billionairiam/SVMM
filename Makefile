@@ -26,7 +26,7 @@ define ABLATION_template
 ABLATION_OBJECTS_$(1) := $(SOURCES:src/%.c=build/ablation/$(1)/%.o)
 ABLATION_DEPFILES += $$(ABLATION_OBJECTS_$(1):.o=.d)
 
-bin/ablation/$(1)/mini-sandbox: $$(ABLATION_OBJECTS_$(1)) | bin/ablation/$(1)
+bin/ablation/$(1)/svmm: $$(ABLATION_OBJECTS_$(1)) | bin/ablation/$(1)
 	$$(CC) $$(CFLAGS) $$^ -o $$@
 
 build/ablation/$(1)/%.o: src/%.c
@@ -46,16 +46,16 @@ KERNEL ?= images/bzImage
 INITRD ?= build/initramfs.cpio.gz
 MEM ?= 256
 
-all: bin/mini-sandbox
+all: bin/svmm
 
-ablation: $(ABLATION_VARIANTS:%=bin/ablation/%/mini-sandbox)
+ablation: $(ABLATION_VARIANTS:%=bin/ablation/%/svmm)
 
 initramfs: build/initramfs.cpio.gz
 
 build/initramfs.cpio.gz: rootfs/build-rootfs.sh | build
 	sh rootfs/build-rootfs.sh $@
 
-bin/mini-sandbox: $(OBJECTS) | bin
+bin/svmm: $(OBJECTS) | bin
 	$(CC) $(CFLAGS) $(OBJECTS) -o $@
 
 bin/test_serial: tests/test_serial.c src/serial.c src/serial.h | bin
@@ -87,7 +87,7 @@ bin/ablation/%:
 	mkdir -p $@
 
 run: all initramfs
-	@./bin/mini-sandbox run --kernel $(KERNEL) --initrd $(INITRD) --mem $(MEM)
+	@./bin/svmm run --kernel $(KERNEL) --initrd $(INITRD) --mem $(MEM)
 
 test: bin/test_metrics bin/test_vcpu_errors
 	./bin/test_metrics

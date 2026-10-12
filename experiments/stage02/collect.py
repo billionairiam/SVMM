@@ -257,7 +257,7 @@ def validate_prerequisites(
         raise RuntimeError("/usr/bin/time is unavailable")
     if require_binaries:
         for variant in VARIANTS:
-            binary = repo / "bin" / "ablation" / variant / "mini-sandbox"
+            binary = repo / "bin" / "ablation" / variant / "svmm"
             if not os.access(binary, os.X_OK):
                 raise RuntimeError(f"ablation binary is unavailable: {binary}")
 
@@ -379,7 +379,7 @@ def _result_row(
     stdout_path = logs / f"{stem}.stdout"
     stderr_path = logs / f"{stem}.stderr"
     timing_path = logs / f"{stem}.time"
-    binary = repo / "bin" / "ablation" / variant / "mini-sandbox"
+    binary = repo / "bin" / "ablation" / variant / "svmm"
     execution = run_timed(
         [str(binary), "run", "--kernel", str(kernel_path)],
         timeout_seconds,

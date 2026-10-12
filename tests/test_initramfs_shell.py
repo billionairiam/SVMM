@@ -1,6 +1,6 @@
 """Stage 03 端到端测试：真实 KVM + bzImage + initramfs，经串口与 BusyBox shell 交互。
 
-Stage 04 起 VMM 改为 `mini-sandbox run --kernel ... --initrd ...`，本文件的 Guest
+Stage 04 起 VMM 改为 `svmm run --kernel ... --initrd ...`，本文件的 Guest
 也被 tests/test_sandbox_cli.py 复用。
 
 需要 Linux、可读写的 /dev/kvm 和一个 x86 bzImage（BZIMAGE_PATH，默认 images/bzImage）。
@@ -18,7 +18,7 @@ import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VMM = os.path.join(ROOT, "bin", "mini-sandbox")
+VMM = os.path.join(ROOT, "bin", "svmm")
 INITRAMFS = os.path.join(ROOT, "build", "initramfs.cpio.gz")
 KERNEL = os.environ.get("BZIMAGE_PATH") or os.path.join(ROOT, "images", "bzImage")
 PROMPT = b"/ # "

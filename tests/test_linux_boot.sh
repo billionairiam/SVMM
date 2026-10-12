@@ -39,7 +39,7 @@ error_file=$(mktemp)
 trap 'rm -f "$output_file" "$error_file"' EXIT HUP INT TERM
 # 不加载 initramfs 时内核应停在 Stage 02 的边界：找不到根文件系统而 panic。
 # 默认命令行带 panic=-1，内核随即复位，VMM 把复位当作客户机退出。
-if timeout 30 ./bin/mini-sandbox run --kernel "$kernel" \
+if timeout 30 ./bin/svmm run --kernel "$kernel" \
        < /dev/null > "$output_file" 2> "$error_file"; then
     result=0
 else

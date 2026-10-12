@@ -9,7 +9,7 @@ run_variant() {
     variant=$1
     out=$(mktemp)
     err=$(mktemp)
-    if timeout 15 "bin/ablation/$variant/mini-sandbox" run --kernel "$kernel" \
+    if timeout 15 "bin/ablation/$variant/svmm" run --kernel "$kernel" \
            </dev/null >"$out" 2>"$err"; then
         status=0
     else

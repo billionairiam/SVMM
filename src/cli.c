@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define PROGRAM "mini-sandbox"
+#define PROGRAM "svmm"
 
 static void print_usage(FILE *stream)
 {

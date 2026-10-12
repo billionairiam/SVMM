@@ -8,7 +8,7 @@
 
 #define MIB (1024u * 1024u)
 /*
- * 客户机内存大小由运行时配置（mini-sandbox run --mem）决定，单位 MiB。
+ * 客户机内存大小由运行时配置（svmm run --mem）决定，单位 MiB。
  * 下限 64 MiB：再小就放不下常见内核的解压窗口和用户态；上限 3 GiB：
  * 客户机 RAM 只映射在一个从 0 开始的内存槽里，必须停在 4 GiB 以下的
  * MMIO 区（IOAPIC 0xfec00000、LAPIC 0xfee00000）之前，ramdisk_image

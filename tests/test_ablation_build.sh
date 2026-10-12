@@ -4,12 +4,12 @@ set -eu
 variants='baseline no_cpuid fixed_32m no_boot_params no_e820 no_cmdline no_protected_mode no_uart'
 make clean
 make
-test -x bin/mini-sandbox
-test ! -e bin/ablation/baseline/mini-sandbox
+test -x bin/svmm
+test ! -e bin/ablation/baseline/svmm
 
 make ablation
 for variant in $variants; do
-    test -x "bin/ablation/$variant/mini-sandbox"
+    test -x "bin/ablation/$variant/svmm"
     test -f "build/ablation/$variant/main.o"
     test -f "build/ablation/$variant/boot/linux.o"
 done
