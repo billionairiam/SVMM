@@ -217,32 +217,37 @@ int boot_linux_load(const char *path, struct linux_image *image)
 }
 
 /*
- * initramfs 默认放在 INITRD_ADDR（96 MiB）。如果内核最终运行窗口
- * [runtime_start, runtime_start + init_size) 延伸到了 96 MiB 之后，就顺延到
- * 窗口末尾向上按 2 MiB 对齐的位置，保证解压内核时不会覆盖 initramfs。
+ * initramfs 的加载地址随客户机内存大小变化（博客 Stage 04 的 3/8 规则）：
+ *
+ *   addr = max(memory_size * 3/8, 16 MiB, 内核运行窗口末尾)，向上按 2 MiB 对齐
+ *     256 MiB → 96 MiB，512 MiB → 192 MiB
+ *
+ * 3/8 只是经验值。内核会把自己解压到 [runtime_start, runtime_start + init_size)，
+ * 发行版内核的这个窗口常到 56–84 MiB，比 128 MiB 的 3/8（48 MiB）还高，
+ * 所以必须再以窗口末尾为下限，否则解压会覆盖 initramfs。
  */
-uint64_t boot_linux_initrd_addr(const struct linux_image *image)
+uint64_t boot_linux_initrd_addr(const struct linux_image *image, size_t memory_size)
 {
-    uint64_t kernel_end = align_up(image->runtime_start + image->init_size,
-                                   2u * 1024u * 1024u);
-    return kernel_end > INITRD_ADDR ? kernel_end : INITRD_ADDR;
+    const uint64_t alignment = 2u * MIB;
+    uint64_t addr = (uint64_t)memory_size / 8 * 3;
+    if (addr < INITRD_MIN_ADDR)
+        addr = INITRD_MIN_ADDR;
+    uint64_t kernel_end = image->runtime_start + image->init_size;
+    if (addr < kernel_end)
+        addr = kernel_end;
+    return align_up(addr, alignment);
 }
 
-size_t boot_linux_memory_size(const struct linux_image *image)
+/*
+ * initramfs 必须在此地址之前结束（不含）：内存末尾留 16 MiB 给内核运行时
+ * （页表、slab、tmpfs 等），同时不能越过内核声明的 initrd_addr_max。
+ */
+uint64_t boot_linux_initrd_limit(const struct linux_image *image, size_t memory_size)
 {
-    if (SVMM_ABLATE_DYNAMIC_MEMORY_ENABLED)
-        return BLOG_GUEST_MEMORY_SIZE;
-
-    size_t size = (size_t)image->runtime_start + image->init_size +
-                  32u * 1024u * 1024u;
-    /* 总是为最大尺寸的 initramfs 留出位置，再多留 16 MiB 给内核使用。 */
-    size_t initrd_end = (size_t)boot_linux_initrd_addr(image) + INITRD_MAX_SIZE +
-                        16u * 1024u * 1024u;
-    if (initrd_end > size)
-        size = initrd_end;
-    const size_t memory_alignment = 2u * 1024u * 1024u;
-    size = (size_t)align_up(size, memory_alignment);
-    return size < GUEST_MEMORY_MIN_SIZE ? GUEST_MEMORY_MIN_SIZE : size;
+    uint64_t limit = memory_size > INITRD_TOP_RESERVE ?
+        (uint64_t)memory_size - INITRD_TOP_RESERVE : 0;
+    uint64_t kernel_limit = (uint64_t)image->initrd_addr_max + 1;
+    return limit < kernel_limit ? limit : kernel_limit;
 }
 
 /*
@@ -264,13 +269,14 @@ size_t boot_linux_memory_size(const struct linux_image *image)
  *     0x00090000  入口临时栈顶，向下增长     BOOT_STACK_ADDR，RSP 初值
  *     0x000e0000  ACPI 表                    内核把 640K–1M 视为 BIOS 区并保留
  *
- *   e820 [1 MiB, memory->size) 可用
+ *   e820 [1 MiB, memory->size) 可用（memory->size 来自 --mem）
  *     0x00100000  压缩内核载荷               KERNEL_ADDR，RIP 从这里开始
  *     runtime_start  内核运行窗口            内核把自己解压到这里，长度 init_size；
  *                                            地址由启动头算出，常见为 16 MiB
- *     initrd 地址    initramfs（≤ 144 MiB）  max(96 MiB, 窗口末尾按 2 MiB 对齐)，
+ *     initrd 地址    initramfs               max(内存 3/8, 16 MiB, 窗口末尾)，
  *                                            见 boot_linux_initrd_addr()
- *     memory->size   客户机内存末尾          至少 256 MiB
+ *     末尾 16 MiB    留给内核运行时          initramfs 不进入，见 boot_linux_initrd_limit()
+ *     memory->size   客户机内存末尾          64 MiB–3 GiB，默认 256 MiB
  */
 int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *image,
                        const char *cmdline, const struct linux_initrd *initrd)
@@ -296,7 +302,7 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
     if (initrd && initrd->size) {
         uint64_t kernel_end = image->runtime_start + image->init_size;
         uint64_t initrd_last = initrd->addr + initrd->size - 1;
-        if (initrd->size > INITRD_MAX_SIZE || initrd->addr < kernel_end ||
+        if (initrd->addr < kernel_end ||
             initrd->addr > memory->size ||
             initrd->size > memory->size - initrd->addr ||
             initrd_last > image->initrd_addr_max || initrd_last > UINT32_MAX) {
@@ -423,10 +429,12 @@ int boot_linux_prepare(struct guest_memory *memory, const struct linux_image *im
 
 /*
  * 把 initramfs 文件（通常是 cpio.gz）直接读进客户机物理地址 address，
- * 成功后 *size 为文件字节数，供 boot_linux_prepare() 写入 ramdisk_size。
+ * 文件必须完整落在 [address, limit) 内（地址由 boot_linux_initrd_addr()、
+ * 上限由 boot_linux_initrd_limit() 给出）。成功后 *size 为文件字节数，
+ * 供 boot_linux_prepare() 写入 ramdisk_size。
  */
-int boot_linux_load_initramfs(struct guest_memory *memory, uint64_t address,
-                              const char *path, size_t *size)
+int boot_linux_load_initramfs(struct guest_memory *memory, const char *path,
+                              uint64_t address, uint64_t limit, size_t *size)
 {
     *size = 0;
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -435,11 +443,19 @@ int boot_linux_load_initramfs(struct guest_memory *memory, uint64_t address,
         return -1;
     }
     struct stat statbuf;
-    if (fstat(fd, &statbuf) < 0 || !S_ISREG(statbuf.st_mode) ||
-        statbuf.st_size <= 0 || (uint64_t)statbuf.st_size > INITRD_MAX_SIZE ||
-        address > memory->size ||
-        (uint64_t)statbuf.st_size > memory->size - address) {
-        fprintf(stderr, "invalid initramfs size or location\n");
+    if (fstat(fd, &statbuf) < 0 || !S_ISREG(statbuf.st_mode) || statbuf.st_size <= 0) {
+        fprintf(stderr, "invalid initramfs file: %s\n", path);
+        close(fd);
+        return -1;
+    }
+    if (limit > memory->size)
+        limit = memory->size;
+    if (address >= limit || (uint64_t)statbuf.st_size > limit - address) {
+        fprintf(stderr,
+                "initramfs (%lld bytes) does not fit in %zu MiB of guest memory: "
+                "space is [0x%llx, 0x%llx); try a larger --mem\n",
+                (long long)statbuf.st_size, memory->size / MIB,
+                (unsigned long long)address, (unsigned long long)limit);
         close(fd);
         return -1;
     }

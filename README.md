@@ -1,6 +1,12 @@
-# Stage 03：从 initramfs 启动到交互 shell
+# Stage 04：最小 Sandbox API
 
-根据 [Runra Stage 03 教程](https://runra.dev/zh/blog/sandbox-from-scratch-03-initramfs-shell) 实现：VMM 把静态 BusyBox 打包成的 initramfs 放进客户机内存，通过 `boot_params` 告诉内核位置，内核解包后运行 `/init`，最终在串口上得到一个可交互的 shell。它建立在 [Stage 02](https://runra.dev/zh/blog/sandbox-from-scratch-02-linux-boot) 的 bzImage 加载器之上。
+根据 [Runra Stage 04 教程](https://runra.dev/zh/blog/sandbox-from-scratch-04-minimal-sandbox-api) 实现：把写死在 `main()` 里的启动流程整理成一个可配置的命令行工具 `mini-sandbox run`。内核、initramfs、内存大小和内核命令行都由参数决定，客户机内存布局随内存大小计算。它建立在 [Stage 03](https://runra.dev/zh/blog/sandbox-from-scratch-03-initramfs-shell)（initramfs + 交互 shell）和 [Stage 02](https://runra.dev/zh/blog/sandbox-from-scratch-02-linux-boot)（bzImage 加载器）之上。
+
+代码分三层：
+
+- `src/cli.c`：解析和校验参数，填好 `struct sandbox_config`。参数错误时在启动 VM 之前退出。
+- `src/sandbox.c`：`sandbox_run(&config)` 按顺序执行加载内核 → 创建 VM → 分配内存 → ACPI → initramfs → boot_params → vCPU → 串口和控制台 → 运行，最后用一个 `cleanup` 出口统一释放资源。
+- `src/main.c`：只有十来行，把前两者接起来。
 
 内核入口仍然使用 [Linux 官方的 32 位启动协议](https://docs.kernel.org/arch/x86/boot.html#the-32-bit-boot-protocol)：设置 CPUID、保护模式和 GDT，以 `%esi` 传入 `boot_params`，从压缩内核入口开始执行。教程描述的 16 位 setup 入口在这个无 BIOS 的最小 VMM 中无法可靠完成启动。
 
@@ -9,20 +15,32 @@
 需要 Linux x86_64、C 编译器、`/dev/kvm` 权限、`cpio`、`gzip`，以及一份可读取的 x86 bzImage。内核镜像和 initramfs 都不存入 Git。
 
 ```sh
-make all initramfs           # initramfs 生成在 build/initramfs.cpio.gz
-mkdir -p images
-cp /boot/vmlinuz-6.16.0 images/bzImage  # 换成本机可读取的镜像
-make run
+make all initramfs           # 生成 bin/mini-sandbox 和 build/initramfs.cpio.gz
+./bin/mini-sandbox run --kernel /boot/vmlinuz-6.16.0 \
+    --initrd build/initramfs.cpio.gz --mem 512
 ```
+
+也可以用 `make run`，默认值为 `KERNEL=images/bzImage INITRD=build/initramfs.cpio.gz MEM=256`，例如 `make run KERNEL=/boot/vmlinuz-6.16.0 MEM=512`。
 
 `rootfs/build-rootfs.sh [输出路径]` 优先使用 `BUSYBOX` 环境变量或系统里的静态 BusyBox（没有 `PT_INTERP` 的 ELF），找不到时下载 busybox.net 的静态构建。它创建 applet 链接和 `/init`，再用 `cpio -H newc` + `gzip` 打包。`/init` 挂载 `proc`、`sysfs`、`devtmpfs`、`tmpfs`，打印 `hello from mini sandbox`，然后用 `setsid cttyhack /bin/sh` 让 shell 拿到 `/dev/ttyS0` 作为控制终端，所以 Ctrl-C 和作业控制都能用。
 
 运行时：
 
-- 参数为 `linux_boot [bzImage [initramfs]]`，也可以用 `BZIMAGE_PATH`、`INITRAMFS_PATH`、`CMDLINE` 环境变量。`INITRAMFS_PATH=` 为空表示不加载 initramfs。
+- 命令行接口：
+
+  ```text
+  mini-sandbox run --kernel PATH [--initrd PATH] [--mem SIZE_MB] [--cmdline STR]
+    -k, --kernel PATH    x86 bzImage（必需）
+    -i, --initrd PATH    initramfs；不传则不加载，内核会停在挂载根文件系统
+    -m, --mem SIZE_MB    客户机内存，单位 MiB，64–3072，默认 256
+    -c, --cmdline STR    内核命令行，整体替换默认值
+    -h, --help           打印帮助到 stdout 并返回 0
+  ```
+
+  参数错误（缺 `--kernel`、未知子命令或选项、`--mem` 不是纯十进制数或越界等）打印 `ERROR: ...` 到 stderr 并返回 2，不会创建 VM。
 - 默认命令行：`console=ttyS0 earlycon=uart8250,io,0x3f8 init=/init loglevel=8 acpi_rsdp=0xe0000 reboot=acpi panic=-1`。
-- stdin 是终端时切换到 raw 模式，按键原样送进串口，由客户机处理行编辑和 Ctrl-C；按 **Ctrl-A x** 退出 VMM，按 Ctrl-A Ctrl-A 发送一个 Ctrl-A。退出时恢复终端模式。stdin 也可以是管道，例如 `printf 'uname -a\npoweroff -f\n' | ./bin/linux_boot`。
-- 退出路径：`poweroff -f` 写 ACPI SLP_TYP=S5（`reason=poweroff`）；在 shell 中执行 `exit`、`reboot -f` 或内核 panic（`panic=-1`）时写 0xcf9 复位（`reason=reset`）；Ctrl-A x、SIGINT、SIGTERM 或 SIGHUP 让 VMM 停止 vCPU（`reason=host_stop`）。这些都视为正常结束，返回 0，并打印 `Stage 03 completed`。三重故障（`reason=shutdown`）和 KVM 错误返回非零。
+- stdin 是终端时切换到 raw 模式，按键原样送进串口，由客户机处理行编辑和 Ctrl-C；按 **Ctrl-A x** 退出 VMM，按 Ctrl-A Ctrl-A 发送一个 Ctrl-A。退出时恢复终端模式。stdin 也可以是管道，例如 `printf 'uname -a\npoweroff -f\n' | ./bin/mini-sandbox run -k ... -i ...`。管道输入要等 shell 提示符出现后再写，8250 驱动打开端口时会清空接收 FIFO。
+- 退出路径：`poweroff -f` 写 ACPI SLP_TYP=S5（`reason=poweroff`）；在 shell 中执行 `exit`、`reboot -f` 或内核 panic（`panic=-1`）时写 0xcf9 复位（`reason=reset`）；Ctrl-A x、SIGINT、SIGTERM 或 SIGHUP 让 VMM 停止 vCPU（`reason=host_stop`）。这些都视为正常结束，返回 0，并打印 `sandbox completed`。三重故障（`reason=shutdown`）、KVM 错误和启动前的资源错误返回 1，同时打印 `SVMM_METRIC stage=failed_<步骤>`。
 
 ## 测试
 
@@ -31,7 +49,9 @@ make test                                          # 单元测试；没有内核
 BZIMAGE_PATH=/boot/vmlinuz-6.16.0 make test        # 加上 KVM 端到端测试
 ```
 
-`tests/test_initramfs_shell.py` 是 Stage 03 的端到端测试，使用真实 KVM、内核和 initramfs：启动到提示符，执行命令并检查挂载、设备节点和 PID 1；用 13 KiB 的 heredoc 验证串口输入不丢字节；分别验证 `poweroff`、`exit` 复位、SIGTERM；在 pty 上验证控制终端、Ctrl-C、Ctrl-A x 和终端模式恢复；initramfs 不存在时 VMM 报错。`tests/test_linux_boot.sh` 用 `INITRAMFS_PATH=` 回归 Stage 02 的边界：内核 panic 在挂载根文件系统这一步，并通过复位干净退出。
+`tests/test_sandbox_cli.py` 是 Stage 04 的端到端测试，文件开头列出了要防住的失败方式。它直接运行 `bin/mini-sandbox`：不需要 KVM 的部分检查帮助、各种错误参数的退出码和输出；KVM 部分用 `--mem 512` 和自定义 `--cmdline` 启动，从内核日志核对 e820 末尾、`RAMDISK` 地址、`MemTotal` 和 `/proc/cmdline`；用 `--mem 128` 确认 initramfs 避开内核解压窗口且仍能进入 shell；用 `--mem 64` 确认放不下时在启动前报错。
+
+`tests/test_initramfs_shell.py` 是 Stage 03 的端到端测试，使用真实 KVM、内核和 initramfs：启动到提示符，执行命令并检查挂载、设备节点和 PID 1；用 13 KiB 的 heredoc 验证串口输入不丢字节；分别验证 `poweroff`、`exit` 复位、SIGTERM；在 pty 上验证控制终端、Ctrl-C、Ctrl-A x 和终端模式恢复；initramfs 不存在时 VMM 报错。`tests/test_linux_boot.sh` 不传 `--initrd`，回归 Stage 02 的边界：内核 panic 在挂载根文件系统这一步，并通过复位干净退出。
 
 ## 启动布局
 
@@ -45,9 +65,10 @@ BZIMAGE_PATH=/boot/vmlinuz-6.16.0 make test        # 加上 KVM 端到端测试
 | `0xE0000` | RSDP（ACPI 2.0，只有 RSDT） |
 | `0xE1000` / `0xE2000` / `0xE3000` / `0xE4000` | RSDT / FADT / DSDT / MADT |
 | `0x100000` | bzImage 压缩内核载荷及入口 |
-| `0x6000000`（96 MiB） | initramfs（`ramdisk_image` / `ramdisk_size`） |
+| `max(3/8 内存, 16 MiB, 内核窗口末尾)`，2 MiB 对齐 | initramfs（`ramdisk_image` / `ramdisk_size`） |
+| 内存末尾 16 MiB | 预留，不放 initramfs |
 
-客户机内存至少 256 MiB。initramfs 默认放在 96 MiB 处；如果内核首选运行地址加 `init_size` 越过这个位置，就改放到运行窗口之后，按 2 MiB 对齐。加载前检查 initramfs 不与内核运行窗口重叠、完整落在客户机内存里、不超过内核报告的 `initrd_addr_max`，内存大小也随之增加。e820 表仍是三项；0xE0000 处的 ACPI 表在内核眼里属于 640K–1M 的 BIOS 区，会被保留。
+客户机内存由 `--mem` 决定，范围 64–3072 MiB；上限让 RAM 留在 IOAPIC/LAPIC 的 MMIO 区和 32 位 `ramdisk_image` 之下。initramfs 的起点按教程取内存的 3/8（256 MiB 时为 96 MiB，512 MiB 时为 192 MiB），但不低于内核解压窗口（首选运行地址 + `init_size`）的末尾；它必须在 `min(内存 − 16 MiB, initrd_addr_max + 1)` 之前结束，否则在启动前报错并提示加大 `--mem`。内核窗口本身超出内存时同样在启动前报错。e820 表是三项，最后一项为 `[1 MiB, 内存末尾)`；0xE0000 处的 ACPI 表在内核眼里属于 640K–1M 的 BIOS 区，会被保留。
 
 这些地址集中定义在 `src/memory.h` 和 `src/boot/acpi.h`；`src/boot/linux.c` 中 `boot_linux_prepare()` 前的注释画出了完整布局。
 
@@ -77,7 +98,17 @@ VM exits handled by the VMM: 38526 (exits KVM handles in the kernel are not coun
 
 ## 与教程的差异
 
-教程的做法在发行版内核上看不到用户态的串口输出（教程自己也提到了这一点）。为了真正得到可交互的 shell，本实现做了以下调整：
+Stage 04 部分：
+
+- **initramfs 地址不低于内核解压窗口末尾**。教程只取 3/8 内存。发行版内核的 `init_size` 很大（6.16 为 40 MiB，6.18 为 62 MiB，7.0 为 68 MiB，窗口从 16 MiB 开始），`--mem 128` 时 3/8 = 48 MiB 会落进窗口，内核解压时覆盖 initramfs，客户机直接挂起。
+- **仍然使用 32 位入口**，不采用教程的实模式 setup 入口（CS=0x1000、RIP=0x200），原因见开头。教程为此增加的 DMA 端口范围也就不需要了。
+- **`--initrd` 是可选的，不传就不加载**，不会去找默认路径。这样 Stage 02 的“停在挂载根文件系统”边界仍能用同一个二进制测试。
+- **内存上限 3072 MiB**，并要求 `--mem` 为纯十进制数；教程没有上限。
+- **加载内核放在创建 VM 之前**，内核文件不存在时不需要 `/dev/kvm` 就能报错，失败指标的阶段名和顺序与 Stage 02 保持一致。
+- 二进制在 `bin/mini-sandbox`；CLI 测试写成 Python 端到端测试 `tests/test_sandbox_cli.py`，而不是教程的 `test_sandbox_cli.sh`。
+- `KVM_SET_TSS_ADDR` 失败只打印警告，与教程一致。
+
+Stage 03 部分：教程的做法在发行版内核上看不到用户态的串口输出（教程自己也提到了这一点）。为了真正得到可交互的 shell，本实现做了以下调整：
 
 - **在内核中创建中断控制器和时钟**：用 `KVM_CREATE_IRQCHIP`（LAPIC + IOAPIC + PIC）和 `KVM_CREATE_PIT2`。没有它们，HLT 会退出到 VMM，也没有定时器中断，调度器和用户态都跑不起来。HLT 改由 KVM 在内核中处理。CPUID 打开 TSC-deadline 位，并把 APIC ID 修正为 vCPU 编号。
 - **UART 中断**：Linux 8250 驱动的发送和接收都靠中断驱动，所以串口实现了 IER/IIR 优先级、THRE/RDI 中断（受 MCR.OUT2 控制）、4 KiB 接收队列（满时阻塞输入线程形成背压）、FCR 清空、环回模式（`size_fifo()` 探测用，不输出到终端）。IRQ 4 通过 `KVM_IRQ_LINE` 注入。
@@ -88,7 +119,7 @@ VM exits handled by the VMM: 38526 (exits KVM handles in the kernel are not coun
 
 ## Stage 02 消融实验
 
-实验构建为 CPUID、动态内存、boot params、e820、内核命令行、保护模式/GDT 和 UART 分别生成一个只移除单项能力的二进制。普通 `make all` 不启用任何消融宏。
+实验构建（`bin/ablation/<变体>/mini-sandbox`）为 CPUID、动态内存、boot params、e820、内核命令行、保护模式/GDT 和 UART 分别生成一个只移除单项能力的二进制。普通 `make all` 不启用任何消融宏。`fixed_32m` 变体忽略 `--mem`，固定使用教程 Stage 02 的 32 MiB。实验脚本只传 `run --kernel`，不加载 initramfs。
 
 ```sh
 make ablation

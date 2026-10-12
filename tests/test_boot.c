@@ -55,7 +55,8 @@ static void write_temp(char *path, const void *data, size_t size)
 
 /*
  * 夹具内核运行窗口为 [2 MiB, 6 MiB)，客户机内存 8 MiB。检查：
- *   - 默认位置 96 MiB（小内核不需要顺延）；
+ *   - 256 MiB 内存时默认位置为 96 MiB（3/8，小内核不需要顺延）；
+ *   - 加载上限之外放不下的文件被拒绝；
  *   - 文件内容逐字节进入客户机内存，大小如实返回；
  *   - 空文件、放不进客户机内存的位置被拒绝；
  *   - ramdisk_image/ramdisk_size 写入 zero page；
@@ -63,7 +64,7 @@ static void write_temp(char *path, const void *data, size_t size)
  */
 static void check_initrd(struct guest_memory *memory, const struct linux_image *image)
 {
-    assert(boot_linux_initrd_addr(image) == INITRD_ADDR);
+    assert(boot_linux_initrd_addr(image, 256u * MIB) == 96u * MIB);
 
     const uint64_t addr = 6u * 1024u * 1024u;
     uint8_t cpio[4096];
@@ -72,18 +73,21 @@ static void check_initrd(struct guest_memory *memory, const struct linux_image *
     char path[] = "/tmp/svmm-initrd-test-XXXXXX";
     write_temp(path, cpio, sizeof(cpio));
     size_t size = 1;
-    assert(boot_linux_load_initramfs(memory, addr, path, &size) == 0);
+    assert(boot_linux_load_initramfs(memory, path, addr, addr + 2048, &size) == -1);
+    assert(boot_linux_load_initramfs(memory, path, addr, memory->size, &size) == 0);
     assert(size == sizeof(cpio));
     assert(memcmp(memory->data + addr, cpio, sizeof(cpio)) == 0);
-    assert(boot_linux_load_initramfs(memory, memory->size - 1024, path, &size) == -1);
+    assert(boot_linux_load_initramfs(memory, path, memory->size - 1024, memory->size,
+                                     &size) == -1);
     assert(size == 0);
     assert(unlink(path) == 0);
 
     char empty[] = "/tmp/svmm-initrd-empty-XXXXXX";
     write_temp(empty, "", 0);
-    assert(boot_linux_load_initramfs(memory, addr, empty, &size) == -1);
+    assert(boot_linux_load_initramfs(memory, empty, addr, memory->size, &size) == -1);
     assert(unlink(empty) == 0);
-    assert(boot_linux_load_initramfs(memory, addr, "/nonexistent/initrd", &size) == -1);
+    assert(boot_linux_load_initramfs(memory, "/nonexistent/initrd", addr, memory->size,
+                                     &size) == -1);
 
     struct linux_initrd initrd = { .addr = addr, .size = sizeof(cpio) };
     assert(boot_linux_prepare(memory, image, "console=ttyS0", &initrd) == 0);
@@ -200,9 +204,8 @@ int main(void)
     assert(boot_linux_load(high_fixture, &high_image) == 0);
     assert(high_image.runtime_start == 256 * 1024 * 1024);
     /* 内核窗口延伸到 96 MiB 之后时，initramfs 顺延到窗口末尾之后。 */
-    assert(boot_linux_initrd_addr(&high_image) == 260 * 1024 * 1024);
+    assert(boot_linux_initrd_addr(&high_image, 256u * MIB) == 260 * 1024 * 1024);
 #if SVMM_ABLATE_DYNAMIC_MEMORY_ENABLED
-    assert(boot_linux_memory_size(&high_image) == 32u * 1024u * 1024u);
     struct guest_memory blog_memory = {
         .data = calloc(1, 32u * 1024u * 1024u),
         .size = 32u * 1024u * 1024u,
@@ -212,8 +215,6 @@ int main(void)
     assert(boot_linux_prepare(&blog_memory, &high_image, "console=ttyS0", NULL) == -1);
     assert(errno == EINVAL);
     free(blog_memory.data);
-#else
-    assert(boot_linux_memory_size(&high_image) >= 260 * 1024 * 1024);
 #endif
     assert(boot_linux_prepare(&memory, &high_image, "console=ttyS0", NULL) == -1);
     boot_linux_free(&high_image);

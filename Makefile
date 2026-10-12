@@ -4,8 +4,8 @@ CFLAGS += -pthread
 CPPFLAGS += -Isrc
 .DEFAULT_GOAL := all
 
-SOURCES := src/main.c src/kvm.c src/memory.c src/vcpu.c src/serial.c src/console.c \
-           src/metrics.c src/boot/linux.c src/boot/acpi.c
+SOURCES := src/main.c src/cli.c src/sandbox.c src/kvm.c src/memory.c src/vcpu.c \
+           src/serial.c src/console.c src/metrics.c src/boot/linux.c src/boot/acpi.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 DEPFILES := $(OBJECTS:.o=.d)
 
@@ -26,7 +26,7 @@ define ABLATION_template
 ABLATION_OBJECTS_$(1) := $(SOURCES:src/%.c=build/ablation/$(1)/%.o)
 ABLATION_DEPFILES += $$(ABLATION_OBJECTS_$(1):.o=.d)
 
-bin/ablation/$(1)/linux_boot: $$(ABLATION_OBJECTS_$(1)) | bin/ablation/$(1)
+bin/ablation/$(1)/mini-sandbox: $$(ABLATION_OBJECTS_$(1)) | bin/ablation/$(1)
 	$$(CC) $$(CFLAGS) $$^ -o $$@
 
 build/ablation/$(1)/%.o: src/%.c
@@ -41,16 +41,21 @@ $(foreach variant,$(ABLATION_VARIANTS),$(eval $(call ABLATION_template,$(variant
 
 .PHONY: all ablation initramfs run test clean
 
-all: bin/linux_boot
+# make run KERNEL=/boot/vmlinuz-6.16.0 MEM=512
+KERNEL ?= images/bzImage
+INITRD ?= build/initramfs.cpio.gz
+MEM ?= 256
 
-ablation: $(ABLATION_VARIANTS:%=bin/ablation/%/linux_boot)
+all: bin/mini-sandbox
+
+ablation: $(ABLATION_VARIANTS:%=bin/ablation/%/mini-sandbox)
 
 initramfs: build/initramfs.cpio.gz
 
 build/initramfs.cpio.gz: rootfs/build-rootfs.sh | build
 	sh rootfs/build-rootfs.sh $@
 
-bin/linux_boot: $(OBJECTS) | bin
+bin/mini-sandbox: $(OBJECTS) | bin
 	$(CC) $(CFLAGS) $(OBJECTS) -o $@
 
 bin/test_serial: tests/test_serial.c src/serial.c src/serial.h | bin
@@ -82,7 +87,7 @@ bin/ablation/%:
 	mkdir -p $@
 
 run: all initramfs
-	@./bin/linux_boot
+	@./bin/mini-sandbox run --kernel $(KERNEL) --initrd $(INITRD) --mem $(MEM)
 
 test: bin/test_metrics bin/test_vcpu_errors
 	./bin/test_metrics
@@ -91,6 +96,7 @@ test: bin/test_metrics bin/test_vcpu_errors
 	sh tests/test_loader_ablations.sh
 	sh tests/test_linux_boot.sh
 	python3 -m unittest -v tests/test_initramfs_shell.py
+	python3 -m unittest -v tests/test_sandbox_cli.py
 
 clean:
 	rm -rf build bin

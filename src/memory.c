@@ -7,14 +7,17 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
-int guest_memory_init(struct guest_memory *memory, int vm_fd, size_t size)
+int guest_memory_init(struct guest_memory *memory, int vm_fd, size_t size_mb)
 {
     memory->data = NULL;
     memory->size = 0;
-    if (size < GUEST_MEMORY_MIN_SIZE || (size & 0xfff) != 0) {
+    if (size_mb < GUEST_MEMORY_MIN_MB || size_mb > GUEST_MEMORY_MAX_MB) {
+        fprintf(stderr, "guest memory must be %u-%u MiB, got %zu MiB\n",
+                GUEST_MEMORY_MIN_MB, GUEST_MEMORY_MAX_MB, size_mb);
         errno = EINVAL;
         return -1;
     }
+    size_t size = size_mb * MIB;
     void *mapping = mmap(NULL, size, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mapping == MAP_FAILED) {

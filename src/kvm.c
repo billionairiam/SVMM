@@ -29,10 +29,12 @@ int kvm_context_init(struct kvm_context *kvm)
         perror("KVM_CREATE_VM");
         return -1;
     }
-    if (ioctl(kvm->vm_fd, KVM_SET_TSS_ADDR, 0xfffbd000) < 0) {
-        perror("KVM_SET_TSS_ADDR");
-        return -1;
-    }
+    /*
+     * TSS 地址只在 Intel 上没有 unrestricted guest 时用于模拟实模式；
+     * 32 位保护模式入口通常用不到它，所以失败只警告，不中止启动。
+     */
+    if (ioctl(kvm->vm_fd, KVM_SET_TSS_ADDR, 0xfffbd000) < 0)
+        perror("WARN: KVM_SET_TSS_ADDR");
     /*
      * 进入用户空间后，Linux 需要定时器中断来调度进程，串口驱动也需要
      * IRQ 4 才能收发字符。由 KVM 在内核里模拟 LAPIC、IOAPIC 和两片 8259，

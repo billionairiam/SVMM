@@ -1,5 +1,8 @@
 """Stage 03 端到端测试：真实 KVM + bzImage + initramfs，经串口与 BusyBox shell 交互。
 
+Stage 04 起 VMM 改为 `mini-sandbox run --kernel ... --initrd ...`，本文件的 Guest
+也被 tests/test_sandbox_cli.py 复用。
+
 需要 Linux、可读写的 /dev/kvm 和一个 x86 bzImage（BZIMAGE_PATH，默认 images/bzImage）。
 条件不满足时跳过；若显式设置了 BZIMAGE_PATH 却无法运行，则判为失败。
 """
@@ -15,7 +18,7 @@ import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VMM = os.path.join(ROOT, "bin", "linux_boot")
+VMM = os.path.join(ROOT, "bin", "mini-sandbox")
 INITRAMFS = os.path.join(ROOT, "build", "initramfs.cpio.gz")
 KERNEL = os.environ.get("BZIMAGE_PATH") or os.path.join(ROOT, "images", "bzImage")
 PROMPT = b"/ # "
@@ -44,9 +47,10 @@ def setUpModule():
 class Guest:
     """启动 VMM，并在后台收集客户机串口输出，提供 expect/send。"""
 
-    def __init__(self, tty=False, env=None):
-        full_env = dict(os.environ)
-        full_env.update(env or {})
+    def __init__(self, tty=False, args=None):
+        """args 是 `run --kernel KERNEL` 之后的参数；默认只加上 --initrd。"""
+        if args is None:
+            args = ["--initrd", INITRAMFS]
         self.master = None
         if tty:
             self.master, slave = pty.openpty()
@@ -56,7 +60,7 @@ class Guest:
         else:
             stdin = stdout = subprocess.PIPE
         self.proc = subprocess.Popen(
-            [VMM, KERNEL], cwd=ROOT, env=full_env, stdin=stdin, stdout=stdout,
+            [VMM, "run", "--kernel", KERNEL, *args], cwd=ROOT, stdin=stdin, stdout=stdout,
             stderr=subprocess.PIPE)
         self.output = b""
         self.cursor = 0
@@ -153,14 +157,18 @@ class Guest:
         return None
 
 
+def boot_to_shell(test, **kwargs):
+    guest = Guest(**kwargs)
+    test.addCleanup(guest.close)
+    guest.expect(b"Run /init as init process", BOOT_TIMEOUT)
+    guest.expect(b"hello from mini sandbox", BOOT_TIMEOUT)
+    guest.expect(PROMPT, BOOT_TIMEOUT)
+    return guest
+
+
 class InitramfsShellTest(unittest.TestCase):
     def boot(self, **kwargs):
-        guest = Guest(**kwargs)
-        self.addCleanup(guest.close)
-        guest.expect(b"Run /init as init process", BOOT_TIMEOUT)
-        guest.expect(b"hello from mini sandbox", BOOT_TIMEOUT)
-        guest.expect(PROMPT, BOOT_TIMEOUT)
-        return guest
+        return boot_to_shell(self, **kwargs)
 
     def test_shell_runs_commands_and_powers_off(self):
         guest = self.boot()
@@ -181,7 +189,7 @@ class InitramfsShellTest(unittest.TestCase):
         guest.send(b"poweroff -f\n")
         self.assertEqual(guest.wait(), 0)
         self.assertEqual(guest.metric_reason(), "poweroff")
-        self.assertIn(b"Stage 03 completed", guest.stderr)
+        self.assertIn(b"sandbox completed", guest.stderr)
 
     def test_large_input_is_not_dropped(self):
         # 13 KiB 远超 4 KiB 的 VMM 接收队列和 16 字节 UART FIFO，校验流控不丢字节。
@@ -236,7 +244,7 @@ class InitramfsShellTest(unittest.TestCase):
         self.assertEqual(guest.metric_reason(), "host_stop")
 
     def test_missing_initramfs_is_rejected(self):
-        guest = Guest(env={"INITRAMFS_PATH": "/nonexistent/initramfs.cpio.gz"})
+        guest = Guest(args=["--initrd", "/nonexistent/initramfs.cpio.gz"])
         self.addCleanup(guest.close)
         self.assertNotEqual(guest.wait(), 0)
         self.assertIn(b"stage=failed_initramfs_load", guest.stderr)

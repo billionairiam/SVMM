@@ -257,7 +257,7 @@ def validate_prerequisites(
         raise RuntimeError("/usr/bin/time is unavailable")
     if require_binaries:
         for variant in VARIANTS:
-            binary = repo / "bin" / "ablation" / variant / "linux_boot"
+            binary = repo / "bin" / "ablation" / variant / "mini-sandbox"
             if not os.access(binary, os.X_OK):
                 raise RuntimeError(f"ablation binary is unavailable: {binary}")
 
@@ -321,13 +321,12 @@ def run_timed(
     start = time.monotonic()
     timed_out = False
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
-        # Stage 02 实验只测到挂载根文件系统之前：不加载 initramfs，也不接控制台输入。
+        # Stage 02 实验只测到挂载根文件系统之前：不传 --initrd，也不接控制台输入。
         process = subprocess.Popen(
             timed_command,
             stdin=subprocess.DEVNULL,
             stdout=stdout_file,
             stderr=stderr_file,
-            env={**os.environ, "INITRAMFS_PATH": ""},
             start_new_session=True,
         )
         try:
@@ -380,9 +379,9 @@ def _result_row(
     stdout_path = logs / f"{stem}.stdout"
     stderr_path = logs / f"{stem}.stderr"
     timing_path = logs / f"{stem}.time"
-    binary = repo / "bin" / "ablation" / variant / "linux_boot"
+    binary = repo / "bin" / "ablation" / variant / "mini-sandbox"
     execution = run_timed(
-        [str(binary), str(kernel_path)],
+        [str(binary), "run", "--kernel", str(kernel_path)],
         timeout_seconds,
         stdout_path,
         stderr_path,

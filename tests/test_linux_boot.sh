@@ -39,14 +39,14 @@ error_file=$(mktemp)
 trap 'rm -f "$output_file" "$error_file"' EXIT HUP INT TERM
 # 不加载 initramfs 时内核应停在 Stage 02 的边界：找不到根文件系统而 panic。
 # 默认命令行带 panic=-1，内核随即复位，VMM 把复位当作客户机退出。
-if INITRAMFS_PATH= timeout 30 ./bin/linux_boot "$kernel" \
+if timeout 30 ./bin/mini-sandbox run --kernel "$kernel" \
        < /dev/null > "$output_file" 2> "$error_file"; then
     result=0
 else
     result=$?
 fi
 if [ "$result" -ne 0 ] ||
-   ! grep -q 'Stage 03 completed' "$error_file" ||
+   ! grep -q 'sandbox completed' "$error_file" ||
    ! grep -q 'stage=vcpu_exit reason=reset' "$error_file" ||
    ! grep -q 'Kernel panic - not syncing: VFS: Unable to mount root fs' "$output_file"; then
     cat "$error_file" >&2

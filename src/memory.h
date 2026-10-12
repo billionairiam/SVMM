@@ -6,11 +6,22 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BLOG_GUEST_MEMORY_SIZE (32u * 1024u * 1024u)
+#define MIB (1024u * 1024u)
+/*
+ * 客户机内存大小由运行时配置（mini-sandbox run --mem）决定，单位 MiB。
+ * 下限 64 MiB：再小就放不下常见内核的解压窗口和用户态；上限 3 GiB：
+ * 客户机 RAM 只映射在一个从 0 开始的内存槽里，必须停在 4 GiB 以下的
+ * MMIO 区（IOAPIC 0xfec00000、LAPIC 0xfee00000）之前，ramdisk_image
+ * 等启动字段也只有 32 位。
+ */
+#define DEFAULT_GUEST_MEM_MB 256u
+#define GUEST_MEMORY_MAX_MB 3072u
+/* fixed_32m 消融项忽略 --mem，固定使用博客 Stage 02 的 32 MiB。 */
+#define BLOG_GUEST_MEMORY_MB 32u
 #if SVMM_ABLATE_DYNAMIC_MEMORY_ENABLED
-#define GUEST_MEMORY_MIN_SIZE BLOG_GUEST_MEMORY_SIZE
+#define GUEST_MEMORY_MIN_MB BLOG_GUEST_MEMORY_MB
 #else
-#define GUEST_MEMORY_MIN_SIZE (256u * 1024u * 1024u)
+#define GUEST_MEMORY_MIN_MB 64u
 #endif
 /*
  * 32 位启动协议用的临时 GDT。boot_linux_prepare() 把描述符写到这里，
@@ -29,18 +40,19 @@
 #define CMDLINE_ADDR 0x00020000u
 #define CMDLINE_MAX_LEN 4096u
 /*
- * initramfs 默认放在 96 MiB，避开 1 MiB 处的内核载荷和其后的解压窗口；
- * 若内核的 runtime_start + init_size 超过 96 MiB，加载器会顺延到窗口之后。
+ * initramfs 的位置随内存大小计算（见 boot_linux_initrd_addr()）：
+ * 起点不低于 16 MiB，终点不高于内存末尾减去 16 MiB，顶部留给内核运行时。
  */
-#define INITRD_ADDR 0x06000000u
-#define INITRD_MAX_SIZE 0x09000000u
+#define INITRD_MIN_ADDR (16u * MIB)
+#define INITRD_TOP_RESERVE (16u * MIB)
 
 struct guest_memory {
     uint8_t *data;
     size_t size;
 };
 
-int guest_memory_init(struct guest_memory *memory, int vm_fd, size_t size);
+/* 分配 size_mb MiB 客户机内存并注册为 KVM 内存槽 0（GPA 从 0 开始）。 */
+int guest_memory_init(struct guest_memory *memory, int vm_fd, size_t size_mb);
 int guest_memory_load(struct guest_memory *memory, size_t address,
                       const void *source, size_t size);
 void guest_memory_destroy(struct guest_memory *memory);
