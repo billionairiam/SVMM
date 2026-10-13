@@ -90,7 +90,7 @@ int virtq_avail_submit(struct virtq *vq, uint16_t head);
  * device 发布的 used.idx 超过在途数量或 id 越界时返回 -1（device 有 bug 或恶意）。
  */
 int virtq_used_pop(struct virtq *vq, struct vring_used_elem *elem);
-/* device 是否请求过“不必 kick”（VRING_USED_F_NO_NOTIFY）。 */
+/* 返回 1 表示需要 kick device；device 设置了 VRING_USED_F_NO_NOTIFY 时返回 0。 */
 int virtq_needs_notify(const struct virtq *vq);
 
 /* ---- device 侧（VMM 做的事） ---- */

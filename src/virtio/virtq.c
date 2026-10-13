@@ -102,6 +102,25 @@ int virtq_used_pop(struct virtq *vq, struct vring_used_elem *elem)
     return 1;
 }
 
+/*
+ * driver 提交 avail 条目后，用它判断要不要 kick（写 doorbell）device。
+ * 返回 1 表示需要 kick，0 表示 device 说过“不必 kick”。
+ *
+ * 和 virtq_needs_interrupt() 是一对，方向相反：
+ *   used->flags  的 NO_NOTIFY     由 device 设置，告诉 driver 不必 kick；
+ *   avail->flags 的 NO_INTERRUPT  由 driver 设置，告诉 device 不必发中断。
+ * 每个标志都放在“对方只读、自己能写”的那个 ring 上。
+ *
+ * device 正在主动处理 avail ring 时（比如 vhost 线程忙着干活）会设置 NO_NOTIFY：
+ * 新条目它这一轮自己就能看到，而真实 VMM 中一次 kick 是一次 MMIO/PIO 写，
+ * 会引发 VM exit，开销很大。规范规定这只是提示，多 kick 一次不会出错，
+ * 只是浪费；但该 kick 的时候没 kick，请求就会一直没人处理。
+ *
+ * flags 由另一侧写，所以用原子读，防止编译器把它缓存在寄存器里，也避免读到写了一半的值。
+ * 注意：真正多线程时，driver “写 avail.idx 再读 used->flags” 是先写后读，
+ * release/acquire 不保证这两步的顺序，需要一个完整内存屏障（Linux 用 virtio_mb()）；
+ * 目前 driver 和 device 在同一线程，不受影响。
+ */
 int virtq_needs_notify(const struct virtq *vq)
 {
     return !(__atomic_load_n(&vq->used->flags, __ATOMIC_ACQUIRE) & VRING_USED_F_NO_NOTIFY);
