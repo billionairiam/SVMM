@@ -13,7 +13,8 @@
  *   0xE1000  RSDT  指向 FADT 和 MADT
  *   0xE2000  FADT  硬件精简（HW_REDUCED_ACPI）模式，指向 DSDT，声明复位和
  *                  睡眠控制寄存器
- *   0xE3000  DSDT  AML：\_S5 关机类型，\_SB.COM1（PNP0501，0x3f8–0x3ff，IRQ 4）
+ *   0xE3000  DSDT  AML：\_S5 关机类型，\_SB.COM1（PNP0501，0x3f8–0x3ff，IRQ 4），
+ *                  带磁盘时还有 \_SB.VR00（virtio-mmio，见 dsdt_virtio_mmio_aml）
  *   0xE4000  MADT  CPU 0 的 Local APIC 和 KVM 模拟的 I/O APIC
  *
  * 硬件精简模式不需要 PM1 事件/控制块、PM 定时器和 SCI，因此 VMM 只需
@@ -89,7 +90,55 @@ static const uint8_t dsdt_aml[] = {
     0x79, 0x00,
 };
 
-#define DSDT_SIZE (ACPI_HEADER_SIZE + sizeof(dsdt_aml))
+/*
+ * Stage 06：virtio-mmio 设备，追加在 DSDT 末尾（AML 允许多个 Scope (\_SB)）。
+ *
+ *   Scope (\_SB)
+ *   {
+ *       Device (VR00)
+ *       {
+ *           Name (_HID, "LNRO0005")
+ *           Name (_UID, Zero)
+ *           Name (_CRS, ResourceTemplate ()
+ *           {
+ *               Memory32Fixed (ReadWrite, 0xD0000000, 0x00001000)
+ *               Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) { 5 }
+ *           })
+ *       }
+ *   }
+ *
+ * 为什么不用命令行 virtio_mmio.device=4K@0xd0000000:5：那里的 5 是 Linux IRQ 号，
+ * 不是 GSI。FADT 声明了硬件精简模式，Linux 不预分配 ISA IRQ 0–15，IRQ 5 不存在，
+ * virtio_blk probe 时 request_irq() 返回 -EINVAL。经 ACPI 的 Interrupt 描述符，
+ * Linux 会调用 acpi_register_gsi() 把 GSI 5 映射成一个真正的 IRQ（串口的 GSI 4
+ * 也是这样变成 IRQ 24 的）。
+ *
+ * 中断设为电平触发：VMM 在 InterruptStatus 非 0 时拉高 GSI，driver 写
+ * InterruptACK 清零后才拉低，和电平语义一一对应。
+ */
+static const uint8_t dsdt_virtio_mmio_aml[] = {
+    /* Scope (\_SB) */
+    0x10, 0x43, 0x04, 0x5c, 0x5f, 0x53, 0x42, 0x5f,
+    /* Device (VR00) */
+    0x5b, 0x82, 0x3a, 0x56, 0x52, 0x30, 0x30,
+    /* Name (_HID, "LNRO0005") */
+    0x08, 0x5f, 0x48, 0x49, 0x44, 0x0d, 0x4c, 0x4e, 0x52, 0x4f, 0x30, 0x30, 0x30, 0x35, 0x00,
+    /* Name (_UID, Zero) */
+    0x08, 0x5f, 0x55, 0x49, 0x44, 0x00,
+    /* Name (_CRS, Buffer (23) { ... }) */
+    0x08, 0x5f, 0x43, 0x52, 0x53, 0x11, 0x1a, 0x0a, 0x17,
+    /* Memory32Fixed (ReadWrite, base, size)：基址在 +4，长度在 +8 */
+    0x86, 0x09, 0x00, 0x01, 0x00, 0x00, 0x00, 0xd0, 0x00, 0x10, 0x00, 0x00,
+    /* Interrupt (Consumer, Level, ActiveHigh, Exclusive) { gsi }：GSI 在 +5 */
+    0x89, 0x06, 0x00, 0x01, 0x01, 0x05, 0x00, 0x00, 0x00,
+    /* EndTag */
+    0x79, 0x00,
+};
+#define VIRTIO_AML_MEM_BASE 49u
+#define VIRTIO_AML_MEM_SIZE 53u
+#define VIRTIO_AML_GSI 62u
+
+#define DSDT_MAX_SIZE (ACPI_HEADER_SIZE + sizeof(dsdt_aml) + sizeof(dsdt_virtio_mmio_aml))
 
 static void put8(uint8_t *table, size_t offset, uint8_t value)
 {
@@ -166,7 +215,7 @@ static void put_io_gas(uint8_t *table, size_t offset, uint16_t port)
 //   +----> HPET
 //   |
 //   +----> ...
-int boot_acpi_setup(struct guest_memory *memory)
+int boot_acpi_setup(struct guest_memory *memory, const struct acpi_virtio_mmio *virtio)
 {
     if (!memory->data || memory->size < ACPI_TABLES_END) {
         errno = EINVAL;
@@ -209,10 +258,19 @@ int boot_acpi_setup(struct guest_memory *memory)
     finish_table(fadt, FADT_SIZE);
     
     // DSDT：描述“机器里有哪些设备、设备怎么工作”
-    uint8_t dsdt[DSDT_SIZE] = { 0 };
-    put_header(dsdt, "DSDT", DSDT_SIZE, 2);
+    uint8_t dsdt[DSDT_MAX_SIZE] = { 0 };
+    size_t dsdt_size = ACPI_HEADER_SIZE + sizeof(dsdt_aml);
     memcpy(dsdt + ACPI_HEADER_SIZE, dsdt_aml, sizeof(dsdt_aml));
-    finish_table(dsdt, DSDT_SIZE);
+    if (virtio) {
+        uint8_t *aml = dsdt + dsdt_size;
+        memcpy(aml, dsdt_virtio_mmio_aml, sizeof(dsdt_virtio_mmio_aml));
+        put32(aml, VIRTIO_AML_MEM_BASE, virtio->base);
+        put32(aml, VIRTIO_AML_MEM_SIZE, virtio->size);
+        put32(aml, VIRTIO_AML_GSI, virtio->gsi);
+        dsdt_size += sizeof(dsdt_virtio_mmio_aml);
+    }
+    put_header(dsdt, "DSDT", (uint32_t)dsdt_size, 2);
+    finish_table(dsdt, dsdt_size);
 
     /*
      * MADT：Local APIC 地址 + 两个条目。
@@ -243,7 +301,7 @@ int boot_acpi_setup(struct guest_memory *memory)
     if (guest_memory_load(memory, ACPI_RSDP_ADDR, rsdp, sizeof(rsdp)) < 0 ||
         guest_memory_load(memory, ACPI_RSDT_ADDR, rsdt, sizeof(rsdt)) < 0 ||
         guest_memory_load(memory, ACPI_FADT_ADDR, fadt, sizeof(fadt)) < 0 ||
-        guest_memory_load(memory, ACPI_DSDT_ADDR, dsdt, sizeof(dsdt)) < 0 ||
+        guest_memory_load(memory, ACPI_DSDT_ADDR, dsdt, dsdt_size) < 0 ||
         guest_memory_load(memory, ACPI_MADT_ADDR, madt, sizeof(madt)) < 0)
         return -1;
     return 0;

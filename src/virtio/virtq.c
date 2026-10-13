@@ -24,9 +24,45 @@ static uint16_t slot(const struct virtq *vq, uint16_t counter)
     return counter & (uint16_t)(vq->qsz - 1);
 }
 
+static bool valid_qsz(unsigned int qsz)
+{
+    return qsz >= 2 && qsz <= VIRTQ_MAX_SIZE && !(qsz & (qsz - 1));
+}
+
+uint64_t virtq_desc_bytes(unsigned int qsz)
+{
+    return (uint64_t)sizeof(struct vring_desc) * qsz;
+}
+
+/* flags + idx + ring[qsz] + used_event */
+uint64_t virtq_avail_bytes(unsigned int qsz)
+{
+    return sizeof(struct vring_avail) + (uint64_t)sizeof(uint16_t) * (qsz + 1);
+}
+
+/* flags + idx + ring[qsz] + avail_event */
+uint64_t virtq_used_bytes(unsigned int qsz)
+{
+    return sizeof(struct vring_used) + (uint64_t)sizeof(struct vring_used_elem) * qsz +
+           sizeof(uint16_t);
+}
+
+int virtq_init_shared(struct virtq *vq, unsigned int qsz, struct vring_desc *desc,
+                      struct vring_avail *avail, struct vring_used *used)
+{
+    if (!valid_qsz(qsz) || !desc || !avail || !used)
+        return -1;
+    /*
+     * 复位后 driver 把 ring 清零再交给 device（§2.6），两端计数器都从 0 开始。
+     * 这里不写共享内存：ring 内容归 driver 初始化。
+     */
+    *vq = (struct virtq){ .qsz = (uint16_t)qsz, .desc = desc, .avail = avail, .used = used };
+    return 0;
+}
+
 struct virtq *virtq_create(unsigned int qsz)
 {
-    if (qsz < 2 || qsz > VIRTQ_MAX_SIZE || (qsz & (qsz - 1)))
+    if (!valid_qsz(qsz))
         return NULL;
     struct virtq *vq = calloc(1, sizeof(*vq));
     if (!vq)
@@ -37,10 +73,9 @@ struct virtq *virtq_create(unsigned int qsz)
      * calloc 都满足。ring 之后的 used_event / avail_event 只在协商了
      * VIRTIO_F_EVENT_IDX 时使用，这里按规范大小预留但不使用。
      */
-    vq->desc = calloc(qsz, sizeof(struct vring_desc));
-    vq->avail = calloc(1, sizeof(struct vring_avail) + sizeof(uint16_t) * (qsz + 1));
-    vq->used = calloc(1, sizeof(struct vring_used) + sizeof(struct vring_used_elem) * qsz +
-                             sizeof(uint16_t));
+    vq->desc = calloc(1, virtq_desc_bytes(qsz));
+    vq->avail = calloc(1, virtq_avail_bytes(qsz));
+    vq->used = calloc(1, virtq_used_bytes(qsz));
     if (!vq->desc || !vq->avail || !vq->used) {
         virtq_destroy(vq);
         return NULL;

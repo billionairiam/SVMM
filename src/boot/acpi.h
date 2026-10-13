@@ -28,6 +28,18 @@ struct guest_memory;
 #define ACPI_RESET_PORT 0x0cf9u
 #define ACPI_RESET_VALUE 0x06u
 
-int boot_acpi_setup(struct guest_memory *memory);
+/*
+ * 一个 virtio-mmio 设备：寄存器页 [base, base + size)，中断接在 I/O APIC 的 gsi 脚上。
+ * 在 DSDT 里声明成 \_SB.VR00（_HID "LNRO0005"），Linux 的 virtio_mmio 驱动按这个
+ * ID 匹配 ACPI 设备，并通过 ACPI 把 GSI 映射成 Linux IRQ。
+ */
+struct acpi_virtio_mmio {
+    uint32_t base;
+    uint32_t size;
+    uint32_t gsi;
+};
+
+/* virtio 可以为 NULL（没有 virtio-mmio 设备）。 */
+int boot_acpi_setup(struct guest_memory *memory, const struct acpi_virtio_mmio *virtio);
 
 #endif

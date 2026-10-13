@@ -1,4 +1,63 @@
-# Stage 05：Virtqueue
+# Stage 06：virtio-blk 与磁盘
+
+根据 [Runra Stage 06 教程](https://runra.dev/zh/blog/sandbox-from-scratch-06-virtio-blk-rootfs-disk-safety) 把 Stage 05 的 virtqueue 放进客户机内存，接上 virtio-mmio 传输层和 virtio-blk 设备：`svmm run --disk PATH` 把宿主机上的 raw 镜像变成客户机里的 `/dev/vda`，initramfs 的 `/init` 自动把它挂到 `/mnt`。
+
+```sh
+make disk                                   # build/disk.img，64 MiB ext4，已存在时不覆盖
+make run-disk KERNEL=/path/to/bzImage       # 等价于 svmm run ... --disk build/disk.img
+```
+
+内核需要 `CONFIG_ACPI`、`CONFIG_VIRTIO_MMIO`、`CONFIG_VIRTIO_BLK` 和镜像里文件系统的驱动（ext4）。
+
+代码：
+
+- `src/virtio/mmio.{h,c}`：virtio-mmio 传输层（Virtio 1.0 §4.2，Version 2）。寄存器页在 GPA `0xd0000000`，不注册成 KVM 内存槽，客户机每次读写都 `KVM_EXIT_MMIO` 到 VMM。负责设备身份、特性协商、队列配置、`QueueNotify`（doorbell）、`InterruptStatus/ACK` 和中断线，以及只读的设备配置空间。与具体设备无关，设备通过 `struct virtio_mmio_backend` 接入。
+- `src/virtio/blk.{h,c}`：virtio-blk。请求链 = 16 字节请求头（只读）+ 数据段 + 1 字节状态（可写）；支持 `T_IN`、`T_OUT`、`T_FLUSH`（`fdatasync`）、`T_GET_ID`，其他类型返回 `UNSUPP`。镜像用 `O_RDWR` 打开并加 `flock(LOCK_EX|LOCK_NB)`，退出时打印一行统计。
+- `src/virtio/virtq.c`：新增 `virtq_init_shared()`，让 Stage 05 的 virtqueue 直接使用 driver 告诉我们的三块客户机内存，所有链校验逻辑原样复用。
+- `src/boot/acpi.c`：带磁盘时在 DSDT 里追加 `\_SB.VR00`（`_HID "LNRO0005"`，`Memory32Fixed` 寄存器页 + 电平触发 GSI 5）。
+- `src/vcpu.c`：`KVM_EXIT_MMIO` 落在设备区间内时交给 `vcpu->mmio.access`，其余地址仍按“没有设备”处理。
+- `src/cli.c`、`src/sandbox.c`：`-d/--disk`；镜像在创建 VM 之前打开，路径错误、太小（不足一个扇区）或被另一个 VMM 占用时以 `stage=failed_disk_open` 失败。
+- `rootfs/build-rootfs.sh`：`/init` 发现 `/dev/vda` 就 `mount /dev/vda /mnt`（文件系统类型自动识别，不是文件系统时只提示）；shell 退出时先 `sync` 和 `umount /mnt` 再 `reboot -f`。
+
+一次读请求的路径：客户机写好描述符和 avail ring → 写 `QueueNotify` → `KVM_EXIT_MMIO` → vCPU 线程上同步处理整个 avail ring（校验、`pread` 直接读进客户机内存、写状态字节、发布 used.idx）→ 拉高 GSI 5 → 回到客户机 → 中断处理函数读 `InterruptStatus`、写 `InterruptACK`（VMM 拉低中断线）→ 回收 used ring。
+
+### 磁盘安全
+
+请求链里的地址、长度、扇区号都由客户机控制。任何一项不合法时不做 I/O，只写 `IOERR` 状态并照常完成，driver 不会挂住；所有检查都在第一次 `pread/pwrite` 之前完成，不会出现做了一半的多段请求：
+
+1. **链结构**：沿用 Stage 05 的 `virtq_walk_chain()`（越界、成环、`INDIRECT`、RO 跟在 WO 后），并对快照做后续检查，避免 double fetch。请求头必须只读且 ≥ 16 字节，拷贝一份再用；状态描述符必须可写。连状态字节都写不了的链以 `len = 0` 完成。
+2. **方向**：读盘的数据段必须对 device 可写，写盘的数据段必须只读，否则 device 会写进 driver 不让写的内存。
+3. **GPA 范围**：每一段 `[addr, addr + len)` 都必须完整落在客户机 RAM 里，用减法比较，回绕也会被拒绝。ring 本身在 `QueueReady=1` 时检查对齐和范围。
+4. **磁盘边界**：总长度是 512 的正整数倍，且 `sector ≤ capacity` 并且 `n ≤ capacity - sector`；不计算 `sector * 512`，客户机给多大的扇区号都不会溢出。
+5. **完整 I/O**：`pread/pwrite` 循环到结束，短读（例如镜像在运行中被截短）返回 `IOERR`，不会把未初始化数据当成功交给客户机。
+
+队列层面：`avail.idx` 一次前进超过 qsz 或链头越界时，device 无法以“完成一条请求”的方式恢复，于是设置 `DEVICE_NEEDS_RESET` 并发配置变更中断，之后忽略 kick，直到 driver 复位。错误日志最多 16 条，防止客户机刷屏。
+
+### 与教程的差异
+
+- **设备发现走 ACPI，不走命令行或扫描**。教程让客户机 `modprobe` / 扫描设备；virtio-mmio 没有可枚举的总线，内核必须被告知设备位置。命令行参数 `virtio_mmio.device=4K@0xd0000000:5` 在本 VMM 下不可用：FADT 声明了硬件精简模式，Linux 不预分配 ISA IRQ 0–15，参数里的 `5` 被当成 Linux IRQ 号，probe 时 `request_irq()` 返回 `-EINVAL`。改为在 DSDT 里声明 `LNRO0005` 设备，Linux 经 `acpi_register_gsi()` 把 GSI 5 映射成真正的 IRQ（新版 Firecracker 也是这样做的）。
+- **寄存器页在 RAM 之外**。教程在客户机 RAM 里挖一个洞并拆成两个内存槽；这里放在 `0xd0000000`（最大 3 GiB 内存之上、IOAPIC 之下，Firecracker 的 MMIO 区起点），内存槽和 e820 都不用改。
+- **用中断，不轮询**。教程说本阶段不发中断；Linux 的 virtio_blk 等完成中断，不发就挂住。这里完成后若 driver 没有设置 `NO_INTERRUPT` 就置 `InterruptStatus` 并拉高电平中断线，`InterruptACK` 清零后拉低，复位也拉低；判断 `NO_INTERRUPT` 前有一个全屏障。
+- **QueueNum 不合法时拒绝而不是截断**。截断后 device 按另一个大小解析 ring，下标全部错位；拒绝后 `QueueReady` 读回 0，driver 放弃设备。`QueueNumMax` 是 128。
+- **特性协商更严格**：只提供 `VERSION_1`、`SEG_MAX`（qsz − 2，没有 INDIRECT 时一个请求的所有描述符要放进同一个队列）、`BLK_SIZE`、`FLUSH`；driver 选了没提供的位或没选 `VERSION_1` 时不保留 `FEATURES_OK`；之后特性冻结。
+- **多段请求**：教程按单个数据段处理；Linux 会发多段 scatter/gather 请求，这里逐段校验后顺序读写。
+- **镜像加锁**：两个 VM 同时挂同一个 ext4 镜像会互相覆盖元数据，第二个 `svmm` 以 `failed_disk_open` 退出。
+- **ext4 而不是 ext2**，`/init` 不自动写测试文件（每次启动都改镜像会让测试结果依赖之前的运行），shell 退出时卸载 `/mnt`。
+- **测试**：没有照搬教程的 shell 测试脚本，先列失败方式再写测试，见下文。
+
+### 测试
+
+- `tests/test_virtio_blk.c`（`bin/test_virtio_blk`）：测试扮演恶意 driver，只通过 MMIO 寄存器和一块假客户机内存操作设备，后端是临时镜像。文件开头列出 17 种失败方式：身份和配置空间、特性协商、队列配置、读写/flush/GET_ID、GPA 越界与回绕、扇区越界与溢出、方向错、长度不是整扇区、请求头/状态描述符非法、成环、`avail.idx` 跳跃与 `NEEDS_RESET`、多段请求半完成、中断拉高/ACK/`NO_INTERRUPT`/复位、非法 MMIO 访问、镜像被截短、未知类型、镜像打开与加锁。
+- `tests/test_virtio_blk.py`：真实 KVM + 内核的端到端测试。宿主写好每个扇区内容不同的 raw 镜像，客户机用 `dd` 读首、中、末扇区并整盘 `md5sum`；客户机写 8 MiB 随机数据并回读，宿主按偏移比对字节、确认相邻扇区未被改动；ext4 镜像上写文件、`sync`、卸载，宿主 `debugfs` 读出、`e2fsck -fn` 干净，第二次启动还能读到；坏路径/太小/目录/被占用的镜像在启动前被拒绝；不带 `--disk` 时没有多出设备和输出。内核由 `VIRTIO_BZIMAGE`（默认 `BZIMAGE_PATH`）指定，需要 e2fsprogs。
+
+```sh
+make bin/test_virtio_blk && ./bin/test_virtio_blk
+VIRTIO_BZIMAGE=/path/to/bzImage python3 -m unittest -v tests/test_virtio_blk.py
+```
+
+两者都包含在 `make test` 中。
+
+## Stage 05：Virtqueue
 
 根据 [Runra Stage 05 教程](https://runra.dev/zh/blog/sandbox-from-scratch-05-virtio-queue) 实现 virtio 的核心数据结构 split virtqueue（Virtio 1.0 §2.6）和一个最小的设备模型。本阶段不碰 KVM：driver 和 device 在同一个进程里，doorbell 和中断都是函数调用，先把队列语义弄清楚；Stage 06 再把队列放进客户机内存、接上 transport 和 virtio-blk 协议。`svmm` 本身的行为与 Stage 04 相同。
 
@@ -75,11 +134,12 @@ make all initramfs           # 生成 bin/svmm 和 build/initramfs.cpio.gz
 - 命令行接口：
 
   ```text
-  svmm run --kernel PATH [--initrd PATH] [--mem SIZE_MB] [--cmdline STR]
+  svmm run --kernel PATH [--initrd PATH] [--mem SIZE_MB] [--cmdline STR] [--disk PATH]
     -k, --kernel PATH    x86 bzImage（必需）
     -i, --initrd PATH    initramfs；不传则不加载，内核会停在挂载根文件系统
     -m, --mem SIZE_MB    客户机内存，单位 MiB，64–3072，默认 256
     -c, --cmdline STR    内核命令行，整体替换默认值
+    -d, --disk PATH      raw 镜像，作为 virtio-blk（/dev/vda）；运行期间读写打开并加锁（Stage 06）
     -h, --help           打印帮助到 stdout 并返回 0
   ```
 
@@ -91,7 +151,7 @@ make all initramfs           # 生成 bin/svmm 和 build/initramfs.cpio.gz
 ## 测试
 
 ```sh
-make test                                          # 单元测试和 virtqueue 测试；没有内核镜像时跳过 KVM 测试
+make test                                          # 单元测试、virtqueue 和 virtio-blk 设备测试；没有内核镜像时跳过 KVM 测试
 BZIMAGE_PATH=/boot/vmlinuz-6.16.0 make test        # 加上 KVM 端到端测试
 ```
 

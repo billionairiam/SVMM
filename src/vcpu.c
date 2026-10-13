@@ -504,12 +504,21 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
         /*
          * 客户机访问了未映射为 RAM 的物理地址（例如 LAPIC、IOAPIC、HPET
          * 或超出内存范围的地址）。mmio.data 最多 8 字节，len 为访问宽度。
-         * 当前没有 MMIO 设备：写入丢弃，读取同样返回全 1。
+         * 落在已注册设备区间内的访问交给设备模拟（Stage 06 的 virtio-mmio），
+         * 设备在 vCPU 线程上同步处理，返回后 KVM 把读结果交给客户机指令；
+         * 其他地址没有设备：写入丢弃，读取同样返回全 1。
          */
         case KVM_EXIT_MMIO:
             if (run->mmio.len > sizeof(run->mmio.data)) {
                 fprintf(stderr, "invalid MMIO width: %u\n", run->mmio.len);
                 return vcpu_finish(stats, "invalid_mmio_width", -1);
+            }
+            if (vcpu->mmio.access && run->mmio.phys_addr >= vcpu->mmio.base &&
+                run->mmio.phys_addr - vcpu->mmio.base < vcpu->mmio.size) {
+                stats->mmio_device_exits++;
+                vcpu->mmio.access(vcpu->mmio.opaque, run->mmio.phys_addr - vcpu->mmio.base,
+                                  run->mmio.data, run->mmio.len, run->mmio.is_write);
+                break;
             }
             if (!run->mmio.is_write)
                 memset(run->mmio.data, 0xff, run->mmio.len);

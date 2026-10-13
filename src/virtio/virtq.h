@@ -73,6 +73,18 @@ struct virtq {
 /* qsz 必须是 [2, VIRTQ_MAX_SIZE] 内的 2 的幂，否则返回 NULL。 */
 struct virtq *virtq_create(unsigned int qsz);
 void virtq_destroy(struct virtq *vq);
+/*
+ * 让 vq 使用调用方提供的三块 ring 内存（Stage 06 中位于客户机内存里，地址由
+ * driver 通过 MMIO 寄存器告诉 device），两端私有计数器清零，不分配也不拥有内存，
+ * 所以不能对它调用 virtq_destroy()。qsz 的要求同 virtq_create()，不满足时返回 -1。
+ * 地址范围和对齐由调用方检查。
+ */
+int virtq_init_shared(struct virtq *vq, unsigned int qsz, struct vring_desc *desc,
+                      struct vring_avail *avail, struct vring_used *used);
+/* 三块 ring 在规范里的字节数（含 EVENT_IDX 用的尾部字段），供调用方检查地址范围。 */
+uint64_t virtq_desc_bytes(unsigned int qsz);
+uint64_t virtq_avail_bytes(unsigned int qsz);
+uint64_t virtq_used_bytes(unsigned int qsz);
 
 /* ---- driver 侧（客户机做的事） ---- */
 

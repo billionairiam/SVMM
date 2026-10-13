@@ -10,6 +10,17 @@ struct kvm_context;
 struct kvm_run;
 struct serial;
 
+/*
+ * MMIO 设备回调：gpa 落在 [base, base + size) 内的 KVM_EXIT_MMIO 交给它处理，
+ * offset 是相对 base 的偏移，读时把结果写进 data。
+ */
+struct vcpu_mmio_region {
+    uint64_t base;
+    uint64_t size;
+    void (*access)(void *opaque, uint64_t offset, uint8_t *data, uint32_t len, int is_write);
+    void *opaque;
+};
+
 struct vcpu {
     int fd;
     struct kvm_run *run;
@@ -18,6 +29,8 @@ struct vcpu {
     volatile sig_atomic_t stop_requested;
     pthread_t thread;
     volatile sig_atomic_t thread_valid;
+    /* 可选的 MMIO 设备（Stage 06 的 virtio-blk）；access 为 NULL 表示没有。 */
+    struct vcpu_mmio_region mmio;
 };
 
 /* KVM_EXIT_* 目前不到 64 种；更大的值都记在最后一格。 */
@@ -46,6 +59,8 @@ struct vcpu_run_stats {
     struct vcpu_io_port_stat io_ports[VCPU_IO_PORT_SLOTS];
     unsigned io_port_count;
     unsigned long io_other_exits;
+    /* 分派给 MMIO 设备的 KVM_EXIT_MMIO 次数。 */
+    unsigned long mmio_device_exits;
 };
 
 int vcpu_init(struct vcpu *vcpu, const struct kvm_context *kvm, unsigned id);

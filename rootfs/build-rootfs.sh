@@ -1,5 +1,5 @@
 #!/bin/sh
-# 生成 Stage 03 的最小 initramfs：静态 BusyBox + /init，打包为 newc cpio 再 gzip。
+# 生成 Stage 03 的最小 initramfs（Stage 06 起 /init 会挂载 virtio-blk 磁盘）：静态 BusyBox + /init，打包为 newc cpio 再 gzip。
 #
 # 用法：rootfs/build-rootfs.sh [输出路径]
 #   输出路径默认是 build/initramfs.cpio.gz（相对仓库根目录）。
@@ -59,7 +59,7 @@ fi
 root=$work/root
 mkdir -p "$root/bin" "$root/sbin" "$root/usr/bin" "$root/usr/sbin" \
          "$root/dev" "$root/proc" "$root/sys" "$root/tmp" "$root/root" \
-         "$root/etc"
+         "$root/etc" "$root/mnt"
 chmod 1777 "$root/tmp"
 cp "$busybox" "$root/bin/busybox"
 chmod 755 "$root/bin/busybox"
@@ -87,6 +87,16 @@ exec 0</dev/console 1>/dev/console 2>&1
 
 echo "hello from mini sandbox"
 
+# Stage 06：VMM 带了 --disk 时，内核把 virtio-blk 磁盘注册成 /dev/vda。
+# 文件系统类型交给 mount 自动识别；不是文件系统（raw 数据盘）时只提示，不影响启动。
+if [ -b /dev/vda ]; then
+    if mount /dev/vda /mnt 2>/dev/null; then
+        echo "virtio-blk: /dev/vda mounted on /mnt"
+    else
+        echo "virtio-blk: mount /dev/vda failed (no filesystem?), use it as a raw device"
+    fi
+fi
+
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export HOME=/root
 export PS1='/ # '
@@ -101,6 +111,11 @@ else
 fi
 # shell 退出即结束 sandbox：reboot -f 写 ACPI RESET_REG（0xcf9），VMM 把它当作客户机退出。
 echo "mini sandbox shell exited"
+# reboot -f 不会卸载文件系统：先把脏页刷到磁盘并卸载，镜像下次才是干净的。
+sync
+if grep -q ' /mnt ' /proc/mounts; then
+    umount /mnt || echo "virtio-blk: umount /mnt failed"
+fi
 exec reboot -f
 EOF
 chmod 755 "$root/init"

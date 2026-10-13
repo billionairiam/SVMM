@@ -26,6 +26,8 @@ static void print_usage(FILE *stream)
             "  -m, --mem SIZE_MB    guest memory in MiB, %u-%u (default: %u)\n"
             "  -c, --cmdline STR    kernel command line, default:\n"
             "                       \"%s\"\n"
+            "  -d, --disk PATH      raw disk image exposed as virtio-blk (/dev/vda);\n"
+            "                       opened read-write and locked while the VM runs\n"
             "  -h, --help           show this help\n"
             "\n"
             "When stdin is a terminal, press Ctrl-A x to quit.\n",
@@ -83,6 +85,7 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
         { "initrd", required_argument, NULL, 'i' },
         { "mem", required_argument, NULL, 'm' },
         { "cmdline", required_argument, NULL, 'c' },
+        { "disk", required_argument, NULL, 'd' },
         { "help", no_argument, NULL, 'h' },
         { 0 },
     };
@@ -96,7 +99,7 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
     optind = 1;
     opterr = 0;
     int opt;
-    while ((opt = getopt_long(sub_argc, sub_argv, "+:k:i:m:c:h", options, NULL)) != -1) {
+    while ((opt = getopt_long(sub_argc, sub_argv, "+:k:i:m:c:d:h", options, NULL)) != -1) {
         switch (opt) {
         case 'k':
             config->kernel_path = optarg;
@@ -111,6 +114,11 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
             break;
         case 'c':
             config->cmdline = optarg;
+            break;
+        case 'd':
+            if (!*optarg)
+                return usage_error("--disk requires a non-empty path");
+            config->disk_path = optarg;
             break;
         case 'h':
             print_usage(stdout);

@@ -5,11 +5,14 @@ CPPFLAGS += -Isrc
 .DEFAULT_GOAL := all
 
 SOURCES := src/main.c src/cli.c src/sandbox.c src/kvm.c src/memory.c src/vcpu.c \
-           src/serial.c src/console.c src/metrics.c src/boot/linux.c src/boot/acpi.c
+           src/serial.c src/console.c src/metrics.c src/boot/linux.c src/boot/acpi.c \
+           src/virtio/virtq.c src/virtio/mmio.c src/virtio/blk.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 # Stage 05 的 virtqueue 是纯用户态代码，不依赖 KVM，单独编进 virtq-demo。
+# Stage 06 起 virtq.c 也编进 svmm，给 virtio-mmio 设备用。
 VIRTIO_SOURCES := src/virtio/virtq.c src/virtio/virtio.c
 VIRTIO_OBJECTS := $(VIRTIO_SOURCES:src/%.c=build/%.o)
+BLK_SOURCES := src/virtio/virtq.c src/virtio/mmio.c src/virtio/blk.c
 DEPFILES := $(OBJECTS:.o=.d) $(VIRTIO_OBJECTS:.o=.d) build/virtio/demo.d
 
 ABLATION_VARIANTS := baseline no_cpuid fixed_32m no_boot_params no_e820 \
@@ -42,18 +45,29 @@ $(foreach variant,$(ABLATION_VARIANTS),$(eval $(call ABLATION_template,$(variant
 
 -include $(DEPFILES) $(ABLATION_DEPFILES)
 
-.PHONY: all ablation initramfs run run-virtq test clean
+.PHONY: all ablation initramfs disk run run-disk run-virtq test clean
 
 # make run KERNEL=/boot/vmlinuz-6.16.0 MEM=512
 KERNEL ?= images/bzImage
 INITRD ?= build/initramfs.cpio.gz
 MEM ?= 256
+# make disk / make run-disk：64 MiB 的 ext4 镜像，已存在时不覆盖。
+DISK ?= build/disk.img
+DISK_MB ?= 64
 
 all: bin/svmm bin/virtq-demo
 
 ablation: $(ABLATION_VARIANTS:%=bin/ablation/%/svmm)
 
 initramfs: build/initramfs.cpio.gz
+
+disk: | build
+	@if [ -e $(DISK) ]; then \
+		echo "disk: $(DISK) exists, keeping it (rm it to recreate)"; \
+	else \
+		truncate -s $(DISK_MB)M $(DISK) && mkfs.ext4 -q -F $(DISK) && \
+		echo "disk: created $(DISK) ($(DISK_MB) MiB ext4)"; \
+	fi
 
 build/initramfs.cpio.gz: rootfs/build-rootfs.sh | build
 	sh rootfs/build-rootfs.sh $@
@@ -66,6 +80,10 @@ bin/virtq-demo: build/virtio/demo.o $(VIRTIO_OBJECTS) | bin
 
 bin/test_virtq: tests/test_virtq.c $(VIRTIO_SOURCES) src/virtio/virtq.h src/virtio/virtio.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_virtq.c $(VIRTIO_SOURCES) -o $@
+
+bin/test_virtio_blk: tests/test_virtio_blk.c $(BLK_SOURCES) src/virtio/virtq.h \
+                     src/virtio/mmio.h src/virtio/blk.h | bin
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_virtio_blk.c $(BLK_SOURCES) -o $@
 
 bin/test_serial: tests/test_serial.c src/serial.c src/serial.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_serial.c src/serial.c -o $@
@@ -98,11 +116,15 @@ bin/ablation/%:
 run: all initramfs
 	@./bin/svmm run --kernel $(KERNEL) --initrd $(INITRD) --mem $(MEM)
 
+run-disk: all initramfs disk
+	@./bin/svmm run --kernel $(KERNEL) --initrd $(INITRD) --mem $(MEM) --disk $(DISK)
+
 run-virtq: bin/virtq-demo
 	@./bin/virtq-demo
 
-test: bin/test_metrics bin/test_vcpu_errors bin/test_virtq
+test: bin/test_metrics bin/test_vcpu_errors bin/test_virtq bin/test_virtio_blk
 	./bin/test_virtq
+	./bin/test_virtio_blk
 	python3 -m unittest -v tests/test_virtq_demo.py
 	./bin/test_metrics
 	./bin/test_vcpu_errors
@@ -111,6 +133,7 @@ test: bin/test_metrics bin/test_vcpu_errors bin/test_virtq
 	sh tests/test_linux_boot.sh
 	python3 -m unittest -v tests/test_initramfs_shell.py
 	python3 -m unittest -v tests/test_sandbox_cli.py
+	python3 -m unittest -v tests/test_virtio_blk.py
 
 clean:
 	rm -rf build bin

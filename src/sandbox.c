@@ -9,6 +9,7 @@
 #include "metrics.h"
 #include "serial.h"
 #include "vcpu.h"
+#include "virtio/blk.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -61,6 +62,17 @@ static void serial_irq(void *opaque, int level)
     kvm_set_irq_line(opaque, COM1_IRQ, level);
 }
 
+static void blk_irq(void *opaque, int level)
+{
+    kvm_set_irq_line(opaque, VIRTIO_MMIO_IRQ, level);
+}
+
+static void blk_mmio_access(void *opaque, uint64_t offset, uint8_t *data, uint32_t len,
+                            int is_write)
+{
+    virtio_mmio_access(opaque, offset, data, len, is_write);
+}
+
 static void console_quit(void *opaque)
 {
     vcpu_request_stop(opaque);
@@ -104,6 +116,8 @@ int sandbox_run(const struct sandbox_config *config)
     struct console console = { 0 };
     struct linux_image image = { 0 };
     struct vcpu_run_stats run_stats = { 0 };
+    struct virtio_blk blk = { .fd = -1 };
+    int blk_attached = 0;
     size_t mem_size_mb = SVMM_ABLATE_DYNAMIC_MEMORY_ENABLED ?
         BLOG_GUEST_MEMORY_MB : config->mem_size_mb;
     size_t memory_size = 0;
@@ -116,6 +130,14 @@ int sandbox_run(const struct sandbox_config *config)
         goto done;
     }
     metric_stage(stderr, SVMM_VARIANT_NAME, "image_loaded", memory_size);
+
+    /* 1b. 可选的磁盘镜像：同样在创建 VM 之前打开，路径错误或被占用时尽早失败。 */
+    if (config->disk_path) {
+        if (virtio_blk_open(&blk, config->disk_path) < 0) {
+            metric_failure("disk_open", memory_size);
+            goto done;
+        }
+    }
 
     /* 2. 打开 /dev/kvm，创建 VM、内核 irqchip 和 PIT。 */
     if (kvm_context_init(&kvm) < 0) {
@@ -132,8 +154,23 @@ int sandbox_run(const struct sandbox_config *config)
     }
     metric_stage(stderr, SVMM_VARIANT_NAME, "memory_mapped", memory_size);
 
-    /* 4. ACPI 表（RSDP 在 0xE0000）。 */
-    if (boot_acpi_setup(&memory) < 0) {
+    /*
+     * 3b. virtio-blk 接到客户机内存和 GSI 5 上。寄存器页在 0xd0000000，
+     * 不注册为内存槽，客户机访问它时产生 KVM_EXIT_MMIO。
+     */
+    if (config->disk_path) {
+        virtio_blk_attach(&blk, memory.data, memory.size, blk_irq, &kvm);
+        blk_attached = 1;
+        fprintf(stderr, "INFO: virtio-blk %s: %llu sectors, mmio 0x%x irq %u\n",
+                config->disk_path, (unsigned long long)blk.config.capacity,
+                VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ);
+    }
+
+    /* 4. ACPI 表（RSDP 在 0xE0000）；带磁盘时 DSDT 里多一个 virtio-mmio 设备。 */
+    const struct acpi_virtio_mmio acpi_blk = {
+        .base = VIRTIO_MMIO_BASE, .size = VIRTIO_MMIO_SIZE, .gsi = VIRTIO_MMIO_IRQ,
+    };
+    if (boot_acpi_setup(&memory, blk_attached ? &acpi_blk : NULL) < 0) {
         perror("ACPI tables");
         metric_failure("acpi_setup", memory_size);
         goto done;
@@ -170,6 +207,13 @@ int sandbox_run(const struct sandbox_config *config)
         metric_failure("vcpu_setup", memory_size);
         goto done;
     }
+    if (blk_attached)
+        vcpu.mmio = (struct vcpu_mmio_region){
+            .base = VIRTIO_MMIO_BASE,
+            .size = VIRTIO_MMIO_SIZE,
+            .access = blk_mmio_access,
+            .opaque = &blk.mmio,
+        };
     metric_stage(stderr, SVMM_VARIANT_NAME, "vcpu_setup", memory_size);
 
     /* 8. 串口输出到 stdout，控制台把 stdin 送进串口。 */
@@ -191,6 +235,8 @@ done:
     /* 10. 清理。先恢复终端模式，再打印统计；raw 模式下 "\n" 不会回到行首。 */
     console_stop(&console);
     metric_exit_breakdown(stderr, &run_stats);
+    if (blk_attached)
+        virtio_blk_print_stats(&blk, stderr);
     if (status == 0)
         fprintf(stderr, "INFO: sandbox completed\n");
     signal_vcpu = NULL;
@@ -198,6 +244,7 @@ done:
     if (serial_ready)
         serial_destroy(&serial);
     guest_memory_destroy(&memory);
+    virtio_blk_close(&blk);
     kvm_context_destroy(&kvm);
     boot_linux_free(&image);
     return status;

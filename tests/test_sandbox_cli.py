@@ -72,7 +72,7 @@ class CliContractTest(unittest.TestCase):
             result = run_cli(*args)
             self.assertEqual(result.returncode, 0, args)
             self.assertEqual(result.stderr, b"", args)
-            for option in (b"--kernel", b"--initrd", b"--mem", b"--cmdline"):
+            for option in (b"--kernel", b"--initrd", b"--mem", b"--cmdline", b"--disk"):
                 self.assertIn(option, result.stdout, args)
 
     def test_invalid_invocations_are_rejected_before_boot(self):
@@ -87,6 +87,8 @@ class CliContractTest(unittest.TestCase):
             ["run", "--kernel", "/nonexistent", "extra"],
             ["run", "--kernel"],
             ["run", "--kernel", "/nonexistent", "--mem"],
+            ["run", "--kernel", "/nonexistent", "--disk"],
+            ["run", "--kernel", "/nonexistent", "--disk", ""],
         ]
         for args in cases:
             with self.subTest(args=args):

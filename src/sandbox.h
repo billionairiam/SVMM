@@ -16,6 +16,7 @@
  *   initrd_path  PUT /boot-source   initrd_path
  *   mem_size_mb  PUT /machine-config mem_size_mib
  *   cmdline      PUT /boot-source   boot_args
+ *   disk_path    PUT /drives/rootfs path_on_host（is_root_device=false）
  */
 struct sandbox_config {
     /* x86 bzImage 路径，必填。 */
@@ -26,6 +27,11 @@ struct sandbox_config {
     size_t mem_size_mb;
     /* 内核命令行。 */
     const char *cmdline;
+    /*
+     * 可选的 raw 磁盘镜像，作为 virtio-blk（客户机里的 /dev/vda）。
+     * 以读写方式打开并加独占锁；设备在 DSDT 里声明，命令行不变。
+     */
+    const char *disk_path;
 };
 
 /* 填入默认值：256 MiB、默认命令行、无内核和 initramfs。 */
