@@ -22,10 +22,36 @@
  * vCPU、串口和控制台。它们全部先初始化成“空”状态，任何一步失败都
  * goto done，由同一段清理代码释放；每个 destroy 函数对未初始化或
  * 部分初始化的对象都是安全的。
+ *
+ * 运行起来后整台机器是这样的：
+ *
+ *   宿主进程 svmm                               客户机（Linux）
+ *   ┌───────────────────────────────────┐      ┌──────────────────────────┐
+ *   │ 主线程 = vCPU 线程                  │      │                          │
+ *   │   vcpu_run(): ioctl(KVM_RUN) 循环 ◄─┼──────┤ IN/OUT 0x3f8  → 串口模型   │
+ *   │     ├ KVM_EXIT_IO   → serial.c     │ exit │ MMIO 0xd0000000 → virtio  │
+ *   │     └ KVM_EXIT_MMIO → virtio/mmio.c│      │ 普通内存访问 → 不退出       │
+ *   │                                   │      │                          │
+ *   │ 控制台线程 console.c                │      │                          │
+ *   │   读 stdin → 串口接收 FIFO ─────────┼─IRQ─►│ 8250 驱动                 │
+ *   │                                   │      │                          │
+ *   │ guest_memory (mmap) ◄─────────────┼──────┤ 客户机 RAM，GPA 0..mem     │
+ *   │ 磁盘镜像 fd (pread/pwrite)          │      │ /dev/vda                 │
+ *   └───────────────────────────────────┘      └──────────────────────────┘
+ *
+ * KVM 内核模块负责 CPU 虚拟化、内存（EPT）、LAPIC/IOAPIC/PIT 和 HLT；VMM 只
+ * 模拟 KVM 不认识的设备。设备通知客户机的唯一方式是 kvm_set_irq_line()。
+ *
+ * 各模块之间用“函数指针 + void *opaque”的回调互相连接，彼此不需要包含对方的
+ * 头文件：例如 serial.c 不知道 KVM 的存在，它只在中断电平变化时调用
+ * serial_irq(opaque=&kvm, level)，由这里转成 KVM_IRQ_LINE。下面几个 static
+ * 函数就是这些“接线”。
  */
 
+/* 信号处理函数只能访问全局变量，所以把 vCPU 指针放在这里。 */
 static struct vcpu *signal_vcpu;
 
+/* 什么都不做：SIGUSR1 的作用只是让阻塞中的 KVM_RUN 以 EINTR 返回。 */
 static void wake_handler(int signo)
 {
     (void)signo;
@@ -57,22 +83,29 @@ static void install_signal_handlers(struct vcpu *vcpu)
     sigaction(SIGHUP, &action, NULL);
 }
 
+/* 串口模型的中断输出 → KVM 的 GSI 4（COM1 的传统 IRQ）。 */
 static void serial_irq(void *opaque, int level)
 {
     kvm_set_irq_line(opaque, COM1_IRQ, level);
 }
 
+/* virtio-mmio 传输层的中断输出 → GSI 5，与 DSDT 里 \_SB.VR00 声明的一致。 */
 static void blk_irq(void *opaque, int level)
 {
     kvm_set_irq_line(opaque, VIRTIO_MMIO_IRQ, level);
 }
 
+/*
+ * vcpu.c 收到落在 virtio 寄存器页内的 KVM_EXIT_MMIO 时调用它。
+ * opaque 是 &blk.mmio；这层转发让 vcpu.c 不必知道 virtio 的存在。
+ */
 static void blk_mmio_access(void *opaque, uint64_t offset, uint8_t *data, uint32_t len,
                             int is_write)
 {
     virtio_mmio_access(opaque, offset, data, len, is_write);
 }
 
+/* 控制台线程收到 Ctrl-A x 时调用：让 vCPU 线程退出 KVM_RUN 循环。 */
 static void console_quit(void *opaque)
 {
     vcpu_request_stop(opaque);
@@ -157,6 +190,8 @@ int sandbox_run(const struct sandbox_config *config)
     /*
      * 3b. virtio-blk 接到客户机内存和 GSI 5 上。寄存器页在 0xd0000000，
      * 不注册为内存槽，客户机访问它时产生 KVM_EXIT_MMIO。
+     * 设备需要客户机内存的宿主指针（memory.data）来直接读写 virtqueue 和
+     * 数据 buffer，所以必须在第 3 步之后。
      */
     if (config->disk_path) {
         virtio_blk_attach(&blk, memory.data, memory.size, blk_irq, &kvm);
@@ -166,7 +201,12 @@ int sandbox_run(const struct sandbox_config *config)
                 VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ);
     }
 
-    /* 4. ACPI 表（RSDP 在 0xE0000）；带磁盘时 DSDT 里多一个 virtio-mmio 设备。 */
+    /*
+     * 4. ACPI 表（RSDP 在 0xE0000）；带磁盘时 DSDT 里多一个 virtio-mmio 设备。
+     * virtio-mmio 不像 PCI 那样能被扫描发现，客户机内核只能从 ACPI（或设备树、
+     * 命令行）得知“0xd0000000 有一个设备、用 GSI 5”。VMM 和客户机对设备位置的
+     * 约定全靠这张表。
+     */
     const struct acpi_virtio_mmio acpi_blk = {
         .base = VIRTIO_MMIO_BASE, .size = VIRTIO_MMIO_SIZE, .gsi = VIRTIO_MMIO_IRQ,
     };
@@ -207,6 +247,10 @@ int sandbox_run(const struct sandbox_config *config)
         metric_failure("vcpu_setup", memory_size);
         goto done;
     }
+    /*
+     * 把 virtio 寄存器页登记给 vCPU 的 MMIO 分派。KVM 本身不知道哪个地址属于
+     * 哪个设备，它只报告“客户机访问了某个未映射的 GPA”，由 VMM 自己查表。
+     */
     if (blk_attached)
         vcpu.mmio = (struct vcpu_mmio_region){
             .base = VIRTIO_MMIO_BASE,

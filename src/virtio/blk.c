@@ -16,15 +16,50 @@
 #define BLK_ERROR_LOG_LIMIT 16u
 
 /*
+ * 一个读请求在客户机内存里的样子（例如 Linux 读 8 个扇区到两个不相邻的页）：
+ *
+ *   descriptor table（客户机内存）              客户机 RAM 里的 buffer
+ *   ┌────┬───────────┬──────┬───────────┐
+ *   │ #5 │ 0x1234000 │   16 │ NEXT      │ ──► { type=IN, reserved, sector=2048 }
+ *   │ #6 │ 0x2000000 │ 2048 │ NEXT|WRITE│ ──► [ 2 KiB 空 buffer，VMM 写入 ]
+ *   │ #7 │ 0x3000800 │ 2048 │ NEXT|WRITE│ ──► [ 2 KiB 空 buffer，VMM 写入 ]
+ *   │ #8 │ 0x1234010 │    1 │ WRITE     │ ──► [ status：VMM 写 0/1/2 ]
+ *   └────┴───────────┴──────┴───────────┘
+ *   avail.ring[k] = 5，avail.idx++，写 QueueNotify
+ *
+ * Linux 侧对应 drivers/block/virtio_blk.c 的 virtio_queue_rq() → virtblk_add_req()：
+ * 把请求头、bio 的各个段、状态字节分别做成 scatterlist，交给 virtqueue_add_sgs()，
+ * 它负责挑空闲描述符、串成链、写 avail ring。
+ *
+ * VMM 侧的处理流程：
+ *
+ *   blk_process_queue()         把 avail ring 里新出现的链一条条取出来
+ *     blk_handle_request()      处理一条链
+ *       virtq_walk_chain()      校验链结构，拷贝成快照 struct chain
+ *       找状态字节、读请求头
+ *       blk_rw() / flush / GET_ID
+ *       写状态字节
+ *     virtq_used_push()         写 used ring：{id = 链头, len = 写给客户机的字节数}
+ *   （回到 mmio.c 的 queue_notify() 发中断）
+ *
+ * 数据直接在客户机内存和镜像文件之间 pread/pwrite，中间没有额外拷贝：
+ * buf 就是 GPA 换算出来的宿主指针。
+ */
+
+/*
  * 一条描述符链的快照。virtq_walk_chain() 已经检查过下标、环、INDIRECT 和
  * 读写顺序，并且回调拿到的是它的私有拷贝，所以之后客户机再改描述符表也
  * 不会影响这里（避免 double fetch）。
+ *
+ * double fetch：VMM 第一次读 desc.len 做检查，第二次读 desc.len 去用；客户机的
+ * 另一个 vCPU 在两次读之间把它改大，检查就被绕过了。解决办法是只读一次、存下来。
  */
 struct chain {
     struct vring_desc desc[VIRTQ_MAX_SIZE];
     unsigned int count;
 };
 
+/* virtq_walk_chain() 的回调：把每个描述符依次存进快照。 */
 static int collect_desc(const struct vring_desc *desc, uint16_t idx, void *opaque)
 {
     (void)idx;
@@ -51,7 +86,13 @@ static void blk_error(struct virtio_blk *blk, const char *format, ...)
     va_end(args);
 }
 
-/* 完整读写：pread/pwrite 可能只完成一部分，循环到结束；遇到 EOF 视为失败。 */
+/*
+ * 完整读写：pread/pwrite 可能只完成一部分，循环到结束；遇到 EOF 视为失败。
+ * pread 返回 0 表示到了文件末尾（镜像在运行中被截短），这时 errno 没有意义，
+ * 清成 0 让调用方打印 "end of file" 而不是一个无关的旧错误。
+ * 用 pread/pwrite 而不是 lseek + read：自带偏移，不改文件位置，将来多个
+ * 线程并发处理请求也不会互相干扰。
+ */
 static int pread_full(int fd, uint8_t *buf, uint64_t len, uint64_t offset)
 {
     while (len) {
@@ -135,7 +176,8 @@ static uint8_t blk_rw(struct virtio_blk *blk, const struct chain *chain, uint32_
     }
 
     /* 防线 5：完整 I/O。短读（镜像被外部截短）不能当成功返回。 */
-    uint64_t offset = sector * VIRTIO_BLK_SECTOR_SIZE;
+    uint64_t offset = sector * VIRTIO_BLK_SECTOR_SIZE; /* 上面已保证 sector < capacity，不会溢出 */
+    /* 多个数据段在磁盘上是连续的：第一段从 offset 开始，下一段接着上一段的末尾。 */
     for (unsigned int i = first; i < last; i++) {
         const struct vring_desc *d = &chain->desc[i];
         uint8_t *buf = virtio_mmio_gpa(dev, d->addr, d->len);
@@ -160,6 +202,10 @@ static uint8_t blk_rw(struct virtio_blk *blk, const struct chain *chain, uint32_
     return VIRTIO_BLK_S_OK;
 }
 
+/*
+ * GET_ID：客户机读设备序列号（Linux 在 /sys/block/vda/serial 里显示）。
+ * 链是 头 + 一个可写的 20 字节 buffer + 状态。
+ */
 static uint8_t blk_get_id(struct virtio_blk *blk, const struct chain *chain, uint64_t *written)
 {
     const struct vring_desc *d = &chain->desc[1];
@@ -196,17 +242,27 @@ static uint32_t blk_handle_request(struct virtio_blk *blk, struct virtq *vq, uin
     }
     blk->stats.requests++;
 
-    /* 状态在最后一个描述符的最后一个字节，必须对 device 可写。 */
+    /*
+     * 状态在最后一个描述符的最后一个字节，必须对 device 可写。
+     * 规范只规定“链的最后一个字节是状态”，没规定它独占一个描述符；Linux 恰好
+     * 给它单独一个 1 字节描述符，但别的 driver 可以把它和最后一段数据放在一起。
+     * 先找状态字节，后面的任何错误才有地方报告给 driver。
+     */
     const struct vring_desc *sd = &chain.desc[chain.count - 1];
     uint8_t *status = NULL;
     if (chain.count >= 2 && (sd->flags & VRING_DESC_F_WRITE) && sd->len >= 1)
         status = virtio_mmio_gpa(dev, sd->addr + sd->len - 1, 1);
+    /* 第二个条件挡住 addr + len - 1 回绕到低地址、恰好又落在 RAM 里的情况。 */
     if (!status || sd->addr + sd->len - 1 < sd->addr) {
         blk_error(blk, "request at head %u has no writable status byte", head);
         return 0;
     }
 
-    /* 请求头：只读、至少 16 字节、在客户机 RAM 里；拷贝一份再用。 */
+    /*
+     * 请求头：只读、至少 16 字节、在客户机 RAM 里；拷贝一份再用。
+     * 拷贝到栈上同样是为了防 double fetch：hdr.type 和 hdr.sector 在检查和使用
+     * 之间不会再被客户机改掉。
+     */
     const struct vring_desc *hd = &chain.desc[0];
     const void *hdr_ptr = virtio_mmio_gpa(dev, hd->addr, sizeof(struct virtio_blk_req_header));
     if ((hd->flags & VRING_DESC_F_WRITE) || hd->len < sizeof(struct virtio_blk_req_header) ||
@@ -226,7 +282,13 @@ static uint32_t blk_handle_request(struct virtio_blk *blk, struct virtq *vq, uin
         result = blk_rw(blk, &chain, hdr.type, hdr.sector, &written);
         break;
     case VIRTIO_BLK_T_FLUSH:
-        /* 客户机的 flush 意味着“之前完成的写必须持久化”，对应宿主的 fdatasync。 */
+        /*
+         * 客户机的 flush 意味着“之前完成的写必须持久化”，对应宿主的 fdatasync。
+         * pwrite 返回只代表数据进了宿主的页缓存，宿主断电仍会丢；ext4 的日志
+         * 提交依赖 flush 来保证顺序，所以这一步不能省。
+         * 只有提供了 VIRTIO_BLK_F_FLUSH，Linux 才会发 flush（否则它认为设备
+         * 没有写缓存，写完成就等于已落盘）。
+         */
         blk->stats.flushes++;
         if (fdatasync(blk->fd) < 0) {
             blk_error(blk, "flush failed: %s", strerror(errno));
@@ -244,15 +306,26 @@ static uint32_t blk_handle_request(struct virtio_blk *blk, struct virtq *vq, uin
         break;
     }
     *status = result;
-    /* 数据段总长受 qsz * UINT32_MAX 限制，但 used.len 只有 32 位。 */
+    /*
+     * used.len = device 写进客户机可写 buffer 的字节数：读到的数据 + 状态字节。
+     * Linux 的 virtio_blk 并不依赖它（看状态字节），但规范要求如实填写，
+     * 别的 driver 可能用它判断收到了多少数据。
+     * 数据段总长受 qsz * UINT32_MAX 限制，但 used.len 只有 32 位。
+     */
     return written + 1 > UINT32_MAX ? UINT32_MAX : (uint32_t)(written + 1);
 }
 
+/*
+ * backend 的 process_queue 回调，每次 kick 调用一次。循环取 avail ring，直到
+ * device 已经看到 driver 发布的所有链（avail.idx == last_seen_avail）。
+ * 每取走一条就立即完成一条，所以这个设备永远没有“在途”的请求。
+ */
 static int blk_process_queue(struct virtio_mmio *dev, struct virtq *vq)
 {
     struct virtio_blk *blk = dev->opaque;
     for (;;) {
         uint16_t head;
+        /* 返回 1 取到一个链头，0 已经空了，-1 avail.idx 不可信。 */
         int rc = virtq_avail_consume(vq, &head);
         if (rc == 0)
             return 0;
@@ -266,6 +339,10 @@ static int blk_process_queue(struct virtio_mmio *dev, struct virtq *vq)
                                   : "avail ring head %u out of range", head);
             return -1;
         }
+        /*
+         * 不管请求成功、失败还是链非法，都要放进 used ring：driver 在等这个链头
+         * 回来才能释放描述符、结束这个 I/O，不完成它就会永远卡住。
+         */
         uint32_t len = blk_handle_request(blk, vq, head);
         if (virtq_used_push(vq, head, len) < 0)
             return -1;
@@ -285,6 +362,10 @@ int virtio_blk_open(struct virtio_blk *blk, const char *path)
         fprintf(stderr, "ERROR: stat disk image %s: %s\n", path, strerror(errno));
         goto fail;
     }
+    /*
+     * 磁盘大小：普通文件看 st_size；块设备（例如 /dev/loop0、一个 LVM 卷）的
+     * st_size 是 0，要用 BLKGETSIZE64 问内核。
+     */
     uint64_t bytes;
     if (S_ISREG(st.st_mode)) {
         bytes = (uint64_t)st.st_size;
@@ -315,12 +396,22 @@ int virtio_blk_open(struct virtio_blk *blk, const char *path)
         goto fail;
     }
     blk->disk_bytes = capacity * VIRTIO_BLK_SECTOR_SIZE;
+    /* 配置空间：driver 在 FEATURES_OK 之后从 0x100 起读这个结构。 */
     blk->config = (struct virtio_blk_config){
         .capacity = capacity,
         /* 没有 INDIRECT 时，一个请求的 头 + 数据段 + 状态 都要放进同一个队列。 */
         .seg_max = VIRTIO_BLK_QUEUE_SIZE - 2,
         .blk_size = VIRTIO_BLK_SECTOR_SIZE,
     };
+    /*
+     * 交给传输层的描述：设备类型、提供的特性、队列大小、配置空间、请求处理函数。
+     * 特性含义：
+     *   VERSION_1  modern virtio，Linux 的 virtio-mmio v2 driver 要求有
+     *   SEG_MAX    告诉 driver 一个请求最多几个数据段（config.seg_max）
+     *   BLK_SIZE   逻辑块大小（config.blk_size），Linux 据此设置 logical_block_size
+     *   FLUSH      设备有写缓存，driver 需要发 flush 才能保证落盘
+     * 没提供的（例如 RO 只读盘、DISCARD、多队列 MQ）driver 就不会使用。
+     */
     blk->backend = (struct virtio_mmio_backend){
         .device_id = VIRTIO_ID_BLOCK_DEVICE,
         .features = (1ull << VIRTIO_F_VERSION_1) | (1ull << VIRTIO_BLK_F_SEG_MAX) |
@@ -338,6 +429,7 @@ fail:
     return -1;
 }
 
+/* opaque 传 blk 自己，process_queue 回调里通过 dev->opaque 取回。 */
 void virtio_blk_attach(struct virtio_blk *blk, uint8_t *mem, uint64_t mem_size,
                        void (*set_irq)(void *opaque, int level), void *irq_opaque)
 {
@@ -354,6 +446,7 @@ void virtio_blk_print_stats(const struct virtio_blk *blk, FILE *stream)
             blk->mmio.stats.notifies, blk->mmio.stats.interrupts);
 }
 
+/* 关闭 fd 同时释放 flock，下一个 svmm 就可以使用这个镜像了。 */
 void virtio_blk_close(struct virtio_blk *blk)
 {
     if (blk->fd >= 0)

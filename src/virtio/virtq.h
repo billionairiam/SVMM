@@ -9,9 +9,23 @@
  *   available ring    driver 写、device 读：“这些链等你处理”；
  *   used ring         device 写、driver 读：“这些链处理完了，写入了多少字节”。
  *
- * 本阶段三块内存由 virtq_create() 在宿主进程里分配；描述符里的 addr 是
- * 客户机物理地址（GPA），由上层（virtio.h 的 virtio_gpa()）翻译。Stage 06
- * 会把它们放进真正的客户机内存。
+ * 三块内存有两种来源：virtq_create() 在宿主进程里分配（Stage 05 的 demo 和单元测试），
+ * 或 virtq_init_shared() 直接使用客户机内存里由 driver 分配好的 ring（Stage 06 的
+ * virtio-mmio，地址由 driver 写进 QueueDesc/QueueAvail/QueueUsed 寄存器）。
+ * 描述符里的 addr 始终是客户机物理地址（GPA），由上层（virtio_gpa() 或
+ * virtio_mmio_gpa()）翻译并检查范围。
+ *
+ * 一个具体例子（qsz = 4）：driver 提交了 3 条链，device 已经完成了 1 条：
+ *
+ *   avail.idx = 3    avail.ring = [h0, h1, h2, -]     device: last_seen_avail = 1
+ *   used.idx  = 1    used.ring  = [{h0,len}, -, -, -]  driver: last_used_idx  = 0
+ *
+ *   device 还没取走的：avail.idx - last_seen_avail = 2 条（槽位 1、2）
+ *   driver 还没回收的：used.idx  - last_used_idx   = 1 条（槽位 0）
+ *
+ * idx 是一直增长的 16 位计数器，不是“下一个槽位”；槽位 = idx % qsz。
+ * 差值用 uint16_t 计算，65535 → 0 回绕时 (uint16_t)(1 - 65535) 仍等于 2。
+ * qsz 必须是 2 的幂，这样 65536 能被 qsz 整除，回绕前后的槽位才连续。
  *
  * 规范要求这些字段是小端；本项目只支持小端宿主（x86_64、arm64），不做转换。
  */

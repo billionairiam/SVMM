@@ -7,7 +7,11 @@
 /*
  * 共享 ring 的 idx 是发布点：写者先写好描述符/ring 槽位，再以 release 语义
  * 写 idx；读者以 acquire 语义读 idx，之后读到的槽位内容一定是新的。
- * 本阶段是单线程，屏障不改变结果，但顺序与真实的多线程 VMM 一致。
+ *
+ * 为什么需要：没有屏障时，编译器或 CPU 可能把“写 idx”提前到“写槽位”之前，
+ * 对方看到 idx 变了就去读槽位，读到的却是旧值。Stage 05 是单线程，屏障不改变
+ * 结果；Stage 06 中 driver 是客户机 vCPU、device 是 VMM，两边真的并发访问同一块
+ * 内存（x86 上 release/acquire 只约束编译器重排，不产生额外指令）。
  */
 static uint16_t load_idx(const uint16_t *idx)
 {
@@ -19,6 +23,7 @@ static void publish_idx(uint16_t *idx, uint16_t value)
     __atomic_store_n(idx, value, __ATOMIC_RELEASE);
 }
 
+/* 计数器 → ring 槽位。qsz 是 2 的幂，所以 & (qsz - 1) 等价于 % qsz。 */
 static uint16_t slot(const struct virtq *vq, uint16_t counter)
 {
     return counter & (uint16_t)(vq->qsz - 1);
@@ -163,6 +168,12 @@ int virtq_needs_notify(const struct virtq *vq)
 
 /* ---- device 侧 ---- */
 
+/*
+ * device 侧：看一眼下一条待处理的链头。
+ * pending 是 driver 发布了、device 还没取走的条目数。正常情况下不会超过 qsz
+ * （ring 只有 qsz 个槽位）；超过说明 avail.idx 被写坏了，此时 ring 里哪些槽位
+ * 有效已经无法判断，只能报错。
+ */
 int virtq_avail_peek(const struct virtq *vq, uint16_t *head)
 {
     uint16_t pending = (uint16_t)(load_idx(&vq->avail->idx) - vq->last_seen_avail);
@@ -200,11 +211,16 @@ static int collect_chain(const struct virtq *vq, uint16_t head,
             *reason = count ? "next index out of range" : "head index out of range";
             return -1;
         }
+        /*
+         * 每个描述符最多访问一次：链上有环（例如 3 → 5 → 3）时，不检查就会死循环，
+         * 恶意客户机可以借此让 vCPU 线程永远卡在 VMM 里。
+         */
         if (visited[idx]) {
             *reason = "descriptor loop";
             return -1;
         }
         visited[idx] = true;
+        /* 整个描述符拷贝一次，后面只用拷贝（防 double fetch）。 */
         struct vring_desc desc = vq->desc[idx];
         if (desc.flags & VRING_DESC_F_INDIRECT) {
             *reason = "indirect descriptors are not supported";
@@ -241,15 +257,24 @@ int virtq_walk_chain(const struct virtq *vq, uint16_t head, virtq_desc_fn fn, vo
 
 int virtq_used_push(struct virtq *vq, uint16_t head, uint32_t len)
 {
-    /* 只有“已取走、未完成”的链才能完成；这也保证 used ring 不会溢出。 */
+    /*
+     * 只有“已取走、未完成”的链才能完成；这也保证 used ring 不会溢出。
+     * last_seen_avail（取走的总数）== next_used_idx（完成的总数）时，手里没有可完成的链。
+     */
     if (head >= vq->qsz || vq->last_seen_avail == vq->next_used_idx)
         return -1;
+    /* 先写槽位，再发布 used.idx：driver 看到新 idx 时槽位内容一定已经写好。 */
     vq->used->ring[slot(vq, vq->next_used_idx)] = (struct vring_used_elem){ .id = head, .len = len };
     vq->next_used_idx++;
     publish_idx(&vq->used->idx, vq->next_used_idx);
     return 0;
 }
 
+/*
+ * device 完成请求后，用它判断要不要给 driver 发中断，与 virtq_needs_notify() 方向相反。
+ * driver 设置 NO_INTERRUPT 通常是因为它准备自己轮询 used ring，中断只会白白打断它。
+ * 调用前要有全屏障，见 mmio.c 的 queue_notify()。
+ */
 int virtq_needs_interrupt(const struct virtq *vq)
 {
     return !(__atomic_load_n(&vq->avail->flags, __ATOMIC_ACQUIRE) & VRING_AVAIL_F_NO_INTERRUPT);

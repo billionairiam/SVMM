@@ -11,11 +11,16 @@ int kvm_context_init(struct kvm_context *kvm)
 {
     kvm->system_fd = -1;
     kvm->vm_fd = -1;
+    /* 需要读写权限：通常是 root，或者属于 kvm 组。O_CLOEXEC 防止 fd 泄漏给子进程。 */
     kvm->system_fd = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     if (kvm->system_fd < 0) {
         perror("open /dev/kvm");
         return -1;
     }
+    /*
+     * KVM 的稳定 API 版本自 Linux 2.6.22 起一直是 12，之后的新功能都通过
+     * KVM_CHECK_EXTENSION 逐项查询，而不是提升版本号。
+     */
     int version = ioctl(kvm->system_fd, KVM_GET_API_VERSION, 0);
     if (version != KVM_API_VERSION) {
         if (version < 0)
@@ -24,6 +29,10 @@ int kvm_context_init(struct kvm_context *kvm)
             fprintf(stderr, "unsupported KVM API version: %d\n", version);
         return -1;
     }
+    /*
+     * 参数 0 是机器类型（x86 上只有默认类型）。刚创建的 VM 没有内存、没有
+     * vCPU，也没有任何设备，下面和 memory.c、vcpu.c 一步步把它装起来。
+     */
     kvm->vm_fd = ioctl(kvm->system_fd, KVM_CREATE_VM, 0);
     if (kvm->vm_fd < 0) {
         perror("KVM_CREATE_VM");
@@ -54,6 +63,14 @@ int kvm_context_init(struct kvm_context *kvm)
     return 0;
 }
 
+/*
+ * 由设备模型调用（串口、virtio-blk），可能在 vCPU 线程，也可能在控制台线程。
+ * KVM 内部对 irqchip 加锁，所以不同线程同时调用是安全的。
+ *
+ * 电平触发的设备要“状态变化才调用”：需要中断时拉高并保持，客户机处理完
+ * （读走数据、写 ACK 寄存器）后再拉低。如果一直保持高电平，I/O APIC 在 EOI 后
+ * 会再次投递，客户机就陷入中断风暴。
+ */
 int kvm_set_irq_line(const struct kvm_context *kvm, unsigned irq, int level)
 {
     struct kvm_irq_level line = { .irq = irq, .level = level ? 1 : 0 };
