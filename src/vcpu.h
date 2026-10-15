@@ -21,6 +21,9 @@ struct vcpu_mmio_region {
     void *opaque;
 };
 
+/* 设备数很少，线性查找即可。 */
+#define VCPU_MMIO_MAX 4u
+
 struct vcpu {
     int fd;
     struct kvm_run *run;
@@ -29,8 +32,12 @@ struct vcpu {
     volatile sig_atomic_t stop_requested;
     pthread_t thread;
     volatile sig_atomic_t thread_valid;
-    /* 可选的 MMIO 设备（Stage 06 的 virtio-blk）；access 为 NULL 表示没有。 */
-    struct vcpu_mmio_region mmio;
+    /*
+     * 已注册的 MMIO 设备（Stage 06 virtio-blk、Stage 07 virtio-net）。
+     * KVM_EXIT_MMIO 时按地址在表里查找；区间互不重叠，所以最多命中一个。
+     */
+    struct vcpu_mmio_region mmio[VCPU_MMIO_MAX];
+    unsigned mmio_count;
 };
 
 /* KVM_EXIT_* 目前不到 64 种；更大的值都记在最后一格。 */
@@ -69,6 +76,15 @@ int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
 int vcpu_run(struct vcpu *vcpu, struct serial *serial,
              struct vcpu_run_stats *stats);
 void vcpu_request_stop(struct vcpu *vcpu);
+/*
+ * 注册一个 MMIO 设备区间。size 为 0、区间回绕、与已注册区间重叠或表已满时
+ * 打印错误并返回 -1（重叠意味着同一个地址有两个设备，是 VMM 配置错误）。
+ * 必须在 vcpu_run() 之前调用。
+ */
+int vcpu_mmio_register(struct vcpu *vcpu, uint64_t base, uint64_t size,
+                       void (*access)(void *opaque, uint64_t offset, uint8_t *data,
+                                      uint32_t len, int is_write),
+                       void *opaque);
 void vcpu_destroy(struct vcpu *vcpu);
 
 #endif

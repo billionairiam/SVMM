@@ -19,8 +19,8 @@
  *     写 DriverFeaturesSel/DriverFeatures     → write_driver_features()
  *   写 Status |= FEATURES_OK，再读回           → write_status() 校验后决定保不保留
  *   读配置空间（capacity、seg_max…）           → virtio_mmio_access() 的配置空间分支
- *   vm_setup_vq():
- *     写 QueueSel=0，读 QueueNumMax          → 128
+ *   vm_setup_vq()，对每个队列（blk 1 个，net 是 RX=0、TX=1）:
+ *     写 QueueSel=i，读 QueueNumMax          → 128（不存在的队列读 0）
  *     写 QueueNum，写 Queue{Desc,Avail,Used}{Low,High}
  *     写 QueueReady=1                        → queue_set_ready()：校验，vq 指向客户机内存
  *   写 Status |= DRIVER_OK                   → 设备开始工作
@@ -88,12 +88,7 @@ static void reset(struct virtio_mmio *dev)
     dev->driver_features_sel = 0;
     dev->driver_features = 0;
     dev->queue_sel = 0;
-    dev->queue_num = 0;
-    dev->queue_desc = 0;
-    dev->queue_avail = 0;
-    dev->queue_used = 0;
-    dev->queue_ready = 0;
-    dev->vq = (struct virtq){ 0 };
+    memset(dev->queues, 0, sizeof(dev->queues));
     dev->interrupt_status = 0;
     update_irq(dev);
 }
@@ -110,7 +105,16 @@ void virtio_mmio_init(struct virtio_mmio *dev, const struct virtio_mmio_backend 
         .set_irq = set_irq,
         .irq_opaque = irq_opaque,
     };
+    pthread_mutex_init(&dev->lock, NULL);
     reset(dev);
+}
+
+/* QueueSel 选中的队列；选了不存在的队列时返回 NULL，相关寄存器读 0、写忽略。 */
+static struct virtio_mmio_queue *selected_queue(struct virtio_mmio *dev)
+{
+    if (dev->queue_sel >= dev->backend->num_queues)
+        return NULL;
+    return &dev->queues[dev->queue_sel];
 }
 
 /*
@@ -129,9 +133,9 @@ static void needs_reset(struct virtio_mmio *dev)
  * 通过之后才让 vq 指向客户机内存；任何一项不对都保持 ready=0，
  * Linux 读回 0 会放弃这个设备。
  */
-static int queue_setup_valid(const struct virtio_mmio *dev)
+static int queue_setup_valid(const struct virtio_mmio *dev, const struct virtio_mmio_queue *q)
 {
-    uint32_t num = dev->queue_num;
+    uint32_t num = q->num;
     /*
      * QueueNum 决定三块 ring 的布局，driver 和 device 必须一致。不合法时
      * 拒绝而不是截断：截断后 device 按另一个大小解析 ring，下标全部错位。
@@ -143,45 +147,101 @@ static int queue_setup_valid(const struct virtio_mmio *dev)
      * 这关系到 VMM 自己的安全：未对齐的 GPA 换成宿主指针后，按 struct 访问
      * 就是未定义行为。
      */
-    if ((dev->queue_desc & 15) || (dev->queue_avail & 1) || (dev->queue_used & 3))
+    if ((q->desc & 15) || (q->avail & 1) || (q->used & 3))
         return 0;
     /*
      * 三块 ring 都必须整块落在客户机 RAM 里。之后 virtq.c 会用
      * “基址 + 下标”直接访问它们，只在这里做一次范围检查；下标本身由
      * slot() 的掩码限制在 [0, qsz)，所以不会越出这里检查过的范围。
      */
-    return virtio_mmio_gpa(dev, dev->queue_desc, virtq_desc_bytes(num)) &&
-           virtio_mmio_gpa(dev, dev->queue_avail, virtq_avail_bytes(num)) &&
-           virtio_mmio_gpa(dev, dev->queue_used, virtq_used_bytes(num));
+    return virtio_mmio_gpa(dev, q->desc, virtq_desc_bytes(num)) &&
+           virtio_mmio_gpa(dev, q->avail, virtq_avail_bytes(num)) &&
+           virtio_mmio_gpa(dev, q->used, virtq_used_bytes(num));
 }
 
 /*
- * 写 QueueReady。本设备只有队列 0，其他 QueueSel 下的写被忽略（QueueNumMax 对它们
+ * 写 QueueReady。QueueSel 指向不存在的队列时写被忽略（QueueNumMax 对它们
  * 读 0，driver 就知道这些队列不存在）。写 0 只是清 ready 标志；写 1 时检查：
  * 未就绪、已经 FEATURES_OK（规范要求先协商特性再配队列）、配置合法。
  */
 static void queue_set_ready(struct virtio_mmio *dev, uint32_t value)
 {
-    if (dev->queue_sel != 0)
+    struct virtio_mmio_queue *q = selected_queue(dev);
+    if (!q)
         return;
     if (value == 0) {
-        dev->queue_ready = 0;
+        q->ready = 0;
         return;
     }
-    if (value != 1 || dev->queue_ready || !(dev->status & VIRTIO_STATUS_FEATURES_OK) ||
-        !queue_setup_valid(dev))
+    if (value != 1 || q->ready || !(dev->status & VIRTIO_STATUS_FEATURES_OK) ||
+        !queue_setup_valid(dev, q))
         return;
     /*
      * GPA → 宿主指针，len 传 0 是因为范围已经在 queue_setup_valid() 里查过。
-     * 从这一刻起 dev->vq 的三个指针直接指向客户机内存：客户机写 ring，
+     * 从这一刻起 q->vq 的三个指针直接指向客户机内存：客户机写 ring，
      * VMM 立刻就能读到，反之亦然，这就是“共享内存”的含义。
      */
-    if (virtq_init_shared(&dev->vq, dev->queue_num,
-                          virtio_mmio_gpa(dev, dev->queue_desc, 0),
-                          virtio_mmio_gpa(dev, dev->queue_avail, 0),
-                          virtio_mmio_gpa(dev, dev->queue_used, 0)) < 0)
+    if (virtq_init_shared(&q->vq, q->num, virtio_mmio_gpa(dev, q->desc, 0),
+                          virtio_mmio_gpa(dev, q->avail, 0),
+                          virtio_mmio_gpa(dev, q->used, 0)) < 0)
         return;
-    dev->queue_ready = 1;
+    q->ready = 1;
+}
+
+/*
+ * 队列“活着”才允许 device 碰它的 ring：设备没准备好（DRIVER_OK 之前 driver 可能
+ * 还在填 ring）、已出错、driver 自己放弃了（FAILED）、或者队列没 ready（复位后
+ * 那块内存可能已经被 driver 释放）时一律不处理。
+ */
+static struct virtio_mmio_queue *live_queue(struct virtio_mmio *dev, uint32_t queue)
+{
+    const uint32_t ready = VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK;
+    if (queue >= dev->backend->num_queues || !dev->queues[queue].ready ||
+        (dev->status & ready) != ready ||
+        (dev->status & (VIRTIO_STATUS_DEVICE_NEEDS_RESET | VIRTIO_STATUS_FAILED)))
+        return NULL;
+    return &dev->queues[queue];
+}
+
+/*
+ * device 处理完一个队列之后：有新完成项且 driver 没关中断就拉中断线；
+ * 处理函数报告队列已坏（rc < 0）就置 NEEDS_RESET。kick 路径和设备线程共用。
+ */
+static void queue_processed(struct virtio_mmio *dev, struct virtq *vq, uint16_t before, int rc)
+{
+    if (vq->next_used_idx != before) {
+        /*
+         * used.idx 的发布（store，在 virtq_used_push() 里）和读 avail.flags（load）
+         * 之间需要全屏障：否则 load 可能提前到 store 之前，读到 driver 在看到新
+         * used.idx 之前设置的 NO_INTERRUPT，漏发中断。
+         */
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        /*
+         * driver 设置 NO_INTERRUPT 表示它正在轮询 used ring（例如 Linux 的
+         * virtqueue_disable_cb()），不需要中断；这时只更新 ring，不拉中断线。
+         */
+        if (virtq_needs_interrupt(vq)) {
+            dev->interrupt_status |= VIRTIO_MMIO_INT_VRING;
+            update_irq(dev);
+        }
+    }
+    if (rc < 0)
+        needs_reset(dev);
+}
+
+int virtio_mmio_run_queue(struct virtio_mmio *dev, uint32_t queue,
+                          int (*fn)(struct virtio_mmio *dev, struct virtq *vq, void *arg),
+                          void *arg)
+{
+    pthread_mutex_lock(&dev->lock);
+    struct virtio_mmio_queue *q = live_queue(dev, queue);
+    if (q) {
+        uint16_t before = q->vq.next_used_idx;
+        int rc = fn(dev, &q->vq, arg);
+        queue_processed(dev, &q->vq, before, rc);
+    }
+    pthread_mutex_unlock(&dev->lock);
+    return q != NULL;
 }
 
 /*
@@ -199,33 +259,15 @@ static void queue_set_ready(struct virtio_mmio *dev, uint32_t value)
  */
 static void queue_notify(struct virtio_mmio *dev, uint32_t queue)
 {
-    const uint32_t ready = VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK;
-    /* 设备没准备好、已出错或 driver 自己放弃了（FAILED）时，kick 一律忽略。 */
-    if (queue != 0 || !dev->queue_ready || (dev->status & ready) != ready ||
-        (dev->status & (VIRTIO_STATUS_DEVICE_NEEDS_RESET | VIRTIO_STATUS_FAILED)))
+    /* 队列号不存在、设备没准备好、已出错时，kick 一律忽略（见 live_queue()）。 */
+    struct virtio_mmio_queue *q = live_queue(dev, queue);
+    if (!q)
         return;
     dev->stats.notifies++;
     /* 记下处理前的完成计数，用来判断这次 kick 有没有完成任何请求。 */
-    uint16_t before = dev->vq.next_used_idx;
-    int rc = dev->backend->process_queue(dev, &dev->vq);
-    if (dev->vq.next_used_idx != before) {
-        /*
-         * used.idx 的发布（store）和读 avail.flags（load）之间需要全屏障：
-         * 否则 load 可能提前到 store 之前，读到 driver 在看到新 used.idx
-         * 之前设置的 NO_INTERRUPT，漏发中断。
-         */
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);
-        /*
-         * driver 设置 NO_INTERRUPT 表示它正在轮询 used ring（例如 Linux 的
-         * virtqueue_disable_cb()），不需要中断；这时只更新 ring，不拉中断线。
-         */
-        if (virtq_needs_interrupt(&dev->vq)) {
-            dev->interrupt_status |= VIRTIO_MMIO_INT_VRING;
-            update_irq(dev);
-        }
-    }
-    if (rc < 0)
-        needs_reset(dev);
+    uint16_t before = q->vq.next_used_idx;
+    int rc = dev->backend->process_queue(dev, queue, &q->vq);
+    queue_processed(dev, &q->vq, before, rc);
 }
 
 /*
@@ -255,6 +297,9 @@ static void write_status(struct virtio_mmio *dev, uint32_t value)
     }
     next |= old & VIRTIO_STATUS_FEATURES_OK;
     dev->status = next;
+    if ((next & VIRTIO_STATUS_DRIVER_OK) && !(old & VIRTIO_STATUS_DRIVER_OK) &&
+        dev->backend->driver_ok)
+        dev->backend->driver_ok(dev);
 }
 
 /*
@@ -278,10 +323,12 @@ static void write_driver_features(struct virtio_mmio *dev, uint32_t value)
  * 就绪之后再改地址会让 device 手里的 vq 指针和 driver 以为的 ring 不一致，
  * 所以忽略；driver 要换 ring 必须先复位设备。
  */
-static void write_queue_addr(struct virtio_mmio *dev, uint64_t *addr, int high, uint32_t value)
+static void write_queue_addr(struct virtio_mmio *dev, size_t field, int high, uint32_t value)
 {
-    if (dev->queue_sel != 0 || dev->queue_ready)
+    struct virtio_mmio_queue *q = selected_queue(dev);
+    if (!q || q->ready)
         return;
+    uint64_t *addr = (uint64_t *)((uint8_t *)q + field);
     if (high)
         *addr = (*addr & 0xffffffffull) | (uint64_t)value << 32;
     else
@@ -309,9 +356,11 @@ static uint32_t read_reg(struct virtio_mmio *dev, uint64_t offset)
         return (uint32_t)(be->features >> (32 * dev->device_features_sel));
     case VIRTIO_MMIO_QUEUE_NUM_MAX:
         /* 0 表示“这个队列不存在”，driver 枚举队列时以此为止。 */
-        return dev->queue_sel == 0 ? be->queue_num_max : 0;
-    case VIRTIO_MMIO_QUEUE_READY:
-        return dev->queue_sel == 0 ? (uint32_t)dev->queue_ready : 0;
+        return selected_queue(dev) ? be->queue_num_max : 0;
+    case VIRTIO_MMIO_QUEUE_READY: {
+        const struct virtio_mmio_queue *q = selected_queue(dev);
+        return q ? (uint32_t)q->ready : 0;
+    }
     case VIRTIO_MMIO_INTERRUPT_STATUS:
         /* 中断处理函数读它判断中断原因：bit 0 有完成项，bit 1 配置/状态变化。 */
         return dev->interrupt_status;
@@ -347,10 +396,12 @@ static int write_reg(struct virtio_mmio *dev, uint64_t offset, uint32_t value)
     case VIRTIO_MMIO_QUEUE_SEL:
         dev->queue_sel = value;
         return 0;
-    case VIRTIO_MMIO_QUEUE_NUM:
-        if (dev->queue_sel == 0 && !dev->queue_ready)
-            dev->queue_num = value;
+    case VIRTIO_MMIO_QUEUE_NUM: {
+        struct virtio_mmio_queue *q = selected_queue(dev);
+        if (q && !q->ready)
+            q->num = value;
         return 0;
+    }
     case VIRTIO_MMIO_QUEUE_READY:
         queue_set_ready(dev, value);
         return 0;
@@ -370,15 +421,18 @@ static int write_reg(struct virtio_mmio *dev, uint64_t offset, uint32_t value)
         return 0;
     case VIRTIO_MMIO_QUEUE_DESC_LOW:
     case VIRTIO_MMIO_QUEUE_DESC_HIGH:
-        write_queue_addr(dev, &dev->queue_desc, offset == VIRTIO_MMIO_QUEUE_DESC_HIGH, value);
+        write_queue_addr(dev, offsetof(struct virtio_mmio_queue, desc),
+                         offset == VIRTIO_MMIO_QUEUE_DESC_HIGH, value);
         return 0;
     case VIRTIO_MMIO_QUEUE_AVAIL_LOW:
     case VIRTIO_MMIO_QUEUE_AVAIL_HIGH:
-        write_queue_addr(dev, &dev->queue_avail, offset == VIRTIO_MMIO_QUEUE_AVAIL_HIGH, value);
+        write_queue_addr(dev, offsetof(struct virtio_mmio_queue, avail),
+                         offset == VIRTIO_MMIO_QUEUE_AVAIL_HIGH, value);
         return 0;
     case VIRTIO_MMIO_QUEUE_USED_LOW:
     case VIRTIO_MMIO_QUEUE_USED_HIGH:
-        write_queue_addr(dev, &dev->queue_used, offset == VIRTIO_MMIO_QUEUE_USED_HIGH, value);
+        write_queue_addr(dev, offsetof(struct virtio_mmio_queue, used),
+                         offset == VIRTIO_MMIO_QUEUE_USED_HIGH, value);
         return 0;
     case VIRTIO_MMIO_SHM_SEL:
         return 0;
@@ -393,8 +447,8 @@ static int write_reg(struct virtio_mmio *dev, uint64_t offset, uint32_t value)
  * offset = 0x50，len = 4，data 指向 kvm_run->mmio.data。读访问时我们写进
  * data 的值，会在下一次 KVM_RUN 时由 KVM 放进客户机指令的目标寄存器。
  */
-void virtio_mmio_access(struct virtio_mmio *dev, uint64_t offset, uint8_t *data,
-                        uint32_t len, int is_write)
+static void access_locked(struct virtio_mmio *dev, uint64_t offset, uint8_t *data,
+                          uint32_t len, int is_write)
 {
     if (is_write)
         dev->stats.writes++;
@@ -443,4 +497,12 @@ bad:
     dev->stats.bad_accesses++;
     if (!is_write && len <= 8)
         memset(data, 0, len);
+}
+
+void virtio_mmio_access(struct virtio_mmio *dev, uint64_t offset, uint8_t *data,
+                        uint32_t len, int is_write)
+{
+    pthread_mutex_lock(&dev->lock);
+    access_locked(dev, offset, data, len, is_write);
+    pthread_mutex_unlock(&dev->lock);
 }

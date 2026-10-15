@@ -32,6 +32,11 @@ struct sandbox_config {
      * 以读写方式打开并加独占锁；设备在 DSDT 里声明，命令行不变。
      */
     const char *disk_path;
+    /*
+     * 可选的 TAP 接口名（Stage 07），作为 virtio-net（客户机里的 eth0）。
+     * 接口必须已经存在，见 scripts/setup-tap.sh。
+     */
+    const char *tap_name;
 };
 
 /* 填入默认值：256 MiB、默认命令行、无内核和 initramfs。 */

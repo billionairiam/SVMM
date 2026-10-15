@@ -1,5 +1,6 @@
 #!/bin/sh
-# 生成 Stage 03 的最小 initramfs（Stage 06 起 /init 会挂载 virtio-blk 磁盘）：静态 BusyBox + /init，打包为 newc cpio 再 gzip。
+# 生成最小 initramfs：静态 BusyBox + /init，打包为 newc cpio 再 gzip。
+# /init 会挂载 virtio-blk 磁盘（Stage 06），并配置 virtio-net 的 eth0（Stage 07）。
 #
 # 用法：rootfs/build-rootfs.sh [输出路径]
 #   输出路径默认是 build/initramfs.cpio.gz（相对仓库根目录）。
@@ -95,6 +96,36 @@ if [ -b /dev/vda ]; then
     else
         echo "virtio-blk: mount /dev/vda failed (no filesystem?), use it as a raw device"
     fi
+fi
+
+# Stage 07：VMM 带了 --tap 时，内核的 virtio_net 驱动创建 eth0。
+# 地址是静态的，和 scripts/setup-tap.sh 给宿主机 tap0 配的 192.168.100.1/24 对应。
+# 没有 eth0 时什么都不打印。
+if [ -e /sys/class/net/eth0 ]; then
+    echo "virtio-net: eth0 detected"
+    ip link set lo up
+    ip addr add 192.168.100.2/24 dev eth0
+    ip link set eth0 up
+    echo "virtio-net: eth0 configured (192.168.100.2/24)"
+    ip route add default via 192.168.100.1
+    echo "virtio-net: default gateway set to 192.168.100.1"
+    echo "nameserver 8.8.8.8" > /etc/resolv.conf
+    echo "virtio-net: DNS set to 8.8.8.8"
+    echo "virtio-net: testing network connectivity..."
+    # 第一个包要先等 ARP 解析，链路刚 up 时也可能丢；最多试 3 次。
+    ok=
+    for _ in 1 2 3; do
+        if ping -c 1 -W 1 192.168.100.1 >/dev/null 2>&1; then
+            ok=1
+            break
+        fi
+    done
+    if [ -n "$ok" ]; then
+        echo "virtio-net: ping gateway 192.168.100.1 OK"
+    else
+        echo "virtio-net: ping gateway 192.168.100.1 FAILED (is the host tap configured?)"
+    fi
+    echo "virtio-net: network ready"
 fi
 
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin

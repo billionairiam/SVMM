@@ -16,12 +16,18 @@
  *   → 对每个队列：QueueSel、读 QueueNumMax、写 QueueNum 和三块 ring 的 GPA、QueueReady=1
  *   → DRIVER_OK，之后才能 kick。
  *
- * 本实现只有一个队列（队列 0），不支持 legacy（Version 1）接口、EVENT_IDX、
+ * 每个设备最多 VIRTIO_MMIO_MAX_QUEUES 个队列（virtio-blk 1 个，virtio-net 2 个），
+ * 用 QueueSel 选择当前操作的队列。不支持 legacy（Version 1）接口、EVENT_IDX、
  * INDIRECT 和共享内存区。传输层与具体设备无关，设备通过 backend 回调接入。
+ *
+ * 并发：寄存器访问来自 vCPU 线程，Stage 07 的网卡还有一个 RX 线程会往队列里
+ * 写帧、拉中断。所有设备状态都由 dev->lock 保护：virtio_mmio_access() 和
+ * virtio_mmio_run_queue() 进出时加锁，backend 回调总是在持锁状态下被调用。
  */
 
 #include "virtio/virtq.h"
 
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -33,6 +39,15 @@
 #define VIRTIO_MMIO_BASE 0xd0000000u
 #define VIRTIO_MMIO_SIZE 0x1000u
 #define VIRTIO_MMIO_IRQ 5u
+
+/*
+ * Stage 07：第二个设备（virtio-net）紧挨着第一个，用下一根中断线。
+ * 每个设备独占一页寄存器和一根电平触发的 GSI，DSDT 里是 \_SB.VR01。
+ */
+#define VIRTIO_MMIO_NET_BASE (VIRTIO_MMIO_BASE + VIRTIO_MMIO_SIZE)
+#define VIRTIO_MMIO_NET_IRQ 6u
+
+#define VIRTIO_MMIO_MAX_QUEUES 2u
 
 /* 寄存器偏移（Virtio 1.0 §4.2.2）。除配置空间外都是 32 位、必须 4 字节对齐访问。 */
 #define VIRTIO_MMIO_MAGIC_VALUE 0x000
@@ -88,17 +103,36 @@ struct virtio_mmio;
 struct virtio_mmio_backend {
     uint32_t device_id;
     uint64_t features; /* device 提供的特性位 */
+    uint32_t num_queues; /* 1..VIRTIO_MMIO_MAX_QUEUES；编号 >= num_queues 的队列不存在 */
     uint16_t queue_num_max;
     /* 配置空间（从 0x100 起）的内容和大小；driver 只读。 */
     const void *config;
     uint32_t config_size;
     /*
-     * 队列 0 收到 kick 后调用：处理 avail ring 里的所有链，写好 used ring。
+     * 队列 queue 收到 kick 后调用（持有 dev->lock）：处理 avail ring 里的链，
+     * 写好 used ring。设备也可以只记下“有新 buffer 了”，交给自己的线程处理
+     * （virtio-net 的 RX 队列就是这样）。
      * 返回 0 表示正常；返回 -1 表示队列已无法继续（例如 avail.idx 非法），
      * 传输层随即置 DEVICE_NEEDS_RESET，直到 driver 复位设备。
      * 完成了几条链由传输层比较 vq->next_used_idx 得出，出错前完成的也会发中断。
      */
-    int (*process_queue)(struct virtio_mmio *dev, struct virtq *vq);
+    int (*process_queue)(struct virtio_mmio *dev, uint32_t queue, struct virtq *vq);
+    /*
+     * 可选：driver 写入 DRIVER_OK、设备开始工作时调用（持有 dev->lock）。
+     * 有自己线程的设备用它唤醒线程：DRIVER_OK 之前的 kick 会被忽略，
+     * driver 可能已经放好了 buffer 却不会再 kick 一次。
+     */
+    void (*driver_ok)(struct virtio_mmio *dev);
+};
+
+/* 一个队列的配置；ready 之后 vq 指向客户机内存里的三块 ring。 */
+struct virtio_mmio_queue {
+    uint32_t num;
+    uint64_t desc;
+    uint64_t avail;
+    uint64_t used;
+    int ready;
+    struct virtq vq;
 };
 
 struct virtio_mmio_stats {
@@ -110,6 +144,7 @@ struct virtio_mmio_stats {
 };
 
 struct virtio_mmio {
+    pthread_mutex_t lock;
     const struct virtio_mmio_backend *backend;
     void *opaque; /* backend 私有数据 */
 
@@ -130,18 +165,16 @@ struct virtio_mmio {
     uint32_t interrupt_status;
     int irq_level;
 
-    /* 队列 0 的配置；queue_ready 之后 vq 指向客户机内存里的三块 ring。 */
-    uint32_t queue_num;
-    uint64_t queue_desc;
-    uint64_t queue_avail;
-    uint64_t queue_used;
-    int queue_ready;
-    struct virtq vq;
+    /* 下标就是 QueueSel 的值。 */
+    struct virtio_mmio_queue queues[VIRTIO_MMIO_MAX_QUEUES];
 
     struct virtio_mmio_stats stats;
 };
 
-/* 初始化为复位状态。mem/mem_size 是客户机 RAM；set_irq 可以为 NULL。 */
+/*
+ * 初始化为复位状态。mem/mem_size 是客户机 RAM；set_irq 可以为 NULL，
+ * 否则它可能在持有 dev->lock 的任意线程上被调用。
+ */
 void virtio_mmio_init(struct virtio_mmio *dev, const struct virtio_mmio_backend *backend,
                       void *opaque, uint8_t *mem, uint64_t mem_size,
                       void (*set_irq)(void *opaque, int level), void *irq_opaque);
@@ -154,6 +187,16 @@ void virtio_mmio_init(struct virtio_mmio *dev, const struct virtio_mmio_backend 
  */
 void virtio_mmio_access(struct virtio_mmio *dev, uint64_t offset, uint8_t *data,
                         uint32_t len, int is_write);
+
+/*
+ * 设备自己的线程（不是 kick）要处理队列时调用：持锁检查队列是否“活着”
+ * （DRIVER_OK、队列 ready、没有 NEEDS_RESET/FAILED），是才调用 fn，然后和 kick
+ * 一样根据 used ring 的变化拉中断；fn 返回 -1 时置 DEVICE_NEEDS_RESET。
+ * 返回 1 表示 fn 被调用了，0 表示队列不可用（driver 还没准备好或正在复位）。
+ */
+int virtio_mmio_run_queue(struct virtio_mmio *dev, uint32_t queue,
+                          int (*fn)(struct virtio_mmio *dev, struct virtq *vq, void *arg),
+                          void *arg);
 
 /*
  * 把 [gpa, gpa + len) 翻译成宿主指针。区间不完全落在客户机 RAM 里时返回 NULL，

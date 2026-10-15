@@ -30,7 +30,7 @@ struct guest_memory;
 
 /*
  * 一个 virtio-mmio 设备：寄存器页 [base, base + size)，中断接在 I/O APIC 的 gsi 脚上。
- * 在 DSDT 里声明成 \_SB.VR00（_HID "LNRO0005"），Linux 的 virtio_mmio 驱动按这个
+ * 在 DSDT 里声明成 \_SB.VR0n（_HID "LNRO0005"），Linux 的 virtio_mmio 驱动按这个
  * ID 匹配 ACPI 设备，并通过 ACPI 把 GSI 映射成 Linux IRQ。
  */
 struct acpi_virtio_mmio {
@@ -39,7 +39,14 @@ struct acpi_virtio_mmio {
     uint32_t gsi;
 };
 
-/* virtio 可以为 NULL（没有 virtio-mmio 设备）。 */
-int boot_acpi_setup(struct guest_memory *memory, const struct acpi_virtio_mmio *virtio);
+/*
+ * 最多两个 virtio-mmio 设备（Stage 07：blk + net）。第 i 个设备命名为 \_SB.VR0i，
+ * _UID 为 i：_UID 用 AML 的 Zero/One 单字节常量编码，再多需要变长编码。
+ */
+#define ACPI_VIRTIO_MMIO_MAX 2u
+
+/* devices 指向 count 个设备，count 可以为 0；count 超过上限时返回 -1（EINVAL）。 */
+int boot_acpi_setup(struct guest_memory *memory, const struct acpi_virtio_mmio *devices,
+                    unsigned count);
 
 #endif

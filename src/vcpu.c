@@ -362,6 +362,46 @@ void vcpu_request_stop(struct vcpu *vcpu)
         pthread_kill(vcpu->thread, SIGUSR1);
 }
 
+int vcpu_mmio_register(struct vcpu *vcpu, uint64_t base, uint64_t size,
+                       void (*access)(void *opaque, uint64_t offset, uint8_t *data,
+                                      uint32_t len, int is_write),
+                       void *opaque)
+{
+    if (!access || size == 0 || base + size < base) {
+        fprintf(stderr, "ERROR: invalid MMIO region 0x%llx+0x%llx\n",
+                (unsigned long long)base, (unsigned long long)size);
+        return -1;
+    }
+    for (unsigned i = 0; i < vcpu->mmio_count; i++) {
+        const struct vcpu_mmio_region *r = &vcpu->mmio[i];
+        /* [base, base+size) 与 [r->base, r->base+r->size) 相交 */
+        if (base < r->base + r->size && r->base < base + size) {
+            fprintf(stderr, "ERROR: MMIO region 0x%llx+0x%llx overlaps 0x%llx+0x%llx\n",
+                    (unsigned long long)base, (unsigned long long)size,
+                    (unsigned long long)r->base, (unsigned long long)r->size);
+            return -1;
+        }
+    }
+    if (vcpu->mmio_count == VCPU_MMIO_MAX) {
+        fprintf(stderr, "ERROR: too many MMIO regions (max %u)\n", VCPU_MMIO_MAX);
+        return -1;
+    }
+    vcpu->mmio[vcpu->mmio_count++] = (struct vcpu_mmio_region){
+        .base = base, .size = size, .access = access, .opaque = opaque,
+    };
+    return 0;
+}
+
+static const struct vcpu_mmio_region *find_mmio(const struct vcpu *vcpu, uint64_t gpa)
+{
+    for (unsigned i = 0; i < vcpu->mmio_count; i++) {
+        const struct vcpu_mmio_region *r = &vcpu->mmio[i];
+        if (gpa >= r->base && gpa - r->base < r->size)
+            return r;
+    }
+    return NULL;
+}
+
 /*
  * 反复进入客户机，直到客户机停机或出错。
  *
@@ -504,7 +544,7 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
         /*
          * 客户机访问了未映射为 RAM 的物理地址（例如 LAPIC、IOAPIC、HPET
          * 或超出内存范围的地址）。mmio.data 最多 8 字节，len 为访问宽度。
-         * 落在已注册设备区间内的访问交给设备模拟（Stage 06 的 virtio-mmio），
+         * 落在已注册设备区间内的访问交给对应设备模拟（virtio-blk / virtio-net），
          * 设备在 vCPU 线程上同步处理，返回后 KVM 把读结果交给客户机指令；
          * 其他地址没有设备：写入丢弃，读取同样返回全 1。
          */
@@ -513,12 +553,14 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
                 fprintf(stderr, "invalid MMIO width: %u\n", run->mmio.len);
                 return vcpu_finish(stats, "invalid_mmio_width", -1);
             }
-            if (vcpu->mmio.access && run->mmio.phys_addr >= vcpu->mmio.base &&
-                run->mmio.phys_addr - vcpu->mmio.base < vcpu->mmio.size) {
-                stats->mmio_device_exits++;
-                vcpu->mmio.access(vcpu->mmio.opaque, run->mmio.phys_addr - vcpu->mmio.base,
-                                  run->mmio.data, run->mmio.len, run->mmio.is_write);
-                break;
+            {
+                const struct vcpu_mmio_region *region = find_mmio(vcpu, run->mmio.phys_addr);
+                if (region) {
+                    stats->mmio_device_exits++;
+                    region->access(region->opaque, run->mmio.phys_addr - region->base,
+                                   run->mmio.data, run->mmio.len, run->mmio.is_write);
+                    break;
+                }
             }
             if (!run->mmio.is_write)
                 memset(run->mmio.data, 0xff, run->mmio.len);

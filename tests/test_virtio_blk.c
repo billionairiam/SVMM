@@ -679,7 +679,7 @@ static void test_bad_mmio_accesses(void)
 
     /* 就绪之后再改 QueueNum/地址无效。 */
     set_queue(&blk, 4, DESC_GPA + 0x100, AVAIL_GPA, USED_GPA);
-    CHECK(blk.mmio.vq.qsz == QSZ && blk.mmio.vq.desc == desc_table());
+    CHECK(blk.mmio.queues[0].vq.qsz == QSZ && blk.mmio.queues[0].vq.desc == desc_table());
     CHECK(still_works(&blk));
     virtio_blk_close(&blk);
 }

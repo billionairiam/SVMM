@@ -320,8 +320,9 @@ static uint32_t blk_handle_request(struct virtio_blk *blk, struct virtq *vq, uin
  * device 已经看到 driver 发布的所有链（avail.idx == last_seen_avail）。
  * 每取走一条就立即完成一条，所以这个设备永远没有“在途”的请求。
  */
-static int blk_process_queue(struct virtio_mmio *dev, struct virtq *vq)
+static int blk_process_queue(struct virtio_mmio *dev, uint32_t queue, struct virtq *vq)
 {
+    (void)queue; /* 只有队列 0，传输层保证不会传别的 */
     struct virtio_blk *blk = dev->opaque;
     for (;;) {
         uint16_t head;
@@ -416,6 +417,7 @@ int virtio_blk_open(struct virtio_blk *blk, const char *path)
         .device_id = VIRTIO_ID_BLOCK_DEVICE,
         .features = (1ull << VIRTIO_F_VERSION_1) | (1ull << VIRTIO_BLK_F_SEG_MAX) |
                     (1ull << VIRTIO_BLK_F_BLK_SIZE) | (1ull << VIRTIO_BLK_F_FLUSH),
+        .num_queues = 1,
         .queue_num_max = VIRTIO_BLK_QUEUE_SIZE,
         .config = &blk->config,
         .config_size = sizeof(blk->config),

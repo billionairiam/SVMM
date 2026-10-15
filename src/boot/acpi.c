@@ -92,6 +92,7 @@ static const uint8_t dsdt_aml[] = {
 
 /*
  * Stage 06：virtio-mmio 设备，追加在 DSDT 末尾（AML 允许多个 Scope (\_SB)）。
+ * Stage 07 起每个设备追加一份，名字 VR00/VR01、_UID 0/1 各不相同。
  *
  *   Scope (\_SB)
  *   {
@@ -134,11 +135,15 @@ static const uint8_t dsdt_virtio_mmio_aml[] = {
     /* EndTag */
     0x79, 0x00,
 };
+/* 模板里每个设备不同的字段的偏移。 */
+#define VIRTIO_AML_NAME_DIGIT 14u /* "VR00" 的最后一个字符 */
+#define VIRTIO_AML_UID 35u        /* _UID 的值：0x00 Zero / 0x01 One */
 #define VIRTIO_AML_MEM_BASE 49u
 #define VIRTIO_AML_MEM_SIZE 53u
 #define VIRTIO_AML_GSI 62u
 
-#define DSDT_MAX_SIZE (ACPI_HEADER_SIZE + sizeof(dsdt_aml) + sizeof(dsdt_virtio_mmio_aml))
+#define DSDT_MAX_SIZE \
+    (ACPI_HEADER_SIZE + sizeof(dsdt_aml) + ACPI_VIRTIO_MMIO_MAX * sizeof(dsdt_virtio_mmio_aml))
 
 static void put8(uint8_t *table, size_t offset, uint8_t value)
 {
@@ -215,9 +220,11 @@ static void put_io_gas(uint8_t *table, size_t offset, uint16_t port)
 //   +----> HPET
 //   |
 //   +----> ...
-int boot_acpi_setup(struct guest_memory *memory, const struct acpi_virtio_mmio *virtio)
+int boot_acpi_setup(struct guest_memory *memory, const struct acpi_virtio_mmio *devices,
+                    unsigned count)
 {
-    if (!memory->data || memory->size < ACPI_TABLES_END) {
+    if (!memory->data || memory->size < ACPI_TABLES_END || count > ACPI_VIRTIO_MMIO_MAX ||
+        (count && !devices)) {
         errno = EINVAL;
         return -1;
     }
@@ -261,12 +268,15 @@ int boot_acpi_setup(struct guest_memory *memory, const struct acpi_virtio_mmio *
     uint8_t dsdt[DSDT_MAX_SIZE] = { 0 };
     size_t dsdt_size = ACPI_HEADER_SIZE + sizeof(dsdt_aml);
     memcpy(dsdt + ACPI_HEADER_SIZE, dsdt_aml, sizeof(dsdt_aml));
-    if (virtio) {
+    /* 每个 virtio-mmio 设备追加一份模板，改名字、_UID、地址和 GSI。 */
+    for (unsigned i = 0; i < count; i++) {
         uint8_t *aml = dsdt + dsdt_size;
         memcpy(aml, dsdt_virtio_mmio_aml, sizeof(dsdt_virtio_mmio_aml));
-        put32(aml, VIRTIO_AML_MEM_BASE, virtio->base);
-        put32(aml, VIRTIO_AML_MEM_SIZE, virtio->size);
-        put32(aml, VIRTIO_AML_GSI, virtio->gsi);
+        put8(aml, VIRTIO_AML_NAME_DIGIT, (uint8_t)('0' + i));
+        put8(aml, VIRTIO_AML_UID, (uint8_t)i);
+        put32(aml, VIRTIO_AML_MEM_BASE, devices[i].base);
+        put32(aml, VIRTIO_AML_MEM_SIZE, devices[i].size);
+        put32(aml, VIRTIO_AML_GSI, devices[i].gsi);
         dsdt_size += sizeof(dsdt_virtio_mmio_aml);
     }
     put_header(dsdt, "DSDT", (uint32_t)dsdt_size, 2);

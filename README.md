@@ -1,4 +1,71 @@
-# Stage 06：virtio-blk 与磁盘
+# Stage 07：virtio-net 与 TAP
+
+根据 [Runra Stage 07 教程](https://runra.dev/zh/blog/sandbox-from-scratch-07-virtio-net-tap) 给客户机加一块网卡：`svmm run --tap tap0` 把宿主机上已有的 TAP 接口接成客户机里的 `eth0`（virtio-net），`/init` 自动配置静态地址并 ping 网关。
+
+```sh
+sudo scripts/setup-tap.sh                    # 创建 tap0 (192.168.100.1/24)，开转发和 MASQUERADE
+make run-net KERNEL=/path/to/bzImage         # 等价于 svmm run ... --tap tap0（TAP=... 可改名）
+sudo scripts/setup-tap.sh --clean            # 删除 tap0 和加的规则，恢复 ip_forward
+```
+
+启动后会看到：
+
+```
+virtio-net: eth0 detected
+virtio-net: eth0 configured (192.168.100.2/24)
+virtio-net: default gateway set to 192.168.100.1
+virtio-net: DNS set to 8.8.8.8
+virtio-net: testing network connectivity...
+virtio-net: ping gateway 192.168.100.1 OK
+virtio-net: network ready
+```
+
+`--tap` 和 `--disk` 可以同时使用。内核需要 `CONFIG_VIRTIO_NET`（加上 Stage 06 的 `CONFIG_ACPI`、`CONFIG_VIRTIO_MMIO`）。
+
+```
+客户机 eth0 192.168.100.2 ──virtio-net── tap0 192.168.100.1 ──NAT── 宿主机出口
+        (GPA 0xd0001000, GSI 6)          (/dev/net/tun fd)
+```
+
+代码：
+
+- `src/virtio/net.{h,c}`：virtio-net 设备。两个队列：0 = RX（driver 放空 buffer，device 填入收到的帧），1 = TX（driver 放要发的帧）。每个帧前面有 12 字节的 `virtio_net_hdr`（`VERSION_1` 下包含 `num_buffers`）。特性只有 `VERSION_1` 和 `MAC`（默认 `52:54:00:12:34:56`），没有任何 offload，所以帧都是算好校验和、不超过 MTU 的普通以太网帧，正好是不带 `IFF_VNET_HDR` 的 TAP 的格式。
+  - **TX**（vCPU 线程，`QueueNotify=1` 触发）：校验链（全部只读、GPA 在 RAM 内、至少 12 + 14 字节），用 iovec 跳过 12 字节头，`writev()` 直接从客户机内存写到 tap，没有中间拷贝；used.len = 0。写失败计入 `tx_errors`，链照常完成。
+  - **RX**（专门的 RX 线程）：`poll(tap_fd, eventfd)`；先确认 RX 队列里有空 buffer 再 `read()` 一个帧，写入全 0 的头（`num_buffers = 1`）和帧，发布 used、拉中断。没有 buffer 时帧留在宿主机内核的 tap 队列里（背压），driver 补充 buffer 的 kick 和 `DRIVER_OK` 通过 eventfd 唤醒线程。帧比 buffer 大时丢弃并计入 `rx_dropped`。
+  - 退出时打印 `virtio-net: tx_packets=… rx_packets=… rx_dropped=… bad_chains=…`。
+- `src/virtio/mmio.{h,c}`：传输层支持多个队列（`QueueSel` 选择，每个队列独立的地址/大小/Ready），并加了一把互斥锁：vCPU 线程（寄存器访问、TX）和 RX 线程（填 RX buffer、拉中断）都在锁内操作设备状态。新增 `virtio_mmio_run_queue()`：在锁内确认队列可用（`DRIVER_OK`、Ready、没有 `NEEDS_RESET`）后运行回调并按需发中断；backend 可选的 `driver_ok` 回调。
+- `src/vcpu.{h,c}`：单个 MMIO 区间改为最多 4 个区间的表，`vcpu_mmio_register()` 拒绝重叠的区间。
+- `src/boot/acpi.c`：DSDT 支持多个 virtio-mmio 设备，第 i 个叫 `\_SB.VR0i`、`_UID i`。blk 固定在 `0xd0000000`/GSI 5，net 固定在 `0xd0001000`/GSI 6（没有磁盘时也一样）。
+- `src/cli.c`、`src/sandbox.c`：`-t/--tap IFNAME`。tap 在创建 VM 之前打开：不存在（不会顺手创建一个没配置的）、名字太长、被另一个进程占用、不是 TAP 时以 `stage=failed_net_open` 失败。RX 线程在 `KVM_RUN` 之前启动，在释放客户机内存之前停止。
+- `scripts/setup-tap.sh`：创建 tap、配地址、`ip_forward=1`、`MASQUERADE -s 192.168.100.0/24 ! -o tap0`、FORWARD 放行。原来的 `ip_forward` 记在 `/run/svmm/tap0.state`，`--clean` 只删本脚本加的规则并恢复它；tap 已存在时拒绝执行，避免重复规则。
+- `rootfs/build-rootfs.sh`：`/init` 发现 `eth0` 就配置 `192.168.100.2/24`、默认路由、`/etc/resolv.conf`，ping 网关（最多 3 次）。
+
+一次 ping 的路径：客户机把 ICMP 帧放进 TX 队列 → 写 `QueueNotify` → `KVM_EXIT_MMIO` → vCPU 线程 `writev(tap)` → 宿主机内核回复 → tap 可读 → RX 线程 `read()` 进 RX buffer → 发布 used.idx、拉高 GSI 6 → 客户机（可能正在 HLT）被中断唤醒，virtio_net 驱动收包。
+
+### 与教程的差异
+
+- **12 字节头**：教程按 10 字节的 legacy 头处理。协商了 `VERSION_1` 时头固定包含 `num_buffers`，是 12 字节；按 10 字节解析，每个帧都会错开 2 字节。
+- **RX 用独立线程 + 中断，不在 VM exit 后轮询**：教程在每次 VM exit 后检查 tap。客户机空闲时执行 HLT，而 irqchip 在内核里，HLT 不会退出到 VMM——客户机在等包的时候恰好没有 VM exit，包永远进不来。这里 RX 线程阻塞在 `poll()` 上，帧一到就写进 RX 队列并发中断。
+- **传输层加锁**：有了第二个线程，寄存器访问（可能是复位）和 RX 写入可能同时发生，所以设备状态都在一把锁内修改；复位后 RX 线程不会再碰旧的 ring。
+- **没有 RX buffer 时不读 tap**：先 peek 一个 buffer 再读帧，避免读出来再丢掉；`DRIVER_OK` 和 RX kick 唤醒线程，不用定时轮询。
+- **tap 必须预先存在**：`TUNSETIFF` 对不存在的名字会新建一个 tap，打错名字时 VM 能启动但网络不通；这里直接报错并提示 `setup-tap.sh`。
+- **MASQUERADE 限定源网段**，`--clean` 恢复原来的 `ip_forward`，而不是无条件关掉。
+- **不做 offload**（`CSUM`、`GSO`、`MRG_RXBUF`），大帧（tap MTU 调大后）在 RX 侧丢弃并计数。
+- **测试**：每个 E2E 测试在独立的网络命名空间里创建 tap，不碰宿主机的网络配置，见下文。
+
+### 测试
+
+- `tests/test_virtio_net.c`（`bin/test_virtio_net`）：测试扮演 driver，只通过 MMIO 寄存器和假客户机内存操作设备，用 `socketpair(SOCK_SEQPACKET)` 代替 tap（一次读写正好一个帧）。文件开头列出 17 种失败方式：设备身份/队列数、TX 头的任意切分、TX 恶意链（方向、长度、GPA 越界与回绕、成环）、写 tap 失败、RX 头和帧内容、没有 buffer 时的背压与顺序、大帧丢弃、RX 恶意链、复位与 `DRIVER_OK` 之前不写内存、`avail.idx` 跳跃与 `NEEDS_RESET`、RX 线程不依赖 kick 就能投递、tap 不存在/名字非法。
+- `tests/test_virtio_net.py`：真实 KVM + 内核，每个测试一个独立的网络命名空间。文件开头列出 9 种失败方式，对应 7 个测试：`/init` 输出和 MAC、宿主机 ↔ 客户机 ping 与邻居表；双向 TCP 大流量（8 MiB `wget`、4 MiB `nc` 两个方向，比对 md5）；`setup-tap.sh` 的 NAT（用另一个命名空间扮演外网，确认源地址被改写；重复执行失败；`--clean` 删干净并恢复 `ip_forward`）；坏 tap 名/被占用的 tap 在启动前被拒绝；与 `--disk` 同时使用（`/proc/interrupts` 里两个 virtio 中断）；不带 `--tap` 时没有网卡；大帧被丢弃而正常流量不受影响。需要 root、`/dev/net/tun`、`iptables`。
+
+```sh
+make bin/test_virtio_net && ./bin/test_virtio_net
+VIRTIO_BZIMAGE=/path/to/bzImage python3 -m unittest -v tests/test_virtio_net.py
+```
+
+两者都包含在 `make test` 中。
+
+## Stage 06：virtio-blk 与磁盘
 
 根据 [Runra Stage 06 教程](https://runra.dev/zh/blog/sandbox-from-scratch-06-virtio-blk-rootfs-disk-safety) 把 Stage 05 的 virtqueue 放进客户机内存，接上 virtio-mmio 传输层和 virtio-blk 设备：`svmm run --disk PATH` 把宿主机上的 raw 镜像变成客户机里的 `/dev/vda`，initramfs 的 `/init` 自动把它挂到 `/mnt`。
 
@@ -15,7 +82,7 @@ make run-disk KERNEL=/path/to/bzImage       # 等价于 svmm run ... --disk buil
 - `src/virtio/blk.{h,c}`：virtio-blk。请求链 = 16 字节请求头（只读）+ 数据段 + 1 字节状态（可写）；支持 `T_IN`、`T_OUT`、`T_FLUSH`（`fdatasync`）、`T_GET_ID`，其他类型返回 `UNSUPP`。镜像用 `O_RDWR` 打开并加 `flock(LOCK_EX|LOCK_NB)`，退出时打印一行统计。
 - `src/virtio/virtq.c`：新增 `virtq_init_shared()`，让 Stage 05 的 virtqueue 直接使用 driver 告诉我们的三块客户机内存，所有链校验逻辑原样复用。
 - `src/boot/acpi.c`：带磁盘时在 DSDT 里追加 `\_SB.VR00`（`_HID "LNRO0005"`，`Memory32Fixed` 寄存器页 + 电平触发 GSI 5）。
-- `src/vcpu.c`：`KVM_EXIT_MMIO` 落在设备区间内时交给 `vcpu->mmio.access`，其余地址仍按“没有设备”处理。
+- `src/vcpu.c`：`KVM_EXIT_MMIO` 落在设备区间内时交给设备的 `access` 回调，其余地址仍按“没有设备”处理。
 - `src/cli.c`、`src/sandbox.c`：`-d/--disk`；镜像在创建 VM 之前打开，路径错误、太小（不足一个扇区）或被另一个 VMM 占用时以 `stage=failed_disk_open` 失败。
 - `rootfs/build-rootfs.sh`：`/init` 发现 `/dev/vda` 就 `mount /dev/vda /mnt`（文件系统类型自动识别，不是文件系统时只提示）；shell 退出时先 `sync` 和 `umount /mnt` 再 `reboot -f`。
 
@@ -134,12 +201,13 @@ make all initramfs           # 生成 bin/svmm 和 build/initramfs.cpio.gz
 - 命令行接口：
 
   ```text
-  svmm run --kernel PATH [--initrd PATH] [--mem SIZE_MB] [--cmdline STR] [--disk PATH]
+  svmm run --kernel PATH [--initrd PATH] [--mem SIZE_MB] [--cmdline STR] [--disk PATH] [--tap IFNAME]
     -k, --kernel PATH    x86 bzImage（必需）
     -i, --initrd PATH    initramfs；不传则不加载，内核会停在挂载根文件系统
     -m, --mem SIZE_MB    客户机内存，单位 MiB，64–3072，默认 256
     -c, --cmdline STR    内核命令行，整体替换默认值
     -d, --disk PATH      raw 镜像，作为 virtio-blk（/dev/vda）；运行期间读写打开并加锁（Stage 06）
+    -t, --tap IFNAME     已存在的 TAP 接口，作为 virtio-net（eth0）；用 scripts/setup-tap.sh 创建（Stage 07）
     -h, --help           打印帮助到 stdout 并返回 0
   ```
 
@@ -151,7 +219,7 @@ make all initramfs           # 生成 bin/svmm 和 build/initramfs.cpio.gz
 ## 测试
 
 ```sh
-make test                                          # 单元测试、virtqueue 和 virtio-blk 设备测试；没有内核镜像时跳过 KVM 测试
+make test                                          # 单元测试、virtqueue、virtio-blk 和 virtio-net 设备测试；没有内核镜像（或 root、/dev/net/tun）时跳过 KVM 测试
 BZIMAGE_PATH=/boot/vmlinuz-6.16.0 make test        # 加上 KVM 端到端测试
 ```
 
