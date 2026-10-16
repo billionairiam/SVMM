@@ -7,6 +7,7 @@
 #include "kvm.h"
 #include "memory.h"
 #include "metrics.h"
+#include "net-policy.h"
 #include "serial.h"
 #include "vcpu.h"
 #include "virtio/blk.h"
@@ -176,6 +177,19 @@ int sandbox_run(const struct sandbox_config *config)
     size_t memory_size = 0;
     int serial_ready = 0;
     int status = 1;
+
+    /*
+     * 0. 可选：进入网络命名空间（Stage 08）。必须是第一步：
+     *    - 下面 1c 打开 /dev/net/tun 时，TAP 在“当前线程所在的 netns”里查找并绑定；
+     *    - setns 只移动调用线程，控制台线程和 RX 线程要在这之后创建才会继承它。
+     * KVM、客户机内存、磁盘文件和 netns 无关，不受影响。
+     */
+    if (config->netns_name) {
+        if (net_policy_enter_ns(config->netns_name) < 0) {
+            metric_failure("netns", memory_size);
+            goto done;
+        }
+    }
 
     /* 1. 读取并校验 bzImage。放在打开 /dev/kvm 之前，镜像有问题时尽早失败。 */
     if (boot_linux_load(config->kernel_path, &image) < 0) {

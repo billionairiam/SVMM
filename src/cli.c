@@ -30,6 +30,9 @@ static void print_usage(FILE *stream)
             "                       opened read-write and locked while the VM runs\n"
             "  -t, --tap IFNAME     existing TAP interface exposed as virtio-net (eth0);\n"
             "                       create one with scripts/setup-tap.sh\n"
+            "  -n, --netns NAME     enter network namespace /var/run/netns/NAME before\n"
+            "                       opening the TAP; scripts/setup-netns-policy.sh builds\n"
+            "                       one with an egress denylist\n"
             "  -h, --help           show this help\n"
             "\n"
             "When stdin is a terminal, press Ctrl-A x to quit.\n",
@@ -89,6 +92,7 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
         { "cmdline", required_argument, NULL, 'c' },
         { "disk", required_argument, NULL, 'd' },
         { "tap", required_argument, NULL, 't' },
+        { "netns", required_argument, NULL, 'n' },
         { "help", no_argument, NULL, 'h' },
         { 0 },
     };
@@ -102,7 +106,7 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
     optind = 1;
     opterr = 0;
     int opt;
-    while ((opt = getopt_long(sub_argc, sub_argv, "+:k:i:m:c:d:t:h", options, NULL)) != -1) {
+    while ((opt = getopt_long(sub_argc, sub_argv, "+:k:i:m:c:d:t:n:h", options, NULL)) != -1) {
         switch (opt) {
         case 'k':
             config->kernel_path = optarg;
@@ -127,6 +131,11 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
             if (!*optarg)
                 return usage_error("--tap requires a non-empty interface name");
             config->tap_name = optarg;
+            break;
+        case 'n':
+            if (!*optarg)
+                return usage_error("--netns requires a non-empty namespace name");
+            config->netns_name = optarg;
             break;
         case 'h':
             print_usage(stdout);

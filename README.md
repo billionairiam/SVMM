@@ -1,3 +1,58 @@
+# Stage 08：网络命名空间与出口策略
+
+根据 [Runra Stage 08 教程](https://runra.dev/zh/blog/sandbox-from-scratch-08-network-egress-policy)：KVM 只隔离 CPU 和内存，客户机经 TAP 发出的包在宿主机内核里是普通网络包，能访问云 metadata（`169.254.169.254`）、内网和宿主机自己。Stage 08 让 VMM 进程 `setns` 进一个专门的网络命名空间，客户机的流量只能经过那里的 nftables denylist 出去。
+
+```sh
+sudo scripts/setup-netns-policy.sh           # 或 sudo make netns：netns + tap0 + veth + NAT + denylist
+sudo make run-netns KERNEL=/path/to/bzImage  # 等价于 svmm run ... --tap tap0 --netns sandbox-ns
+# 客户机里：policy-test（2 个目标应该通，3 个应该被拒）
+sudo ip netns exec sandbox-ns nft list chain inet sandbox-egress forward   # 看被拒的计数
+sudo dmesg | grep SANDBOX-DENY                                             # 被拒的连接（限速记录）
+sudo scripts/setup-netns-policy.sh --clean   # 或 sudo make netns-down
+```
+
+```
+客户机 eth0 192.168.100.2
+     │ virtio-net
+┌────┴──────────────────────────── sandbox-ns ──┐
+│ tap0 192.168.100.1                             │  forward 链：denylist（先计数再丢弃）
+│   └─ MASQUERADE → 192.168.200.2                │  IPv6 关闭，forward 链也丢 IPv6
+│ veth-g 192.168.200.2，默认路由 → 192.168.200.1   │
+└────┬───────────────────────────────────────────┘
+     │ veth pair
+veth-h 192.168.200.1（宿主机）── MASQUERADE ── 宿主机出口
+```
+
+denylist：`169.254.0.0/16`（含 `169.254.169.254`）、`100.100.100.200`、`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、`100.64.0.0/10`。宿主机的 `veth-h` 也在其中，客户机访问不到它。`ct state established,related` 放在 denylist 之前，只检查新连接的目标地址；外面主动连向客户机（目标 `192.168.100.2`）同样被 `192.168.0.0/16` 挡住。
+
+**只能走代理的网络**（例如公司代理和 DNS 都在 10/8 里）：用 `ALLOW_DST` 在 denylist 上开例外，然后在客户机里走代理：
+
+```sh
+sudo ALLOW_DST="10.102.248.16 10.248.2.5" scripts/setup-netns-policy.sh
+# 客户机里：
+echo "nameserver 10.248.2.5" > /etc/resolv.conf
+export http_proxy=http://10.102.248.16:912
+wget -O - http://example.com/
+POLICY_ALLOW_PING=10.248.2.5 POLICY_ALLOW_URL=http://example.com/ policy-test
+```
+
+注意：放行代理等于把代理能到达的地方都交给了客户机。设了 `http_proxy` 之后，`wget http://169.254.169.254/` 是代理替客户机去连的，nftables 只看到发往代理的包。
+
+代码：
+
+- `src/net-policy.{h,c}`：`net_policy_enter_ns(name)` = 校验名字 → `open("/var/run/netns/<name>")` → `setns(fd, CLONE_NEWNET)` → `close`。名字只允许 `[A-Za-z0-9_.-]`、不超过 64 个字符、不能是 `.`/`..`（否则 `../../proc/1/ns/net` 会回到宿主机的 netns）。不存在（提示 `ip netns add`）、残留的普通文件（`setns` 返回 `EINVAL`）、没有 `CAP_SYS_ADMIN` 时以 `stage=failed_netns` 失败，不会启动 VM。
+- `src/sandbox.{h,c}`：`netns_name` 字段；`sandbox_run()` 的第 0 步，在读内核、打开 TAP、创建任何线程之前。TAP 在 `TUNSETIFF` 时所在的 netns 里查找，`setns` 只移动调用线程，之后创建的控制台线程和 RX 线程继承它。
+- `src/cli.c`：`-n/--netns NAME`。VMM 自己 `setns`，不需要 `ip netns exec`。
+- `scripts/setup-netns-policy.sh`：建 netns（先关 IPv6）、veth pair、sandbox 里的 tap0、两层 MASQUERADE、nftables 表 `inet sandbox-egress`（`deny-dst-v4`、`allow-dst-v4` 两个 interval 集合和 `forward` 链）和 `ip sandbox-nat`。宿主机上加 MASQUERADE 和 FORWARD 放行，打开 `ip_forward`；在 init netns 里运行时还会打开 `net.netfilter.nf_log_all_netns`（否则非 init netns 的 nftables 日志不进 dmesg）。原值记在 `/run/svmm/netns-<name>.state`，`--clean` 恢复。netns 或 `veth-h` 已存在时拒绝执行；netns 里还有进程（svmm 没退出）时 `--clean` 拒绝执行。环境变量 `NETNS`、`TAP`、`ALLOW_DST`（只接受 IPv4 地址/CIDR，防止注入 nft 语句）、`SVMM_NETNS_STATE_DIR`。
+- `rootfs/build-rootfs.sh`：客户机里的 `/bin/policy-test`，`POLICY_ALLOW_PING`、`POLICY_ALLOW_URL` 可以换掉允许的目标。
+- `Makefile`：`netns`、`netns-down`、`run-netns`、`help`。
+
+和教程的差别：`policy-test` 不在每次启动时自动运行（被拒的连接要等超时，会拖慢每次启动），在 shell 里手动运行；没有 `run-in-netns.sh`，`--netns` 加 `make run-netns` 已经覆盖；多了 `ALLOW_DST` 例外、被拒日志限速、forward 链丢 IPv6。
+
+局限：denylist 只挡私有/特殊地址，宿主机的公网地址仍然能访问；没有速率限制和 DNS 过滤；一次只有一个 sandbox-ns（`veth-h` 名字固定）。
+
+测试：`tests/test_network_policy.py`（端到端，需要 root、`nft`，`BZIMAGE_PATH=... python3 -m unittest -v tests/test_network_policy.py`）。每个测试新建一个“宿主机” netns，被拒的地址都配在它上面并且有 HTTP 服务（没有策略就能连上），`ALLOW_DST` 放行的 `10.0.0.2` 作为对照；另有一个 wan netns 扮演外网，只有两层 MASQUERADE 都生效才能收到回复。宿主 netns 里还放了一个同名的诱饵 `tap0`，验证 VMM 打开的是 sandbox-ns 里的那个。
+
 # Stage 07：virtio-net 与 TAP
 
 根据 [Runra Stage 07 教程](https://runra.dev/zh/blog/sandbox-from-scratch-07-virtio-net-tap) 给客户机加一块网卡：`svmm run --tap tap0` 把宿主机上已有的 TAP 接口接成客户机里的 `eth0`（virtio-net），`/init` 自动配置静态地址并 ping 网关。

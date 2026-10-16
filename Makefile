@@ -4,8 +4,8 @@ CFLAGS += -pthread
 CPPFLAGS += -Isrc
 .DEFAULT_GOAL := all
 
-SOURCES := src/main.c src/cli.c src/sandbox.c src/kvm.c src/memory.c src/vcpu.c \
-           src/serial.c src/console.c src/metrics.c src/boot/linux.c src/boot/acpi.c \
+SOURCES := src/main.c src/cli.c src/sandbox.c src/net-policy.c src/kvm.c src/memory.c \
+           src/vcpu.c src/serial.c src/console.c src/metrics.c src/boot/linux.c src/boot/acpi.c \
            src/virtio/virtq.c src/virtio/mmio.c src/virtio/blk.c src/virtio/net.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 # Stage 05 的 virtqueue 是纯用户态代码，不依赖 KVM，单独编进 virtq-demo。
@@ -46,7 +46,8 @@ $(foreach variant,$(ABLATION_VARIANTS),$(eval $(call ABLATION_template,$(variant
 
 -include $(DEPFILES) $(ABLATION_DEPFILES)
 
-.PHONY: all ablation initramfs disk run run-disk run-net run-virtq test clean
+.PHONY: all ablation initramfs disk run run-disk run-net run-virtq test clean \
+        netns netns-down run-netns help
 
 # make run KERNEL=/boot/vmlinuz-6.16.0 MEM=512
 KERNEL ?= images/bzImage
@@ -57,6 +58,9 @@ DISK ?= build/disk.img
 DISK_MB ?= 64
 # make run-net：先 sudo scripts/setup-tap.sh 创建 tap0。
 TAP ?= tap0
+# make netns / run-netns / netns-down（Stage 08）：sandbox netns + nftables 出口 denylist。
+# ALLOW_DST="10.1.2.3 10.4.0.0/16" 可以在 denylist 上开例外（例如公司代理和 DNS）。
+NETNS ?= sandbox-ns
 
 all: bin/svmm bin/virtq-demo
 
@@ -129,6 +133,30 @@ run-disk: all initramfs disk
 run-net: all initramfs
 	@./bin/svmm run --kernel $(KERNEL) --initrd $(INITRD) --mem $(MEM) --tap $(TAP)
 
+# 这两个 target 需要 root：sudo make netns。
+netns:
+	@NETNS=$(NETNS) TAP=$(TAP) ALLOW_DST="$(ALLOW_DST)" sh scripts/setup-netns-policy.sh
+
+netns-down:
+	@NETNS=$(NETNS) TAP=$(TAP) sh scripts/setup-netns-policy.sh --clean
+
+# VMM 自己 setns 进 $(NETNS)，不需要 ip netns exec。
+run-netns: all initramfs
+	@./bin/svmm run --kernel $(KERNEL) --initrd $(INITRD) --mem $(MEM) --tap $(TAP) \
+		--netns $(NETNS)
+
+help:
+	@echo "make all          build bin/svmm and bin/virtq-demo"
+	@echo "make initramfs    build $(INITRD)"
+	@echo "make run          boot KERNEL with the initramfs"
+	@echo "make run-disk     ... plus $(DISK) as virtio-blk"
+	@echo "make run-net      ... plus TAP=$(TAP) as virtio-net (sudo scripts/setup-tap.sh first)"
+	@echo "sudo make netns   create netns $(NETNS) with $(TAP), veth, NAT and the egress denylist"
+	@echo "make run-netns    boot with --tap $(TAP) --netns $(NETNS) (as root)"
+	@echo "sudo make netns-down   remove everything 'make netns' created"
+	@echo "make test         unit + E2E tests (E2E needs BZIMAGE_PATH and root)"
+	@echo "make clean        remove build/ and bin/"
+
 run-virtq: bin/virtq-demo
 	@./bin/virtq-demo
 
@@ -147,6 +175,7 @@ test: bin/test_metrics bin/test_vcpu_errors bin/test_virtq bin/test_virtio_blk \
 	python3 -m unittest -v tests/test_sandbox_cli.py
 	python3 -m unittest -v tests/test_virtio_blk.py
 	python3 -m unittest -v tests/test_virtio_net.py
+	python3 -m unittest -v tests/test_network_policy.py
 
 clean:
 	rm -rf build bin

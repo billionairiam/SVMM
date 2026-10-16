@@ -1,6 +1,7 @@
 #!/bin/sh
 # 生成最小 initramfs：静态 BusyBox + /init，打包为 newc cpio 再 gzip。
-# /init 会挂载 virtio-blk 磁盘（Stage 06），并配置 virtio-net 的 eth0（Stage 07）。
+# /init 会挂载 virtio-blk 磁盘（Stage 06），并配置 virtio-net 的 eth0（Stage 07）；
+# /bin/policy-test 检查 Stage 08 的出口策略。
 #
 # 用法：rootfs/build-rootfs.sh [输出路径]
 #   输出路径默认是 build/initramfs.cpio.gz（相对仓库根目录）。
@@ -150,6 +151,49 @@ fi
 exec reboot -f
 EOF
 chmod 755 "$root/init"
+
+# Stage 08：出口策略自检，在客户机 shell 里手动运行 `policy-test`。
+# 不放进 /init：被拒的连接要等超时，每次启动都跑会拖慢启动。
+cat > "$root/bin/policy-test" <<'EOF'
+#!/bin/sh
+# 检查 scripts/setup-netns-policy.sh 装的 denylist：2 个目标应该能通，3 个应该被拒。
+# “被拒”的检查里连接失败才算通过。允许的目标可以换掉（例如只能走代理的网络里）：
+#   POLICY_ALLOW_PING=1.1.1.1 POLICY_ALLOW_URL=http://example.org/ policy-test
+allow_ping=${POLICY_ALLOW_PING:-8.8.8.8}
+allow_url=${POLICY_ALLOW_URL:-http://example.com/}
+pass=0
+fail=0
+
+# check EXPECT LABEL WHY CMD...：EXPECT 是 OK（应该通）或 FAILED（应该被拒）。
+check() {
+    expect=$1 label=$2 why=$3
+    shift 3
+    if "$@" >/dev/null 2>&1; then got=OK; else got=FAILED; fi
+    if [ "$got" = "$expect" ]; then
+        pass=$((pass + 1))
+        echo "policy-test: $label $got ($why)"
+    else
+        fail=$((fail + 1))
+        echo "policy-test: $label $got ($why) <-- expected $expect"
+    fi
+}
+
+echo "policy-test: egress policy check starting..."
+check OK "ping $allow_ping" "allowed egress" ping -c 2 -W 2 "$allow_ping"
+check FAILED "ping 10.0.0.1" "private CIDR denied" ping -c 1 -W 2 10.0.0.1
+check FAILED "wget 169.254.169.254" "metadata denied" \
+    wget -q -T 3 -O /dev/null http://169.254.169.254/
+check FAILED "ping 100.64.0.1" "CGNAT denied" ping -c 1 -W 2 100.64.0.1
+check OK "wget $allow_url" "allowed egress" wget -q -T 5 -O /dev/null "$allow_url"
+echo "policy-test: passed=$pass failed=$fail"
+if [ "$fail" -eq 0 ]; then
+    echo "policy-test: all egress tests passed"
+else
+    echo "policy-test: some egress tests failed"
+    exit 1
+fi
+EOF
+chmod 755 "$root/bin/policy-test"
 
 mkdir -p "$(dirname "$output")"
 tmp_output=$output.tmp.$$

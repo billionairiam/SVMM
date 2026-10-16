@@ -17,6 +17,8 @@
  *   mem_size_mb  PUT /machine-config mem_size_mib
  *   cmdline      PUT /boot-source   boot_args
  *   disk_path    PUT /drives/rootfs path_on_host（is_root_device=false）
+ *   tap_name     PUT /network-interfaces/eth0 host_dev_name
+ *   netns_name   jailer --netns
  */
 struct sandbox_config {
     /* x86 bzImage 路径，必填。 */
@@ -37,6 +39,12 @@ struct sandbox_config {
      * 接口必须已经存在，见 scripts/setup-tap.sh。
      */
     const char *tap_name;
+    /*
+     * 可选的网络命名空间名（Stage 08），即 /var/run/netns/ 下的文件名。
+     * sandbox_run() 在打开 TAP、创建任何线程之前 setns() 进去，tap_name 在这个
+     * netns 里查找。出口策略见 scripts/setup-netns-policy.sh。
+     */
+    const char *netns_name;
 };
 
 /* 填入默认值：256 MiB、默认命令行、无内核和 initramfs。 */
