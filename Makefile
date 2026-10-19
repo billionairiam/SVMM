@@ -4,7 +4,7 @@ CFLAGS += -pthread
 CPPFLAGS += -Isrc
 .DEFAULT_GOAL := all
 
-SOURCES := src/main.c src/cli.c src/sandbox.c src/net-policy.c src/kvm.c src/memory.c \
+SOURCES := src/main.c src/cli.c src/sandbox.c src/net-policy.c src/jail.c src/kvm.c src/memory.c \
            src/vcpu.c src/serial.c src/console.c src/metrics.c src/boot/linux.c src/boot/acpi.c \
            src/virtio/virtq.c src/virtio/mmio.c src/virtio/blk.c src/virtio/net.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
@@ -47,7 +47,7 @@ $(foreach variant,$(ABLATION_VARIANTS),$(eval $(call ABLATION_template,$(variant
 -include $(DEPFILES) $(ABLATION_DEPFILES)
 
 .PHONY: all ablation initramfs disk run run-disk run-net run-virtq test clean \
-        netns netns-down run-netns help
+        netns netns-down run-netns jail-setup jail-clean run-jail help
 
 # make run KERNEL=/boot/vmlinuz-6.16.0 MEM=512
 KERNEL ?= images/bzImage
@@ -95,6 +95,9 @@ bin/test_virtio_blk: tests/test_virtio_blk.c $(BLK_SOURCES) src/virtio/virtq.h \
 bin/test_virtio_net: tests/test_virtio_net.c $(NET_SOURCES) src/virtio/virtq.h \
                      src/virtio/mmio.h src/virtio/net.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_virtio_net.c $(NET_SOURCES) -o $@
+
+bin/test_jail: tests/test_jail.c src/jail.c src/jail.h | bin
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_jail.c src/jail.c -o $@
 
 bin/test_serial: tests/test_serial.c src/serial.c src/serial.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_serial.c src/serial.c -o $@
@@ -145,6 +148,16 @@ run-netns: all initramfs
 	@./bin/svmm run --kernel $(KERNEL) --initrd $(INITRD) --mem $(MEM) --tap $(TAP) \
 		--netns $(NETNS)
 
+# Stage 09：jailer。run-jail 需要 root；jail-setup 只是提前检查 cgroup v2，可以不跑。
+jail-setup:
+	@sh scripts/setup-jail.sh
+
+jail-clean:
+	@sh scripts/setup-jail.sh --clean
+
+run-jail: all initramfs
+	@./bin/svmm run --kernel $(KERNEL) --initrd $(INITRD) --mem $(MEM) --jail
+
 help:
 	@echo "make all          build bin/svmm and bin/virtq-demo"
 	@echo "make initramfs    build $(INITRD)"
@@ -154,6 +167,9 @@ help:
 	@echo "sudo make netns   create netns $(NETNS) with $(TAP), veth, NAT and the egress denylist"
 	@echo "make run-netns    boot with --tap $(TAP) --netns $(NETNS) (as root)"
 	@echo "sudo make netns-down   remove everything 'make netns' created"
+	@echo "sudo make jail-setup   check cgroup v2 and create /sys/fs/cgroup/svmm"
+	@echo "sudo make run-jail     boot with --jail (cgroup, rlimit, no capabilities, seccomp)"
+	@echo "sudo make jail-clean   remove cgroups left by exited VMMs"
 	@echo "make test         unit + E2E tests (E2E needs BZIMAGE_PATH and root)"
 	@echo "make clean        remove build/ and bin/"
 
@@ -161,10 +177,11 @@ run-virtq: bin/virtq-demo
 	@./bin/virtq-demo
 
 test: bin/test_metrics bin/test_vcpu_errors bin/test_virtq bin/test_virtio_blk \
-      bin/test_virtio_net
+      bin/test_virtio_net bin/test_jail
 	./bin/test_virtq
 	./bin/test_virtio_blk
 	./bin/test_virtio_net
+	./bin/test_jail
 	python3 -m unittest -v tests/test_virtq_demo.py
 	./bin/test_metrics
 	./bin/test_vcpu_errors
@@ -176,6 +193,7 @@ test: bin/test_metrics bin/test_vcpu_errors bin/test_virtq bin/test_virtio_blk \
 	python3 -m unittest -v tests/test_virtio_blk.py
 	python3 -m unittest -v tests/test_virtio_net.py
 	python3 -m unittest -v tests/test_network_policy.py
+	python3 -m unittest -v tests/test_jailer.py
 
 clean:
 	rm -rf build bin

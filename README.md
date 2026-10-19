@@ -1,3 +1,83 @@
+# Stage 09：Jailer——cgroup、rlimit、capability 与 seccomp
+
+根据 [Runra Stage 09 教程](https://runra.dev/zh/blog/sandbox-from-scratch-09-jailer-cgroup-seccomp)：KVM 隔离的是客户机，VMM 自己仍然是宿主机上的 root 进程。客户机能驱动的代码（MMIO 分派、virtqueue 解析、串口模型）一旦有漏洞，攻击者拿到的就是这个进程的全部能力。`--jail` 在四个方向上收紧它：
+
+```sh
+sudo scripts/setup-jail.sh                  # 或 sudo make jail-setup：检查 cgroup v2，可选
+sudo make run-jail KERNEL=/path/to/bzImage  # 等价于 svmm run ... --jail
+sudo bin/svmm run --kernel ... --tap tap0 --netns sandbox-ns --disk build/disk.img \
+     --jail --cpu-max 50000 --memory-max 512 --nofile 64 --nproc 32
+grep -E 'Seccomp|NoNewPrivs|Cap' /proc/$(pgrep -n svmm)/status   # Seccomp: 2，Cap* 全 0
+cat /sys/fs/cgroup/svmm/vm-$(pgrep -n svmm)/{cpu.max,memory.max,pids.max}
+sudo dmesg | grep type=1326                 # seccomp 杀掉的调用（没有就对了）
+sudo scripts/setup-jail.sh --clean          # 或 sudo make jail-clean：删掉已退出 VMM 的 cgroup
+```
+
+| 层 | 做什么 | 默认 |
+|---|---|---|
+| cgroup v2 | `/sys/fs/cgroup/svmm/vm-<pid>`：`cpu.max`、`memory.max`（`memory.swap.max=0`）、`pids.max` | 1 CPU、`--mem` + 128 MiB、32 |
+| rlimit | `RLIMIT_NOFILE`、`RLIMIT_NPROC`，软硬限制相同 | 64、32 |
+| capability | ambient、bounding、inheritable、permitted、effective 全部清空 | — |
+| seccomp | `NO_NEW_PRIVS` + 原始 BPF 白名单，31 个调用，其余 `KILL_PROCESS` | — |
+
+stderr 上会依次出现 `INFO: jail: cgroup applied`（或 `WARN: jail: cgroup unavailable`）、`INFO: jail: rlimit applied`、`INFO: jail: capabilities dropped`、`INFO: jail: seccomp installed`。
+
+### 三个阶段
+
+教程在启动早期一次性调用 `jail_apply()`。这里拆成三步，插在 `sandbox_run()` 的不同位置：
+
+```
+0    setns(netns)            需要 CAP_SYS_ADMIN
+0.5  jail_limit()            cgroup + rlimit：任何分配之前，内核镜像、客户机内存都记在 jail cgroup 上
+1-7  读内核、开磁盘、开 TAP（TUNSETIFF 需要 CAP_NET_ADMIN）、KVM、内存、vCPU
+7b   jail_drop_caps()        创建任何线程之前：capability 是每个线程各自的
+8    串口、信号、控制台线程、RX 线程
+8c   jail_seccomp()          TSYNC：已经存在的线程一起装上
+9    KVM_RUN                 从这里开始处理客户机可控的输入
+```
+
+capability 丢早了，`--tap` 和 `--netns` 就不能和 `--jail` 一起用；丢晚了，控制台线程和 RX 线程还带着满权限。seccomp 放在最后，之前的初始化是可信的（打开文件、创建线程、装信号处理函数），白名单只需要覆盖运行阶段。
+
+### 白名单
+
+用 `strace -f` 跑磁盘 + 网络 + 终端 + 三种退出路径（Ctrl-A x、客户机 `exit`、SIGTERM），统计第一次 `KVM_RUN` 之后出现的调用：
+
+- I/O：`read write writev pread64 pwrite64 fdatasync close fstat ioctl poll ppoll`
+- 内存：`mmap mprotect munmap mremap madvise brk`，`mmap`/`mprotect` 的 `prot` 带 `PROT_EXEC` 时杀掉（W^X）
+- 线程与信号：`futex sched_yield rt_sigprocmask rt_sigreturn tgkill getpid gettid set_robust_list rseq restart_syscall exit exit_group`
+- 其他：`clock_gettime getrandom`
+
+没有 `openat socket execve clone clone3 prctl rt_sigaction mount ptrace`。过滤器先检查 `arch == AUDIT_ARCH_X86_64`：`int $0x80` 进来的是 i386 调用号，i386 的 20（`getpid`）在 x86-64 上是 `writev`，不检查就会被放行。x32 调用号（带 `0x40000000`）同样直接杀掉。
+
+### 与教程的差异
+
+- **分三个阶段**（见上）。教程的顺序在丢 capability 之后才打开 TAP，`--tap` 会失败。
+- **capability 全部清空**。教程只丢 bounding 集合，但它只限制“将来能获得什么”，root 进程当前的 `CapEff`/`CapPrm` 还是满的。这里先清 ambient、逐个 `PR_CAPBSET_DROP`（需要 `CAP_SETPCAP`，所以在前面），再 `capset` 把 effective/permitted/inheritable 清零。注意：uid 仍然是 0，没有 capability 的 root 依然能读写 root 拥有的文件，真正挡住运行阶段打开文件的是 seccomp。
+- **`SECCOMP_RET_KILL_PROCESS`**，不是 `KILL_THREAD`：VMM 是多线程的，RX 线程或控制台线程被单独杀掉后，主线程会卡在 `pthread_join` 上。
+- **`SECCOMP_FILTER_FLAG_TSYNC`**：用 `syscall(SYS_seccomp, ...)` 安装，同步到已有的线程。`prctl(PR_SET_SECCOMP)` 只作用于调用线程。
+- **W^X**：`mmap`/`mprotect` 检查 `prot` 参数的低 32 位。
+- **控制台不再用 `pthread_cancel`**：glibc 第一次 `pthread_cancel` 时会 `dlopen` libgcc_s（`openat` + `PROT_EXEC` 的 `mmap`），过滤器会杀掉 VMM。控制台线程改成 `poll(in_fd, eventfd)`，`console_stop()` 写 eventfd 唤醒它。
+- **`pids.max`**：`RLIMIT_NPROC` 对 root（`INIT_USER`）不生效，任务数靠 cgroup 的 `pids.max` 限制。
+- **`memory.swap.max=0`**：否则宿主机有 swap 时，超过 `memory.max` 的客户机内存会被换出而不是触发 OOM。
+- **cgroup 清理**：进程删不掉自己所在的 cgroup，`vm-<pid>` 在 VMM 退出后留下。下一次 `--jail` 启动时删掉 pid 已经不存在的目录，`setup-jail.sh --clean` 删掉所有空的 `vm-*`；还有进程的 cgroup `rmdir` 会 `EBUSY`，不会误删。
+- **子选项**：`--cpu-max USEC`（1000 到 100000000，周期 100000）、`--memory-max MB`、`--nofile N`、`--nproc N`，没有 `--jail` 时报错。
+
+代码：
+
+- `src/jail.{h,c}`：`struct jail_profile`、`jail_profile_finish()`、`jail_limit()`、`jail_drop_caps()`、`jail_seccomp()`。
+- `src/sandbox.{h,c}`：`sandbox_config.jail`，第 0.5、7b、8c 步。
+- `src/console.{h,c}`：eventfd 唤醒代替 `pthread_cancel`。
+- `src/cli.c`：`-j/--jail` 和四个子选项。
+- `scripts/setup-jail.sh`：检查 cgroup v2 和 `cpu memory pids` 控制器，创建 `/sys/fs/cgroup/svmm` 并在两级 `cgroup.subtree_control` 里启用；`--clean` 清理。
+- `Makefile`：`jail-setup`、`jail-clean`、`run-jail`。
+
+局限：`ioctl` 不检查参数（`KVM_*`、`TCSETS`、`FIONREAD` 都要用，按 fd 区分需要更复杂的过滤器）；没有 user namespace、`pivot_root`/chroot 和换 uid，进程仍然是 uid 0；cgroup 只支持 v2；只支持 x86-64。
+
+测试（需要 root）：
+
+- `tests/test_jail.c`（`make bin/test_jail && sudo bin/test_jail`）：每个用例 fork 一个子进程，装过滤器后执行运行阶段的调用（应当存活）、危险调用和 `PROT_EXEC` 映射（应当 SIGSYS）、`int $0x80`（检查 arch）、安装前创建的线程调用 `socket`（TSYNC 加 KILL_PROCESS：整个进程被杀）；父进程从 `/proc/<pid>/status` 检查 `Seccomp`、`NoNewPrivs` 和五个 capability 集合。
+- `tests/test_jailer.py`（`BZIMAGE_PATH=... python3 -m unittest -v tests/test_jailer.py`）：带 `--disk --tap --netns --jail` 和终端的完整负载（读写磁盘、ping、大段输入、Ctrl-A x），检查每个线程的 `/proc/<pid>/task/*/status`、`limits` 和 cgroup 文件；客户机 `exit` 和 SIGTERM 退出；客户机死循环时 `cpu.stat` 显示被限流；客户机写满内存时 VMM 被 OOM 杀掉（`memory.events` 的 `oom_kill`）；用 tmpfs 盖住 `/sys/fs/cgroup` 时 WARN 后照常运行；残留 cgroup 的清理；非法选项；不加 `--jail` 时一切照旧。
+
 # Stage 08：网络命名空间与出口策略
 
 根据 [Runra Stage 08 教程](https://runra.dev/zh/blog/sandbox-from-scratch-08-network-egress-policy)：KVM 只隔离 CPU 和内存，客户机经 TAP 发出的包在宿主机内核里是普通网络包，能访问云 metadata（`169.254.169.254`）、内网和宿主机自己。Stage 08 让 VMM 进程 `setns` 进一个专门的网络命名空间，客户机的流量只能经过那里的 nftables denylist 出去。

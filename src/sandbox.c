@@ -191,6 +191,17 @@ int sandbox_run(const struct sandbox_config *config)
         }
     }
 
+    /*
+     * 0.5 可选：jailer 第一阶段（Stage 09），cgroup v2 + rlimit。
+     * 放在分配任何东西之前：一页内存在第一次被访问（缺页）时记到进程当时所在的
+     * cgroup 上，之后读进来的内核镜像、拷进客户机内存的内核和 initramfs、
+     * 客户机运行中碰到的每一页都算进 memory.max。
+     */
+    if (jail_limit(&config->jail) < 0) {
+        metric_failure("jail", memory_size);
+        goto done;
+    }
+
     /* 1. 读取并校验 bzImage。放在打开 /dev/kvm 之前，镜像有问题时尽早失败。 */
     if (boot_linux_load(config->kernel_path, &image) < 0) {
         metric_failure("image_load", memory_size);
@@ -321,6 +332,19 @@ int sandbox_run(const struct sandbox_config *config)
     }
     metric_stage(stderr, SVMM_VARIANT_NAME, "vcpu_setup", memory_size);
 
+    /*
+     * 7b. 可选：jailer 第二阶段，丢掉全部 capability。
+     *   - 不能更早：第 0 步 setns 需要 CAP_SYS_ADMIN，1c 打开 TAP（TUNSETIFF）
+     *     需要 CAP_NET_ADMIN；
+     *   - 不能更晚：capability 是每个线程各自的，第 8 步创建的控制台线程和
+     *     RX 线程会继承创建者当时的 capability，所以必须在它们之前丢。
+     * 之后不再打开任何文件，也不需要任何特权。
+     */
+    if (jail_drop_caps(&config->jail) < 0) {
+        metric_failure("jail", memory_size);
+        goto done;
+    }
+
     /* 8. 串口输出到 stdout，控制台把 stdin 送进串口。 */
     serial_init(&serial, STDOUT_FILENO);
     serial_ready = 1;
@@ -337,6 +361,17 @@ int sandbox_run(const struct sandbox_config *config)
      */
     if (net_attached && virtio_net_start(&net) < 0) {
         metric_failure("net_start", memory_size);
+        goto done;
+    }
+
+    /*
+     * 8c. 可选：jailer 第三阶段，seccomp。最后一步：之前是可信的初始化（打开
+     * 文件、创建线程、装信号处理函数），之后开始处理客户机可控的输入（MMIO、
+     * virtqueue、串口），只留下这个阶段真正用到的系统调用。TSYNC 让已经存在的
+     * 控制台线程和 RX 线程也装上同一个过滤器。
+     */
+    if (jail_seccomp(&config->jail) < 0) {
+        metric_failure("jail", memory_size);
         goto done;
     }
 

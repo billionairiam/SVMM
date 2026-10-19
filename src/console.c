@@ -3,10 +3,12 @@
 #include "serial.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 
 /*
@@ -29,7 +31,11 @@
  *   - 读到 EOF 或读错误（例如管道输入写完了）：线程悄悄结束，客户机照常
  *     运行，只是不再有输入；
  *   - 串口输入已关闭（VMM 正在退出）：serial_receive() 返回 -1；
- *   - 被 console_stop() 取消：阻塞在 read() 时，read() 是取消点。
+ *   - console_stop() 写了 stop_fd：poll() 返回，线程结束。
+ *
+ * 等输入用 poll(in_fd, stop_fd) 而不是阻塞在 read() 上再 pthread_cancel()：
+ * glibc 第一次 pthread_cancel() 时会 dlopen libgcc_s.so（openat + PROT_EXEC
+ * mmap），Stage 09 的 seccomp 过滤器会因此杀掉整个 VMM。
  */
 static void *console_thread(void *opaque)
 {
@@ -42,6 +48,17 @@ static void *console_thread(void *opaque)
     /* 去掉转义序列后要送给客户机的字节，不会比 input 多。 */
     uint8_t output[sizeof(input)];
     while (!quit) {
+        struct pollfd fds[2] = {
+            { .fd = console->in_fd, .events = POLLIN },
+            { .fd = console->stop_fd, .events = POLLIN },
+        };
+        if (poll(fds, 2, -1) < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (fds[1].revents)
+            break;
         ssize_t n = read(console->in_fd, input, sizeof(input));
         /* 被信号打断不是错误，重新读即可。 */
         if (n < 0 && errno == EINTR)
@@ -74,14 +91,9 @@ static void *console_thread(void *opaque)
         }
         /*
          * 投递给串口。接收队列满时 serial_receive() 会在条件变量上等待，
-         * 而 pthread_cond_wait() 是取消点：如果在那里被取消，线程会带着
-         * 串口锁退出，vCPU 线程下次访问串口就会永远卡住。所以投递期间
-         * 暂时禁止取消；console_stop() 改用 serial_close_input() 唤醒这里。
+         * console_stop() 用 serial_close_input() 唤醒这里。
          */
-        int old_state;
-        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_state);
         int result = count ? serial_receive(console->serial, output, count) : 0;
-        pthread_setcancelstate(old_state, NULL);
         if (result < 0)
             return NULL;
     }
@@ -133,6 +145,12 @@ int console_start(struct console *console, struct serial *serial, int in_fd,
      * 也就是运行 KVM_RUN 的 vCPU 线程，正好打断 KVM_RUN 让它检查停止请求。
      * 创建完再恢复主线程自己的掩码。
      */
+    console->stop_fd = eventfd(0, EFD_CLOEXEC);
+    if (console->stop_fd < 0) {
+        perror("eventfd console");
+        console_stop(console);
+        return -1;
+    }
     sigset_t all, old;
     sigfillset(&all);
     pthread_sigmask(SIG_BLOCK, &all, &old);
@@ -141,6 +159,7 @@ int console_start(struct console *console, struct serial *serial, int in_fd,
     if (error) {
         errno = error;
         perror("pthread_create console");
+        close(console->stop_fd);
         console_stop(console);
         return -1;
     }
@@ -150,18 +169,20 @@ int console_start(struct console *console, struct serial *serial, int in_fd,
 
 /*
  * 控制台线程可能阻塞在两个地方，需要分别唤醒：
- *   - 阻塞在 serial_receive() 等待队列空间（此时禁止取消）：
+ *   - 阻塞在 serial_receive() 等待队列空间：
  *     serial_close_input() 让它返回错误，线程自行结束；
- *   - 阻塞在 read(in_fd) 等待用户输入：read() 是取消点，
- *     pthread_cancel() 让线程在这里结束。
+ *   - 阻塞在 poll() 等待用户输入：写 stop_fd 让 poll() 返回。
  * pthread_join() 等线程真正结束后，才能安全恢复终端设置。
  */
 void console_stop(struct console *console)
 {
     if (console->started) {
         serial_close_input(console->serial);
-        pthread_cancel(console->thread);
+        uint64_t one = 1;
+        if (write(console->stop_fd, &one, sizeof(one)) != sizeof(one))
+            perror("console stop");
         pthread_join(console->thread, NULL);
+        close(console->stop_fd);
         console->started = false;
     }
     if (console->raw) {

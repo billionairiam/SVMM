@@ -34,8 +34,13 @@ struct console {
     bool started;
     /* 切换到 raw 模式之前的终端设置，退出时原样恢复。 */
     struct termios saved;
-    /* 控制台线程：循环 read(in_fd) 并把字节投递给串口。 */
+    /* 控制台线程：循环 poll + read(in_fd) 并把字节投递给串口。 */
     pthread_t thread;
+    /*
+     * eventfd，console_stop() 写它来唤醒阻塞在 poll() 里的控制台线程。
+     * 只在 started 为 true 时有效。
+     */
+    int stop_fd;
     /* Ctrl-A x 时调用 quit(quit_opaque)；main.c 中它会让 vCPU 停止运行。 */
     console_quit_fn quit;
     void *quit_opaque;

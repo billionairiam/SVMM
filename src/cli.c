@@ -33,11 +33,20 @@ static void print_usage(FILE *stream)
             "  -n, --netns NAME     enter network namespace /var/run/netns/NAME before\n"
             "                       opening the TAP; scripts/setup-netns-policy.sh builds\n"
             "                       one with an egress denylist\n"
+            "  -j, --jail           harden the VMM process (Stage 09): cgroup v2 limits,\n"
+            "                       rlimits, drop all capabilities, seccomp allowlist;\n"
+            "                       scripts/setup-jail.sh checks and prepares cgroup v2\n"
+            "      --cpu-max USEC   with --jail: cpu.max quota per %u us period\n"
+            "                       (default: %u = 1 CPU)\n"
+            "      --memory-max MB  with --jail: memory.max (default: --mem + %u)\n"
+            "      --nofile N       with --jail: RLIMIT_NOFILE (default: %u)\n"
+            "      --nproc N        with --jail: RLIMIT_NPROC and pids.max (default: %u)\n"
             "  -h, --help           show this help\n"
             "\n"
             "When stdin is a terminal, press Ctrl-A x to quit.\n",
             GUEST_MEMORY_MIN_MB, GUEST_MEMORY_MAX_MB, DEFAULT_GUEST_MEM_MB,
-            SANDBOX_DEFAULT_CMDLINE);
+            SANDBOX_DEFAULT_CMDLINE, JAIL_CPU_PERIOD_US, JAIL_DEFAULT_CPU_MAX_US,
+            JAIL_DEFAULT_MEMORY_OVERHEAD_MB, JAIL_DEFAULT_NOFILE, JAIL_DEFAULT_NPROC);
 }
 
 __attribute__((format(printf, 1, 2)))
@@ -66,6 +75,29 @@ static int parse_mem_mb(const char *text, size_t *mem_mb)
     return 0;
 }
 
+/* 同 parse_mem_mb，范围 [min, max]。 */
+static int parse_uint(const char *text, unsigned long long min, unsigned long long max,
+                      unsigned long long *out)
+{
+    if (*text < '0' || *text > '9')
+        return -1;
+    char *end;
+    errno = 0;
+    unsigned long long value = strtoull(text, &end, 10);
+    if (errno || *end || value < min || value > max)
+        return -1;
+    *out = value;
+    return 0;
+}
+
+/* --jail 子选项的 getopt 返回值（没有短选项）。 */
+enum {
+    OPT_CPU_MAX = 256,
+    OPT_MEMORY_MAX,
+    OPT_NOFILE,
+    OPT_NPROC,
+};
+
 int cli_parse(int argc, char **argv, struct sandbox_config *config)
 {
     sandbox_config_init(config);
@@ -93,6 +125,11 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
         { "disk", required_argument, NULL, 'd' },
         { "tap", required_argument, NULL, 't' },
         { "netns", required_argument, NULL, 'n' },
+        { "jail", no_argument, NULL, 'j' },
+        { "cpu-max", required_argument, NULL, OPT_CPU_MAX },
+        { "memory-max", required_argument, NULL, OPT_MEMORY_MAX },
+        { "nofile", required_argument, NULL, OPT_NOFILE },
+        { "nproc", required_argument, NULL, OPT_NPROC },
         { "help", no_argument, NULL, 'h' },
         { 0 },
     };
@@ -106,7 +143,13 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
     optind = 1;
     opterr = 0;
     int opt;
-    while ((opt = getopt_long(sub_argc, sub_argv, "+:k:i:m:c:d:t:n:h", options, NULL)) != -1) {
+    /* 第一个出现的 --jail 子选项，用来报“没有 --jail”的错误。 */
+    const char *jail_suboption = NULL;
+    unsigned long long value;
+    int index;
+    while ((opt = getopt_long(sub_argc, sub_argv, "+:k:i:m:c:d:t:n:jh", options, &index)) != -1) {
+        if (opt >= OPT_CPU_MAX && !jail_suboption)
+            jail_suboption = options[index].name;
         switch (opt) {
         case 'k':
             config->kernel_path = optarg;
@@ -137,6 +180,34 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
                 return usage_error("--netns requires a non-empty namespace name");
             config->netns_name = optarg;
             break;
+        case 'j':
+            config->jail.enabled = true;
+            break;
+        case OPT_CPU_MAX:
+            /* 内核要求配额至少 1 ms；上限 1000 个 CPU。 */
+            if (parse_uint(optarg, 1000, 1000ull * JAIL_CPU_PERIOD_US, &value) < 0)
+                return usage_error("--cpu-max must be an integer from 1000 to %llu (us per "
+                                   "%u us), got '%s'", 1000ull * JAIL_CPU_PERIOD_US,
+                                   JAIL_CPU_PERIOD_US, optarg);
+            config->jail.cpu_max_us = (unsigned)value;
+            break;
+        case OPT_MEMORY_MAX:
+            if (parse_uint(optarg, 1, 1u << 20, &value) < 0)
+                return usage_error("--memory-max must be an integer from 1 to %u (MiB), "
+                                   "got '%s'", 1u << 20, optarg);
+            config->jail.memory_max_mb = (size_t)value;
+            break;
+        case OPT_NOFILE:
+        case OPT_NPROC:
+            if (parse_uint(optarg, 1, 1u << 20, &value) < 0)
+                return usage_error("%s must be an integer from 1 to %u, got '%s'",
+                                   opt == OPT_NOFILE ? "--nofile" : "--nproc", 1u << 20,
+                                   optarg);
+            if (opt == OPT_NOFILE)
+                config->jail.nofile = (unsigned)value;
+            else
+                config->jail.nproc = (unsigned)value;
+            break;
         case 'h':
             print_usage(stdout);
             exit(0);
@@ -152,5 +223,9 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
         return usage_error("unexpected argument '%s'", sub_argv[optind]);
     if (!config->kernel_path || !*config->kernel_path)
         return usage_error("--kernel is required");
+    if (jail_suboption && !config->jail.enabled)
+        return usage_error("--%s requires --jail", jail_suboption);
+    if (config->jail.enabled)
+        jail_profile_finish(&config->jail, config->mem_size_mb);
     return 0;
 }

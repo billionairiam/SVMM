@@ -1,6 +1,8 @@
 #ifndef SANDBOX_H
 #define SANDBOX_H
 
+#include "jail.h"
+
 #include <stddef.h>
 
 #define SANDBOX_DEFAULT_CMDLINE \
@@ -19,6 +21,7 @@
  *   disk_path    PUT /drives/rootfs path_on_host（is_root_device=false）
  *   tap_name     PUT /network-interfaces/eth0 host_dev_name
  *   netns_name   jailer --netns
+ *   jail         jailer 的 cgroup / rlimit / capability / seccomp
  */
 struct sandbox_config {
     /* x86 bzImage 路径，必填。 */
@@ -45,6 +48,11 @@ struct sandbox_config {
      * netns 里查找。出口策略见 scripts/setup-netns-policy.sh。
      */
     const char *netns_name;
+    /*
+     * Stage 09 的 jailer（--jail 及其子选项）。enabled 为 false 时不做任何事；
+     * 为 true 时 cli_parse() 已经用 jail_profile_finish() 填好默认值。
+     */
+    struct jail_profile jail;
 };
 
 /* 填入默认值：256 MiB、默认命令行、无内核和 initramfs。 */
