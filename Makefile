@@ -4,7 +4,7 @@ CFLAGS += -pthread
 CPPFLAGS += -Isrc
 .DEFAULT_GOAL := all
 
-SOURCES := src/main.c src/cli.c src/sandbox.c src/net-policy.c src/jail.c src/kvm.c src/memory.c \
+SOURCES := src/main.c src/cli.c src/sandbox.c src/snapshot.c src/net-policy.c src/jail.c src/kvm.c src/memory.c \
            src/vcpu.c src/serial.c src/console.c src/metrics.c src/boot/linux.c src/boot/acpi.c \
            src/virtio/virtq.c src/virtio/mmio.c src/virtio/blk.c src/virtio/net.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
@@ -47,7 +47,8 @@ $(foreach variant,$(ABLATION_VARIANTS),$(eval $(call ABLATION_template,$(variant
 -include $(DEPFILES) $(ABLATION_DEPFILES)
 
 .PHONY: all ablation initramfs disk run run-disk run-net run-virtq test clean \
-        netns netns-down run-netns jail-setup jail-clean run-jail help
+        netns netns-down run-netns jail-setup jail-clean run-jail \
+        snapshot-save snapshot-list run-snapshot help
 
 # make run KERNEL=/boot/vmlinuz-6.16.0 MEM=512
 KERNEL ?= images/bzImage
@@ -158,6 +159,20 @@ jail-clean:
 run-jail: all initramfs
 	@./bin/svmm run --kernel $(KERNEL) --initrd $(INITRD) --mem $(MEM) --jail
 
+# Stage 10：冷快照，存在 ./snapshots/（或 $$SVMM_SNAPSHOT_DIR）。
+# 先在 run-disk 的 shell 里 exit 关机，再 snapshot-save；VM 运行中会被拒绝。
+SNAPSHOT ?= ws
+snapshot-save: all
+	@./bin/svmm snapshot save --name $(SNAPSHOT) --disk $(DISK) --kernel $(KERNEL) \
+		--initrd $(INITRD) --mem $(MEM)
+
+snapshot-list: all
+	@./bin/svmm snapshot list
+
+run-snapshot: all initramfs
+	@./bin/svmm run --kernel $(KERNEL) --initrd $(INITRD) --mem $(MEM) --disk $(DISK) \
+		--snapshot $(SNAPSHOT)
+
 help:
 	@echo "make all          build bin/svmm and bin/virtq-demo"
 	@echo "make initramfs    build $(INITRD)"
@@ -170,6 +185,9 @@ help:
 	@echo "sudo make jail-setup   check cgroup v2 and create /sys/fs/cgroup/svmm"
 	@echo "sudo make run-jail     boot with --jail (cgroup, rlimit, no capabilities, seccomp)"
 	@echo "sudo make jail-clean   remove cgroups left by exited VMMs"
+	@echo "make snapshot-save     save $(DISK) as cold snapshot SNAPSHOT=$(SNAPSHOT) (VM shut down)"
+	@echo "make snapshot-list     list snapshots in ./snapshots"
+	@echo "make run-snapshot      restore SNAPSHOT=$(SNAPSHOT) into $(DISK), then boot like run-disk"
 	@echo "make test         unit + E2E tests (E2E needs BZIMAGE_PATH and root)"
 	@echo "make clean        remove build/ and bin/"
 
@@ -194,6 +212,7 @@ test: bin/test_metrics bin/test_vcpu_errors bin/test_virtq bin/test_virtio_blk \
 	python3 -m unittest -v tests/test_virtio_net.py
 	python3 -m unittest -v tests/test_network_policy.py
 	python3 -m unittest -v tests/test_jailer.py
+	python3 -m unittest -v tests/test_snapshot.py
 
 clean:
 	rm -rf build bin

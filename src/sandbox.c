@@ -9,6 +9,7 @@
 #include "metrics.h"
 #include "net-policy.h"
 #include "serial.h"
+#include "snapshot.h"
 #include "vcpu.h"
 #include "virtio/blk.h"
 #include "virtio/net.h"
@@ -177,6 +178,20 @@ int sandbox_run(const struct sandbox_config *config)
     size_t memory_size = 0;
     int serial_ready = 0;
     int status = 1;
+
+    /*
+     * -1. 可选：从冷快照恢复 workspace（Stage 10）。最先做：
+     *    - 只是文件复制，不需要 KVM，manifest 坏了就在分配任何资源之前失败；
+     *    - 必须在 1b 打开磁盘之前，否则 virtio-blk 拿到的是被替换掉的旧 inode；
+     *    - 在 jail 之前，复制时的 open/rename 等系统调用不受 seccomp 白名单限制，
+     *      产生的页缓存也不记到 VM 的 cgroup 上。
+     */
+    if (config->snapshot_name) {
+        if (!config->disk_path || snapshot_load(config->snapshot_name, config->disk_path) < 0) {
+            metric_failure("snapshot", memory_size);
+            goto done;
+        }
+    }
 
     /*
      * 0. 可选：进入网络命名空间（Stage 08）。必须是第一步：

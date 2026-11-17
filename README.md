@@ -1,3 +1,47 @@
+# Stage 10：冷快照——给 sandbox 一个保存按钮
+
+根据 [Runra Stage 10 教程](https://runra.dev/zh/blog/sandbox-from-scratch-10-cold-snapshot)：关机后把 `--disk` 镜像整盘复制一份并附带 manifest，下次启动前恢复，再重新 boot。只保存 workspace（磁盘），不保存内存、寄存器、设备状态（那是 Stage 11 的 warm snapshot）。
+
+```sh
+make run-disk KERNEL=/path/to/bzImage       # 在 /mnt 里写文件，然后 exit 关机
+make snapshot-save SNAPSHOT=ws KERNEL=...   # = svmm snapshot save --name ws --disk build/disk.img ...
+make snapshot-list                          # NAME  SIZE  CREATED_AT（坏的标 invalid）
+bin/svmm snapshot validate --name ws        # manifest + 整盘校验和
+make run-snapshot SNAPSHOT=ws KERNEL=...    # = svmm run ... --disk build/disk.img --snapshot ws
+bin/svmm snapshot delete --name ws
+```
+
+快照放在当前目录的 `snapshots/<name>/{disk.img,metadata.json}`，环境变量 `SVMM_SNAPSHOT_DIR` 可以改根目录。名字只允许 `[A-Za-z0-9_-]`、1-128 个字符。退出码：0 成功、1 操作失败、2 用法错误。
+
+### 生命周期
+
+```
+save:    flock(disk, SH) ── 拿不到 = VM 在跑，拒绝
+         mkdtemp(snapshots/.tmp-<name>-XXXXXX)
+         复制 disk.img（全零块 lseek 跳过）+ 算 FNV-1a ── fsync
+         写 metadata.json ── fsync ── fsync(临时目录)
+         renameat2(临时目录 → snapshots/<name>, RENAME_NOREPLACE) ── fsync(snapshots/)
+
+run --snapshot（sandbox_run 的第 -1 步，netns / jail / KVM 之前）:
+         校验 manifest ── 失败：stage=failed_snapshot，--disk 不动，不打开 /dev/kvm
+         realpath(--disk)，flock(EX) ── 拿不到 = VM 在跑，拒绝
+         复制到同目录临时文件，边复制边算校验和 ── 对不上就删掉临时文件
+         rename(临时文件 → --disk) ── 然后 virtio_blk_open 打开的就是恢复后的镜像
+```
+
+manifest 校验（fail-closed，任何一项不对都拒绝）：必须是一个扁平 JSON 对象（值只能是字符串或整数，不能重复键、不能有尾随内容）；`manifest_version == 1`、`snapshot_type == "cold"`、`name` 等于目录名、`disk_filename == "disk.img"`、`created_at` 非空、`disk_size_bytes` 为正且等于文件大小、`disk_fnv1a64` 等于实际内容。`disk_path`、`kernel_path`、`initrd_path`、`cmdline`、`guest_mem_mb` 只是记录，恢复时不检查。
+
+### 与教程的差异
+
+- **保存和恢复都是原子的**。教程直接写进 `snapshots/<name>/`、直接覆盖 `--disk`，失败时再清理；进程被 kill 或掉电时会留下半个快照或半个磁盘。这里都写临时文件再 `rename`，并 fsync 文件和目录。
+- **内容校验和 `disk_fnv1a64`**。教程只比较大小，同样大小的位翻转检测不到。FNV-1a 只防意外损坏，不防有意篡改（能改快照目录的人本来也能改 `--disk`）。恢复时边复制边算，校验的就是写进 `--disk` 的那份字节。
+- **拒绝处理正在使用的磁盘**。`virtio_blk_open()` 对运行中的磁盘持有 `flock(LOCK_EX)`：save 拿不到 `LOCK_SH`、restore 拿不到 `LOCK_EX` 就拒绝。教程的“冷”只靠用户自觉。
+- **保持稀疏**。64 MiB 的 ext4 镜像实际只占几 MiB，教程的 read/write 复制会把它写满。
+- **`--snapshot` 跟随符号链接**，替换的是链接指向的文件，并保留它的权限位；`--disk` 不存在时直接创建。
+- **delete 只删 `disk.img` 和 `metadata.json`**，目录里有别的文件就拒绝，而不是递归删除。
+- **CLI**：`--snapshot` 没有 `--disk`、名字非法都在 CLI 层报用法错误（退出码 2）；快照根目录可以用 `SVMM_SNAPSHOT_DIR` 指定。
+- **测试**：教程是 `tests/test_snapshot.sh` 加 golden output；这里是 `tests/test_snapshot.py`，覆盖 25 种坏 manifest/坏磁盘、磁盘满、运行中的 VM、路径穿越，以及真实客户机的 写文件 → 关机 → save → 改坏 → restore → 文件回来、e2fsck 干净。
+
 # Stage 09：Jailer——cgroup、rlimit、capability 与 seccomp
 
 根据 [Runra Stage 09 教程](https://runra.dev/zh/blog/sandbox-from-scratch-09-jailer-cgroup-seccomp)：KVM 隔离的是客户机，VMM 自己仍然是宿主机上的 root 进程。客户机能驱动的代码（MMIO 分派、virtqueue 解析、串口模型）一旦有漏洞，攻击者拿到的就是这个进程的全部能力。`--jail` 在四个方向上收紧它：

@@ -22,6 +22,7 @@
  *   tap_name     PUT /network-interfaces/eth0 host_dev_name
  *   netns_name   jailer --netns
  *   jail         jailer 的 cgroup / rlimit / capability / seccomp
+ *   snapshot_name  PUT /snapshot/load（这里只恢复磁盘，客户机重新 boot）
  */
 struct sandbox_config {
     /* x86 bzImage 路径，必填。 */
@@ -53,6 +54,12 @@ struct sandbox_config {
      * 为 true 时 cli_parse() 已经用 jail_profile_finish() 填好默认值。
      */
     struct jail_profile jail;
+    /*
+     * 可选的冷快照名（Stage 10）。非 NULL 时 sandbox_run() 第一步把
+     * snapshots/<name>/disk.img 校验后复制到 disk_path，再正常 boot；
+     * 要求 disk_path 非 NULL（cli_parse() 已检查）。
+     */
+    const char *snapshot_name;
 };
 
 /* 填入默认值：256 MiB、默认命令行、无内核和 initramfs。 */

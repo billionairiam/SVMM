@@ -10,4 +10,10 @@ struct sandbox_config;
  */
 int cli_parse(int argc, char **argv, struct sandbox_config *config);
 
+/*
+ * `svmm snapshot ACTION [options]`（Stage 10），argv[1] 是 "snapshot"。
+ * 返回进程退出码：0 成功，1 操作失败，2 用法错误。
+ */
+int cli_snapshot(int argc, char **argv);
+
 #endif

@@ -2,6 +2,7 @@
 
 #include "memory.h"
 #include "sandbox.h"
+#include "snapshot.h"
 
 #include <errno.h>
 #include <getopt.h>
@@ -16,6 +17,8 @@ static void print_usage(FILE *stream)
 {
     fprintf(stream,
             "Usage: " PROGRAM " run --kernel PATH [options]\n"
+            "       " PROGRAM " snapshot list|save|validate|delete [options]\n"
+            "                (cold snapshots of --disk; see '" PROGRAM " snapshot --help')\n"
             "\n"
             "Boot a Linux bzImage in a KVM sandbox; the guest serial console is\n"
             "attached to this process's stdin/stdout.\n"
@@ -41,6 +44,8 @@ static void print_usage(FILE *stream)
             "      --memory-max MB  with --jail: memory.max (default: --mem + %u)\n"
             "      --nofile N       with --jail: RLIMIT_NOFILE (default: %u)\n"
             "      --nproc N        with --jail: RLIMIT_NPROC and pids.max (default: %u)\n"
+            "  -s, --snapshot NAME  before booting, restore cold snapshot NAME into --disk\n"
+            "                       (Stage 10); --disk is overwritten, requires --disk\n"
             "  -h, --help           show this help\n"
             "\n"
             "When stdin is a terminal, press Ctrl-A x to quit.\n",
@@ -130,6 +135,7 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
         { "memory-max", required_argument, NULL, OPT_MEMORY_MAX },
         { "nofile", required_argument, NULL, OPT_NOFILE },
         { "nproc", required_argument, NULL, OPT_NPROC },
+        { "snapshot", required_argument, NULL, 's' },
         { "help", no_argument, NULL, 'h' },
         { 0 },
     };
@@ -147,7 +153,7 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
     const char *jail_suboption = NULL;
     unsigned long long value;
     int index;
-    while ((opt = getopt_long(sub_argc, sub_argv, "+:k:i:m:c:d:t:n:jh", options, &index)) != -1) {
+    while ((opt = getopt_long(sub_argc, sub_argv, "+:k:i:m:c:d:t:n:js:h", options, &index)) != -1) {
         if (opt >= OPT_CPU_MAX && !jail_suboption)
             jail_suboption = options[index].name;
         switch (opt) {
@@ -182,6 +188,12 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
             break;
         case 'j':
             config->jail.enabled = true;
+            break;
+        case 's':
+            if (!snapshot_name_valid(optarg))
+                return usage_error("invalid snapshot name '%s' (1-%d characters of "
+                                   "[A-Za-z0-9_-])", optarg, SNAPSHOT_NAME_MAX);
+            config->snapshot_name = optarg;
             break;
         case OPT_CPU_MAX:
             /* 内核要求配额至少 1 ms；上限 1000 个 CPU。 */
@@ -223,9 +235,159 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
         return usage_error("unexpected argument '%s'", sub_argv[optind]);
     if (!config->kernel_path || !*config->kernel_path)
         return usage_error("--kernel is required");
+    if (config->snapshot_name && !config->disk_path)
+        return usage_error("--snapshot requires --disk (the snapshot is restored into it)");
     if (jail_suboption && !config->jail.enabled)
         return usage_error("--%s requires --jail", jail_suboption);
     if (config->jail.enabled)
         jail_profile_finish(&config->jail, config->mem_size_mb);
     return 0;
+}
+
+/* ---------- svmm snapshot ---------- */
+
+static void print_snapshot_usage(FILE *stream)
+{
+    fprintf(stream,
+            "Usage: " PROGRAM " snapshot ACTION [options]\n"
+            "\n"
+            "Cold snapshots (Stage 10): copy a shut-down sandbox's --disk image plus a\n"
+            "metadata.json manifest into $" SNAPSHOT_DIR_ENV "/NAME/ (default: ./"
+            SNAPSHOT_DEFAULT_DIR "/NAME/).\n"
+            "Restore with '" PROGRAM " run --disk PATH --snapshot NAME ...'.\n"
+            "\n"
+            "Actions:\n"
+            "  list                         list snapshots (stdout: NAME SIZE CREATED_AT)\n"
+            "  save --name NAME --disk PATH [--kernel PATH] [--initrd PATH] [--mem MB]\n"
+            "       [--cmdline STR]         copy PATH into snapshot NAME; refuses an\n"
+            "                               existing NAME or a disk in use by a sandbox;\n"
+            "                               the optional values are recorded only\n"
+            "  validate --name NAME         check the manifest and the disk checksum\n"
+            "  delete --name NAME           remove snapshot NAME\n"
+            "\n"
+            "NAME: 1-%d characters of [A-Za-z0-9_-].\n"
+            "Exit status: 0 success, 1 operation failed, 2 usage error.\n",
+            SNAPSHOT_NAME_MAX);
+}
+
+__attribute__((format(printf, 1, 2)))
+static int snapshot_usage_error(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    fputs("ERROR: ", stderr);
+    vfprintf(stderr, format, args);
+    va_end(args);
+    fputs("\nTry '" PROGRAM " snapshot --help' for more information.\n", stderr);
+    return 2;
+}
+
+int cli_snapshot(int argc, char **argv)
+{
+    if (argc < 3)
+        return snapshot_usage_error("missing snapshot action");
+    const char *action = argv[2];
+    if (!strcmp(action, "-h") || !strcmp(action, "--help") || !strcmp(action, "help")) {
+        print_snapshot_usage(stdout);
+        return 0;
+    }
+    enum { LIST, SAVE, VALIDATE, DELETE } kind;
+    if (!strcmp(action, "list"))
+        kind = LIST;
+    else if (!strcmp(action, "save"))
+        kind = SAVE;
+    else if (!strcmp(action, "validate"))
+        kind = VALIDATE;
+    else if (!strcmp(action, "delete"))
+        kind = DELETE;
+    else
+        return snapshot_usage_error("unknown snapshot action '%s'", action);
+
+    enum { OPT_NAME = 256 };
+    static const struct option options[] = {
+        { "name", required_argument, NULL, OPT_NAME },
+        { "disk", required_argument, NULL, 'd' },
+        { "kernel", required_argument, NULL, 'k' },
+        { "initrd", required_argument, NULL, 'i' },
+        { "mem", required_argument, NULL, 'm' },
+        { "cmdline", required_argument, NULL, 'c' },
+        { "help", no_argument, NULL, 'h' },
+        { 0 },
+    };
+    const char *name = NULL, *disk = NULL;
+    struct snapshot_info info = { 0 };
+    /* argv[2]（action）充当 getopt 的 argv[0]。 */
+    int sub_argc = argc - 2;
+    char **sub_argv = argv + 2;
+    optind = 1;
+    opterr = 0;
+    int opt, index;
+    while ((opt = getopt_long(sub_argc, sub_argv, "+:d:k:i:m:c:h", options, &index)) != -1) {
+        /* 只有 save 接受 --name 以外的选项。 */
+        if (opt != 'h' && opt != ':' && opt != '?' && kind != SAVE &&
+            !(opt == OPT_NAME && kind != LIST))
+            return snapshot_usage_error("option '%s' is not valid for 'snapshot %s'",
+                                        sub_argv[optind - 1], action);
+        switch (opt) {
+        case OPT_NAME:
+            if (!snapshot_name_valid(optarg))
+                return snapshot_usage_error("invalid snapshot name '%s' (1-%d characters of "
+                                            "[A-Za-z0-9_-])", optarg, SNAPSHOT_NAME_MAX);
+            name = optarg;
+            break;
+        case 'd':
+            if (!*optarg)
+                return snapshot_usage_error("--disk requires a non-empty path");
+            disk = optarg;
+            break;
+        case 'k':
+            info.kernel_path = optarg;
+            break;
+        case 'i':
+            info.initrd_path = optarg;
+            break;
+        case 'm':
+            if (parse_mem_mb(optarg, &info.mem_size_mb) < 0)
+                return snapshot_usage_error("--mem must be an integer from %u to %u (MiB), "
+                                            "got '%s'", GUEST_MEMORY_MIN_MB,
+                                            GUEST_MEMORY_MAX_MB, optarg);
+            break;
+        case 'c':
+            info.cmdline = optarg;
+            break;
+        case 'h':
+            print_snapshot_usage(stdout);
+            return 0;
+        case ':':
+            return snapshot_usage_error("option '%s' requires an argument",
+                                        sub_argv[optind - 1]);
+        default:
+            if (optopt)
+                return snapshot_usage_error("unknown option '-%c'", optopt);
+            return snapshot_usage_error("unknown option '%s'", sub_argv[optind - 1]);
+        }
+    }
+    if (optind < sub_argc)
+        return snapshot_usage_error("unexpected argument '%s'", sub_argv[optind]);
+    if (kind != LIST && !name)
+        return snapshot_usage_error("'snapshot %s' requires --name", action);
+    if (kind == SAVE && !disk)
+        return snapshot_usage_error("'snapshot save' requires --disk");
+
+    int ret;
+    switch (kind) {
+    case LIST:
+        ret = snapshot_list();
+        break;
+    case SAVE:
+        ret = snapshot_save(name, disk, &info);
+        break;
+    case VALIDATE:
+        ret = snapshot_validate(name);
+        break;
+    default:
+        ret = snapshot_delete(name);
+        break;
+    }
+    return ret < 0 ? 1 : 0;
 }
