@@ -23,6 +23,8 @@
  *   netns_name   jailer --netns
  *   jail         jailer 的 cgroup / rlimit / capability / seccomp
  *   snapshot_name  PUT /snapshot/load（这里只恢复磁盘，客户机重新 boot）
+ *   warm_save_name PATCH /vm Paused + PUT /snapshot/create（保存后退出）
+ *   restore_name   PUT /snapshot/load + resume_vm（热快照，不 boot）
  */
 struct sandbox_config {
     /* x86 bzImage 路径，必填。 */
@@ -60,6 +62,18 @@ struct sandbox_config {
      * 要求 disk_path 非 NULL（cli_parse() 已检查）。
      */
     const char *snapshot_name;
+    /*
+     * Stage 11：热快照名。非 NULL 时 Ctrl-A s 或 SIGUSR2 让 VMM 暂停 vCPU，把内存、
+     * KVM 状态、设备状态和磁盘存成 snapshots/<name>/ 后退出；保存失败时客户机继续
+     * 运行。与 jail 互斥（seccomp 不允许运行阶段创建文件，cli_parse() 已检查）。
+     */
+    const char *warm_save_name;
+    /*
+     * Stage 11：从热快照 <name> 恢复，代替 boot。kernel/initrd/mem/cmdline 都来自
+     * 快照，cli_parse() 不允许同时给出；disk_path / tap_name 必须和快照里的设备
+     * 一一对应，磁盘先被快照里的副本覆盖。
+     */
+    const char *restore_name;
 };
 
 /* 填入默认值：256 MiB、默认命令行、无内核和 initramfs。 */

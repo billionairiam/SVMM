@@ -1,5 +1,8 @@
 #include "snapshot.h"
 
+#include "memory.h"
+#include "vmstate.h"
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -11,12 +14,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #define DISK_FILENAME "disk.img"
 #define METADATA_FILENAME "metadata.json"
+#define MEMORY_FILENAME "memory.bin"
+#define VMSTATE_FILENAME "vmstate.bin"
+#define PAGE_SIZE_4K 4096u
+/* vmstate.bin 实际只有几十 KiB；上限防止把一个巨大的文件读进内存。 */
+#define VMSTATE_FILE_MAX (1u << 20)
 #define COPY_BUF_SIZE (1u << 20)
 /* manifest 只有十来个短字段；上限防止把一个巨大的文件读进内存。 */
 #define METADATA_MAX (64u * 1024)
@@ -450,10 +459,26 @@ static bool manifest_int(const struct manifest *m, const char *key, long long *o
 
 /* 校验通过后，后续步骤需要的东西。 */
 struct manifest_summary {
+    bool warm;
+    bool has_disk;
+    bool has_net;
     uint64_t disk_size;
     uint64_t disk_hash;
     char created_at[64];
+    /* 以下只对热快照有意义 */
+    size_t mem_mb;
+    uint64_t memory_hash;
+    uint64_t vmstate_size;
+    uint64_t vmstate_hash;
 };
+
+static bool parse_hex64(const char *s, uint64_t *out)
+{
+    if (!s || strlen(s) != 16 || strspn(s, "0123456789abcdef") != 16)
+        return false;
+    *out = strtoull(s, NULL, 16);
+    return true;
+}
 
 static int read_metadata(const char *path, char *buf, size_t *len)
 {
@@ -545,22 +570,83 @@ static int manifest_check(const char *name, bool quiet, struct manifest_summary 
         REJECT("unsupported manifest_version %lld (expected %d)", version,
                SNAPSHOT_MANIFEST_VERSION);
     const char *s = manifest_string(m, "snapshot_type");
-    if (!s || strcmp(s, "cold"))
-        REJECT("snapshot_type must be \"cold\"");
+    if (!s || (strcmp(s, "cold") && strcmp(s, "warm")))
+        REJECT("snapshot_type must be \"cold\" or \"warm\"");
+    out->warm = !strcmp(s, "warm");
     s = manifest_string(m, "name");
     if (!s || strcmp(s, name))
         REJECT("name in manifest does not match the directory name");
-    s = manifest_string(m, "disk_filename");
-    if (!s || strcmp(s, DISK_FILENAME))
-        REJECT("disk_filename must be \"" DISK_FILENAME "\"");
     s = manifest_string(m, "created_at");
     if (!s || !*s || strlen(s) >= sizeof(out->created_at))
         REJECT("created_at missing or malformed");
     snprintf(out->created_at, sizeof(out->created_at), "%s", s);
-    s = manifest_string(m, "disk_fnv1a64");
-    if (!s || strlen(s) != 16 || strspn(s, "0123456789abcdef") != 16)
+
+    out->has_disk = true;
+    out->has_net = false;
+    if (out->warm) {
+        long long mem_mb, msize, vsize, disk, net;
+        if (!manifest_int(m, "guest_mem_mb", &mem_mb) || mem_mb < GUEST_MEMORY_MIN_MB ||
+            mem_mb > GUEST_MEMORY_MAX_MB)
+            REJECT("guest_mem_mb must be %u-%u", GUEST_MEMORY_MIN_MB, GUEST_MEMORY_MAX_MB);
+        out->mem_mb = (size_t)mem_mb;
+        s = manifest_string(m, "memory_filename");
+        if (!s || strcmp(s, MEMORY_FILENAME))
+            REJECT("memory_filename must be \"" MEMORY_FILENAME "\"");
+        if (!manifest_int(m, "memory_size_bytes", &msize) || msize != mem_mb * (long long)MIB)
+            REJECT("memory_size_bytes must equal guest_mem_mb MiB");
+        if (!parse_hex64(manifest_string(m, "memory_hash"), &out->memory_hash))
+            REJECT("memory_hash must be 16 lowercase hex digits");
+        s = manifest_string(m, "vmstate_filename");
+        if (!s || strcmp(s, VMSTATE_FILENAME))
+            REJECT("vmstate_filename must be \"" VMSTATE_FILENAME "\"");
+        if (!manifest_int(m, "vmstate_size_bytes", &vsize) || vsize <= 0 ||
+            vsize > (long long)VMSTATE_FILE_MAX)
+            REJECT("vmstate_size_bytes must be 1-%u", VMSTATE_FILE_MAX);
+        out->vmstate_size = (uint64_t)vsize;
+        if (!parse_hex64(manifest_string(m, "vmstate_fnv1a64"), &out->vmstate_hash))
+            REJECT("vmstate_fnv1a64 must be 16 lowercase hex digits");
+        if (!manifest_int(m, "disk", &disk) || (disk != 0 && disk != 1) ||
+            !manifest_int(m, "net", &net) || (net != 0 && net != 1))
+            REJECT("disk and net must be 0 or 1");
+        out->has_disk = disk;
+        out->has_net = net;
+        const char *files[] = { MEMORY_FILENAME, VMSTATE_FILENAME };
+        const long long sizes[] = { msize, vsize };
+        for (int i = 0; i < 2; i++) {
+            if (snap_path(path, name, files[i]) < 0)
+                goto out;
+            if (lstat(path, &st) < 0)
+                REJECT("%s: %s", path, strerror(errno));
+            if (!S_ISREG(st.st_mode))
+                REJECT("%s is not a regular file", path);
+            if ((long long)st.st_size != sizes[i])
+                REJECT("%s is %lld bytes, manifest says %lld", files[i],
+                       (long long)st.st_size, sizes[i]);
+        }
+        if (!out->has_disk) {
+            if (snap_path(path, name, DISK_FILENAME) < 0)
+                goto out;
+            if (lstat(path, &st) == 0 || errno != ENOENT)
+                REJECT("manifest says disk 0 but %s exists", DISK_FILENAME);
+            ret = 0;
+            goto out;
+        }
+    } else {
+        /* 反过来：冷快照里出现热快照的文件，说明 manifest 被改过或者拼错了目录。 */
+        const char *files[] = { MEMORY_FILENAME, VMSTATE_FILENAME };
+        for (int i = 0; i < 2; i++) {
+            if (snap_path(path, name, files[i]) < 0)
+                goto out;
+            if (lstat(path, &st) == 0 || errno != ENOENT)
+                REJECT("cold snapshot must not contain %s", files[i]);
+        }
+    }
+
+    s = manifest_string(m, "disk_filename");
+    if (!s || strcmp(s, DISK_FILENAME))
+        REJECT("disk_filename must be \"" DISK_FILENAME "\"");
+    if (!parse_hex64(manifest_string(m, "disk_fnv1a64"), &out->disk_hash))
         REJECT("disk_fnv1a64 must be 16 lowercase hex digits");
-    out->disk_hash = strtoull(s, NULL, 16);
 
     long long size;
     if (!manifest_int(m, "disk_size_bytes", &size) || size <= 0)
@@ -769,17 +855,46 @@ static int hash_snapshot_disk(const char *name, int dst, const char *dst_name,
     return 0;
 }
 
+static int check_vmstate_file(const char *name, const struct manifest_summary *sum,
+                              uint8_t **out);
+static int check_memory_file(const char *name, const struct manifest_summary *sum);
+
 int snapshot_validate(const char *name)
 {
     if (check_name(name) < 0)
         return -1;
     struct manifest_summary sum;
-    if (manifest_check(name, false, &sum) < 0 || hash_snapshot_disk(name, -1, NULL, &sum) < 0)
+    if (manifest_check(name, false, &sum) < 0 ||
+        (sum.has_disk && hash_snapshot_disk(name, -1, NULL, &sum) < 0))
         return -1;
+    if (sum.warm) {
+        uint8_t *vmstate = NULL;
+        struct vmstate *decoded = calloc(1, sizeof(*decoded));
+        int bad = !decoded || check_vmstate_file(name, &sum, &vmstate) < 0 ||
+                  vmstate_decode(decoded, vmstate, sum.vmstate_size) < 0 ||
+                  check_memory_file(name, &sum) < 0;
+        if (!bad && decoded->devices != ((sum.has_disk ? VMSTATE_DEV_BLK : 0) |
+                                         (sum.has_net ? VMSTATE_DEV_NET : 0))) {
+            fprintf(stderr, "ERROR: snapshot '%s': devices in %s do not match the manifest\n",
+                    name, VMSTATE_FILENAME);
+            bad = 1;
+        }
+        free(decoded);
+        free(vmstate);
+        if (bad)
+            return -1;
+        fprintf(stderr, "INFO: snapshot '%s': manifest valid (warm, %zu MiB memory, %s, "
+                "created %s)\n", name, sum.mem_mb, sum.has_disk ? "with disk" : "no disk",
+                sum.created_at);
+        return 0;
+    }
     fprintf(stderr, "INFO: snapshot '%s': manifest valid (%llu bytes, created %s)\n", name,
             (unsigned long long)sum.disk_size, sum.created_at);
     return 0;
 }
+
+static int restore_disk(const char *name, const struct manifest_summary *sum,
+                        const char *disk_path);
 
 int snapshot_load(const char *name, const char *disk_path)
 {
@@ -793,6 +908,17 @@ int snapshot_load(const char *name, const char *disk_path)
                 "%s was not modified\n", name, disk_path);
         return -1;
     }
+    if (sum.warm) {
+        fprintf(stderr, "ERROR: snapshot '%s' is a warm snapshot; resume it with "
+                "`svmm run --restore %s`\n", name, name);
+        return -1;
+    }
+    return restore_disk(name, &sum, disk_path);
+}
+
+static int restore_disk(const char *name, const struct manifest_summary *sum,
+                        const char *disk_path)
+{
 
     /*
      * 符号链接：替换的是它指向的文件，而不是链接本身。目标不存在时就在
@@ -837,7 +963,7 @@ int snapshot_load(const char *name, const char *disk_path)
         goto out;
     }
     /* 边复制边算校验和：读到的正是要恢复的字节，校验之后再被换掉也影响不到。 */
-    if (hash_snapshot_disk(name, tmp_fd, tmp, &sum) < 0)
+    if (hash_snapshot_disk(name, tmp_fd, tmp, sum) < 0)
         goto out;
     if (rename(tmp, target) < 0) {
         fprintf(stderr, "ERROR: snapshot: rename %s -> %s: %s\n", tmp, target, strerror(errno));
@@ -848,7 +974,7 @@ int snapshot_load(const char *name, const char *disk_path)
     if (fsync_dir(dir) < 0)
         goto out;
     fprintf(stderr, "INFO: snapshot: workspace restored from snapshot '%s' (%llu bytes, "
-            "created %s)\n", name, (unsigned long long)sum.disk_size, sum.created_at);
+            "created %s)\n", name, (unsigned long long)sum->disk_size, sum->created_at);
     ret = 0;
 out:
     if (tmp_fd >= 0) {
@@ -911,8 +1037,9 @@ int snapshot_list(void)
         /* list 只做结构检查，不读全盘算校验和；完整检查用 validate。 */
         struct manifest_summary sum;
         if (manifest_check(names[i], true, &sum) == 0)
-            printf("%s\t%llu\t%s\n", names[i], (unsigned long long)sum.disk_size,
-                   sum.created_at);
+            printf("%s\t%llu\t%s\t%s\n", names[i],
+                   (unsigned long long)(sum.has_disk ? sum.disk_size : 0), sum.created_at,
+                   sum.warm ? "warm" : "cold");
         else
             printf("%s\t-\tinvalid\n", names[i]);
     }
@@ -938,7 +1065,7 @@ int snapshot_delete(const char *name)
                 snapshot_root());
         return -1;
     }
-    /* 只删自己认识的两个文件：多出来的东西可能是用户放的，不替他决定。 */
+    /* 只删自己认识的文件：多出来的东西可能是用户放的，不替他决定。 */
     DIR *d = opendir(dir);
     if (!d) {
         fprintf(stderr, "ERROR: snapshot: open %s: %s\n", dir, strerror(errno));
@@ -947,7 +1074,8 @@ int snapshot_delete(const char *name)
     struct dirent *e;
     while ((e = readdir(d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") ||
-            !strcmp(e->d_name, DISK_FILENAME) || !strcmp(e->d_name, METADATA_FILENAME))
+            !strcmp(e->d_name, DISK_FILENAME) || !strcmp(e->d_name, METADATA_FILENAME) ||
+            !strcmp(e->d_name, MEMORY_FILENAME) || !strcmp(e->d_name, VMSTATE_FILENAME))
             continue;
         fprintf(stderr, "ERROR: snapshot: %s contains unexpected entry '%s'; refusing to "
                 "delete\n", dir, e->d_name);
@@ -955,8 +1083,10 @@ int snapshot_delete(const char *name)
         return -1;
     }
     closedir(d);
-    const char *files[] = { METADATA_FILENAME, DISK_FILENAME };
-    for (int i = 0; i < 2; i++) {
+    /* metadata.json 先删：中途失败时剩下的目录不会再被当成一个完整快照。 */
+    const char *files[] = { METADATA_FILENAME, DISK_FILENAME, MEMORY_FILENAME,
+                            VMSTATE_FILENAME };
+    for (int i = 0; i < 4; i++) {
         char path[SNAP_PATH_MAX];
         if (snap_path(path, name, files[i]) < 0)
             return -1;
@@ -971,4 +1101,469 @@ int snapshot_delete(const char *name)
     }
     fprintf(stderr, "INFO: snapshot '%s' deleted\n", name);
     return 0;
+}
+
+/* ---------- Stage 11：热快照 ---------- */
+
+/*
+ * 客户机内存的校验和。逐字节的 FNV-1a 对几百 MiB 太慢，这里按 64 位字做同样的
+ * “异或再乘”，并且只算非零页（先混入页号，页号不同的同样内容也能区分开）：
+ * 全零页在 memory.bin 里是洞，校验时可以直接跳过，保存时和校验时跳过的是同一批页。
+ * 某个非零页被改成全零、或者洞里多出数据，都会改变参与计算的页集合，校验和就对不上。
+ */
+static uint64_t hash_page(uint64_t hash, uint64_t index, const uint8_t *page)
+{
+    hash = (hash ^ index) * FNV1A64_PRIME;
+    for (size_t i = 0; i < PAGE_SIZE_4K; i += 8) {
+        uint64_t word;
+        memcpy(&word, page + i, sizeof(word));
+        hash = (hash ^ word) * FNV1A64_PRIME;
+    }
+    return hash;
+}
+
+static bool page_is_zero(const uint8_t *page)
+{
+    return all_zero(page, PAGE_SIZE_4K);
+}
+
+/*
+ * 按 fd 的数据区段（SEEK_DATA / SEEK_HOLE）遍历 mem 的非零页。文件系统的区段可能
+ * 比 4 KiB 粗，区段里的零页照样跳过，所以结果只取决于内容。
+ */
+static int hash_mapped_memory(int fd, const uint8_t *mem, size_t size, uint64_t *out)
+{
+    uint64_t hash = FNV1A64_OFFSET;
+    off_t pos = 0;
+    size_t next_page = 0;
+    while ((size_t)pos < size) {
+        off_t data = lseek(fd, pos, SEEK_DATA);
+        if (data < 0) {
+            if (errno == ENXIO) /* 后面全是洞 */
+                break;
+            fprintf(stderr, "ERROR: snapshot: seek %s: %s\n", MEMORY_FILENAME, strerror(errno));
+            return -1;
+        }
+        off_t hole = lseek(fd, data, SEEK_HOLE);
+        if (hole < 0) {
+            fprintf(stderr, "ERROR: snapshot: seek %s: %s\n", MEMORY_FILENAME, strerror(errno));
+            return -1;
+        }
+        if ((size_t)hole > size)
+            hole = (off_t)size;
+        size_t first = (size_t)data / PAGE_SIZE_4K;
+        size_t last = ((size_t)hole + PAGE_SIZE_4K - 1) / PAGE_SIZE_4K;
+        for (size_t p = first > next_page ? first : next_page; p < last; p++) {
+            const uint8_t *page = mem + p * PAGE_SIZE_4K;
+            if (!page_is_zero(page))
+                hash = hash_page(hash, p, page);
+        }
+        if (last > next_page)
+            next_page = last;
+        pos = hole;
+    }
+    *out = hash;
+    return 0;
+}
+
+static int check_memory_hash(const char *name, uint64_t expected, uint64_t got)
+{
+    if (expected == got)
+        return 0;
+    fprintf(stderr, "ERROR: snapshot '%s': %s content does not match memory_hash (expected "
+            "%016llx, got %016llx)\n", name, MEMORY_FILENAME, (unsigned long long)expected,
+            (unsigned long long)got);
+    return -1;
+}
+
+static int open_snapshot_file(const char *name, const char *file, uint64_t size)
+{
+    char path[SNAP_PATH_MAX];
+    if (snap_path(path, name, file) < 0)
+        return -1;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) < 0) {
+        fprintf(stderr, "ERROR: snapshot: open %s: %s\n", path, strerror(errno));
+        if (fd >= 0)
+            close(fd);
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode) || (uint64_t)st.st_size != size) {
+        fprintf(stderr, "ERROR: snapshot '%s': %s changed since the manifest check\n", name,
+                file);
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* validate 用：把 memory.bin 只读映射进来算校验和。 */
+static int check_memory_file(const char *name, const struct manifest_summary *sum)
+{
+    size_t size = sum->mem_mb * MIB;
+    int fd = open_snapshot_file(name, MEMORY_FILENAME, size);
+    if (fd < 0)
+        return -1;
+    void *mem = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    int ret = -1;
+    uint64_t hash;
+    if (mem == MAP_FAILED)
+        fprintf(stderr, "ERROR: snapshot: mmap %s: %s\n", MEMORY_FILENAME, strerror(errno));
+    else if (hash_mapped_memory(fd, mem, size, &hash) == 0)
+        ret = check_memory_hash(name, sum->memory_hash, hash);
+    if (mem != MAP_FAILED)
+        munmap(mem, size);
+    close(fd);
+    return ret;
+}
+
+/* 读入整个 vmstate.bin 并核对校验和；成功时 *out 由调用者 free()。 */
+static int check_vmstate_file(const char *name, const struct manifest_summary *sum,
+                              uint8_t **out)
+{
+    int fd = open_snapshot_file(name, VMSTATE_FILENAME, sum->vmstate_size);
+    if (fd < 0)
+        return -1;
+    uint8_t *buf = malloc(sum->vmstate_size);
+    size_t used = 0;
+    int ret = -1;
+    if (!buf) {
+        fprintf(stderr, "ERROR: snapshot: out of memory\n");
+        goto out;
+    }
+    while (used < sum->vmstate_size) {
+        ssize_t n = read(fd, buf + used, sum->vmstate_size - used);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0) {
+            fprintf(stderr, "ERROR: snapshot: read %s: %s\n", VMSTATE_FILENAME,
+                    n < 0 ? strerror(errno) : "unexpected end of file");
+            goto out;
+        }
+        used += (size_t)n;
+    }
+    uint64_t hash = fnv1a64(FNV1A64_OFFSET, buf, used);
+    if (hash != sum->vmstate_hash) {
+        fprintf(stderr, "ERROR: snapshot '%s': %s content does not match vmstate_fnv1a64 "
+                "(expected %016llx, got %016llx)\n", name, VMSTATE_FILENAME,
+                (unsigned long long)sum->vmstate_hash, (unsigned long long)hash);
+        goto out;
+    }
+    *out = buf;
+    buf = NULL;
+    ret = 0;
+out:
+    free(buf);
+    close(fd);
+    return ret;
+}
+
+/*
+ * memory.bin：全零页不写（留成洞），连续的非零页合成一次 pwrite。
+ * 保存时 vCPU 已暂停、RX 线程已停，没有人在改客户机内存。
+ */
+static int write_memory_file(int fd, const char *path, const uint8_t *mem, size_t size,
+                             uint64_t *hash_out, size_t *nonzero_out)
+{
+    uint64_t hash = FNV1A64_OFFSET;
+    size_t pages = size / PAGE_SIZE_4K, nonzero = 0;
+    for (size_t p = 0; p < pages;) {
+        if (page_is_zero(mem + p * PAGE_SIZE_4K)) {
+            p++;
+            continue;
+        }
+        size_t run = p;
+        while (run < pages && !page_is_zero(mem + run * PAGE_SIZE_4K)) {
+            hash = hash_page(hash, run, mem + run * PAGE_SIZE_4K);
+            run++;
+        }
+        const uint8_t *buf = mem + p * PAGE_SIZE_4K;
+        size_t len = (run - p) * PAGE_SIZE_4K;
+        off_t off = (off_t)(p * PAGE_SIZE_4K);
+        while (len) {
+            ssize_t n = pwrite(fd, buf, len, off);
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n < 0) {
+                fprintf(stderr, "ERROR: snapshot: write %s: %s\n", path, strerror(errno));
+                return -1;
+            }
+            buf += n;
+            off += n;
+            len -= (size_t)n;
+        }
+        nonzero += run - p;
+        p = run;
+    }
+    if (ftruncate(fd, (off_t)size) < 0 || fsync(fd) < 0) {
+        fprintf(stderr, "ERROR: snapshot: finish %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    *hash_out = hash;
+    *nonzero_out = nonzero;
+    return 0;
+}
+
+static int write_file(const char *path, const uint8_t *buf, size_t len)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0 || write_all(fd, buf, len) < 0 || fsync(fd) < 0) {
+        fprintf(stderr, "ERROR: snapshot: write %s: %s\n", path, strerror(errno));
+        if (fd >= 0)
+            close(fd);
+        return -1;
+    }
+    return close(fd);
+}
+
+struct warm_meta {
+    size_t mem_mb;
+    uint64_t memory_hash;
+    size_t vmstate_size;
+    uint64_t vmstate_hash;
+    unsigned devices;
+    const char *disk_path;
+    uint64_t disk_size;
+    uint64_t disk_hash;
+};
+
+static int write_warm_metadata(const char *path, const char *name, const struct warm_meta *w,
+                               const struct snapshot_info *info)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    FILE *fp = fd >= 0 ? fdopen(fd, "w") : NULL;
+    if (!fp) {
+        fprintf(stderr, "ERROR: snapshot: create %s: %s\n", path, strerror(errno));
+        if (fd >= 0)
+            close(fd);
+        return -1;
+    }
+    char created[32];
+    time_t now = time(NULL);
+    struct tm tm;
+    strftime(created, sizeof(created), "%Y-%m-%dT%H:%M:%SZ", gmtime_r(&now, &tm));
+    bool disk = w->devices & VMSTATE_DEV_BLK;
+
+    fprintf(fp, "{\n  \"manifest_version\": %d,\n  \"snapshot_type\": \"warm\",\n"
+            "  \"name\": ", SNAPSHOT_MANIFEST_VERSION);
+    write_json_string(fp, name);
+    fprintf(fp, ",\n  \"created_at\": \"%s\",\n  \"guest_mem_mb\": %zu,\n"
+            "  \"memory_filename\": \"" MEMORY_FILENAME "\",\n"
+            "  \"memory_size_bytes\": %llu,\n  \"memory_hash\": \"%016llx\",\n"
+            "  \"vmstate_filename\": \"" VMSTATE_FILENAME "\",\n"
+            "  \"vmstate_size_bytes\": %zu,\n  \"vmstate_fnv1a64\": \"%016llx\",\n"
+            "  \"disk\": %d,\n  \"net\": %d",
+            created, w->mem_mb, (unsigned long long)w->mem_mb * MIB,
+            (unsigned long long)w->memory_hash, w->vmstate_size,
+            (unsigned long long)w->vmstate_hash, disk, !!(w->devices & VMSTATE_DEV_NET));
+    if (disk) {
+        fprintf(fp, ",\n  \"disk_filename\": \"" DISK_FILENAME "\",\n  \"disk_path\": ");
+        write_json_string(fp, w->disk_path);
+        fprintf(fp, ",\n  \"disk_size_bytes\": %llu,\n  \"disk_fnv1a64\": \"%016llx\"",
+                (unsigned long long)w->disk_size, (unsigned long long)w->disk_hash);
+    }
+    const char *keys[] = { "kernel_path", "initrd_path", "cmdline" };
+    const char *values[] = { info->kernel_path, info->initrd_path, info->cmdline };
+    for (int i = 0; i < 3; i++) {
+        if (!values[i])
+            continue;
+        fprintf(fp, ",\n  \"%s\": ", keys[i]);
+        write_json_string(fp, values[i]);
+    }
+    fputs("\n}\n", fp);
+    int err = fflush(fp) || fsync(fd) < 0 ? errno : 0;
+    if (fclose(fp) && !err)
+        err = errno;
+    if (err) {
+        fprintf(stderr, "ERROR: snapshot: write %s: %s\n", path, strerror(err));
+        return -1;
+    }
+    return 0;
+}
+
+int snapshot_warm_check_new(const char *name)
+{
+    if (check_name(name) < 0)
+        return -1;
+    char dir[SNAP_PATH_MAX];
+    struct stat st;
+    if (snap_path(dir, name, NULL) < 0)
+        return -1;
+    if (lstat(dir, &st) == 0 || errno != ENOENT) {
+        fprintf(stderr, "ERROR: snapshot: snapshot '%s' already exists in %s/; delete it "
+                "first or choose another name\n", name, snapshot_root());
+        return -1;
+    }
+    return 0;
+}
+
+int snapshot_warm_save(const char *name, const struct snapshot_warm_source *src)
+{
+    const char *root = snapshot_root();
+    char final_dir[SNAP_PATH_MAX], tmp_dir[SNAP_PATH_MAX];
+    enum { F_MEM, F_VMSTATE, F_DISK, F_META, F_COUNT };
+    const char *names[F_COUNT] = { MEMORY_FILENAME, VMSTATE_FILENAME, DISK_FILENAME,
+                                   METADATA_FILENAME };
+    char files[F_COUNT][SNAP_PATH_MAX + 16];
+    bool made_tmp = false;
+    int fd = -1;
+    int ret = -1;
+
+    if (snapshot_warm_check_new(name) < 0 || snap_path(final_dir, name, NULL) < 0)
+        return -1;
+    if (mkdir(root, 0755) < 0 && errno != EEXIST) {
+        fprintf(stderr, "ERROR: snapshot: create %s: %s\n", root, strerror(errno));
+        return -1;
+    }
+    int n = snprintf(tmp_dir, sizeof(tmp_dir), "%s/.tmp-%s-XXXXXX", root, name);
+    if (n < 0 || (size_t)n + sizeof("/" METADATA_FILENAME) > sizeof(tmp_dir)) {
+        fprintf(stderr, "ERROR: snapshot: path under %s is too long\n", root);
+        return -1;
+    }
+    if (!mkdtemp(tmp_dir)) {
+        fprintf(stderr, "ERROR: snapshot: create temporary directory in %s: %s\n", root,
+                strerror(errno));
+        return -1;
+    }
+    made_tmp = true;
+    for (int i = 0; i < F_COUNT; i++)
+        snprintf(files[i], sizeof(files[i]), "%s/%s", tmp_dir, names[i]);
+
+    struct warm_meta w = {
+        .mem_mb = src->memory_size / MIB,
+        .vmstate_size = src->vmstate_len,
+        .vmstate_hash = fnv1a64(FNV1A64_OFFSET, src->vmstate, src->vmstate_len),
+        .devices = src->devices,
+        .disk_path = src->disk_path,
+    };
+    size_t nonzero = 0;
+    fd = open(files[F_MEM], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "ERROR: snapshot: create %s: %s\n", files[F_MEM], strerror(errno));
+        goto out;
+    }
+    if (write_memory_file(fd, files[F_MEM], src->memory, src->memory_size, &w.memory_hash,
+                          &nonzero) < 0)
+        goto out;
+    close(fd);
+    fd = -1;
+    if (write_file(files[F_VMSTATE], src->vmstate, src->vmstate_len) < 0)
+        goto out;
+
+    if (src->devices & VMSTATE_DEV_BLK) {
+        /*
+         * 磁盘由这个进程以 LOCK_EX 打开着（virtio-blk 用 pread/pwrite，不动文件偏移），
+         * 所以直接从它的 fd 复制，而不是再按路径打开一次。
+         */
+        fd = open(files[F_DISK], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (fd < 0 || lseek(src->disk_fd, 0, SEEK_SET) < 0) {
+            fprintf(stderr, "ERROR: snapshot: copy disk: %s\n", strerror(errno));
+            goto out;
+        }
+        if (copy_fd(src->disk_fd, src->disk_path, fd, files[F_DISK], &w.disk_hash,
+                    &w.disk_size) < 0)
+            goto out;
+        close(fd);
+        fd = -1;
+    }
+    if (write_warm_metadata(files[F_META], name, &w, &src->info) < 0 || fsync_dir(tmp_dir) < 0)
+        goto out;
+    if (renameat2(AT_FDCWD, tmp_dir, AT_FDCWD, final_dir, RENAME_NOREPLACE) < 0) {
+        fprintf(stderr, "ERROR: snapshot: rename %s -> %s: %s\n", tmp_dir, final_dir,
+                strerror(errno));
+        goto out;
+    }
+    made_tmp = false;
+    if (fsync_dir(root) < 0)
+        goto out;
+    fprintf(stderr, "INFO: snapshot: memory %zu MiB (%zu MiB non-zero), vmstate %zu bytes",
+            w.mem_mb, nonzero * PAGE_SIZE_4K / MIB, w.vmstate_size);
+    if (src->devices & VMSTATE_DEV_BLK)
+        fprintf(stderr, ", disk %llu bytes", (unsigned long long)w.disk_size);
+    fprintf(stderr, "\n");
+    ret = 0;
+out:
+    if (fd >= 0)
+        close(fd);
+    if (made_tmp) {
+        for (int i = 0; i < F_COUNT; i++)
+            unlink(files[i]);
+        rmdir(tmp_dir);
+    }
+    return ret;
+}
+
+int snapshot_warm_load(const char *name, const char *disk_path, int has_net,
+                       struct snapshot_warm_image *out)
+{
+    *out = (struct snapshot_warm_image){ .memory_fd = -1 };
+    if (check_name(name) < 0)
+        return -1;
+    struct manifest_summary sum;
+    if (manifest_check(name, false, &sum) < 0)
+        return -1;
+    if (!sum.warm) {
+        fprintf(stderr, "ERROR: snapshot '%s' is a cold snapshot (disk only); boot from it "
+                "with `svmm run --kernel ... --disk PATH --snapshot %s`\n", name, name);
+        return -1;
+    }
+    const char *missing = NULL, *extra = NULL;
+    if (sum.has_disk && !disk_path)
+        missing = "a virtio-blk disk; pass --disk PATH (it will be replaced by the "
+                  "snapshot's disk.img)";
+    else if (!sum.has_disk && disk_path)
+        extra = "virtio-blk disk; remove --disk";
+    else if (sum.has_net && !has_net)
+        missing = "a virtio-net device; pass --tap IFNAME";
+    else if (!sum.has_net && has_net)
+        extra = "virtio-net device; remove --tap";
+    if (missing || extra) {
+        fprintf(stderr, "ERROR: snapshot '%s' has %s%s\n", name, missing ? "" : "no ",
+                missing ? missing : extra);
+        return -1;
+    }
+    if (check_vmstate_file(name, &sum, &out->vmstate) < 0)
+        return -1;
+    out->vmstate_len = sum.vmstate_size;
+    out->memory_fd = open_snapshot_file(name, MEMORY_FILENAME, sum.mem_mb * MIB);
+    if (out->memory_fd < 0) {
+        snapshot_warm_release(out);
+        return -1;
+    }
+    out->mem_size_mb = sum.mem_mb;
+    out->memory_hash = sum.memory_hash;
+    out->devices = (sum.has_disk ? VMSTATE_DEV_BLK : 0) | (sum.has_net ? VMSTATE_DEV_NET : 0);
+    out->disk_size = sum.disk_size;
+    out->disk_hash = sum.disk_hash;
+    snprintf(out->created_at, sizeof(out->created_at), "%s", sum.created_at);
+    return 0;
+}
+
+int snapshot_warm_verify_memory(const struct snapshot_warm_image *img, const uint8_t *memory,
+                                size_t size)
+{
+    uint64_t hash;
+    if (hash_mapped_memory(img->memory_fd, memory, size, &hash) < 0)
+        return -1;
+    return check_memory_hash("restore", img->memory_hash, hash);
+}
+
+int snapshot_warm_restore_disk(const char *name, const struct snapshot_warm_image *img,
+                               const char *disk_path)
+{
+    struct manifest_summary sum = {
+        .has_disk = true, .disk_size = img->disk_size, .disk_hash = img->disk_hash,
+    };
+    snprintf(sum.created_at, sizeof(sum.created_at), "%s", img->created_at);
+    return restore_disk(name, &sum, disk_path);
+}
+
+void snapshot_warm_release(struct snapshot_warm_image *img)
+{
+    if (img->memory_fd >= 0)
+        close(img->memory_fd);
+    img->memory_fd = -1;
+    free(img->vmstate);
+    img->vmstate = NULL;
 }

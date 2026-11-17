@@ -153,4 +153,33 @@ int serial_handle_in(struct serial *serial, uint16_t port, uint8_t *value);
 int serial_receive(struct serial *serial, const uint8_t *data, size_t size);
 void serial_close_input(struct serial *serial);
 
+/*
+ * Stage 11 热快照：客户机可见的串口状态。接收队列按“从队头开始”的顺序展开，
+ * 恢复后 rx_head 从 0 开始。定长结构，原样写进 vmstate.bin。
+ */
+struct serial_state {
+    uint8_t ier, lcr, mcr, fcr, scr, dll, dlm;
+    uint8_t thre_pending;
+    uint8_t irq_level;
+    uint8_t pad[3];
+    uint32_t rx_count;
+    uint8_t rx[SERIAL_RX_CAPACITY];
+};
+
+/*
+ * 保存时要让串口和中断控制器的状态出自同一时刻：控制台线程在两次读取之间投递
+ * 一个字节，就会出现“串口说有数据、IRQ 4 却没拉高”的快照。所以由调用者
+ * serial_lock()，依次读串口和 KVM 状态，再 serial_unlock()；serial_save() 要求
+ * 已经持锁。
+ */
+void serial_lock(struct serial *serial);
+void serial_unlock(struct serial *serial);
+void serial_save(const struct serial *serial, struct serial_state *state);
+
+/*
+ * 在 serial_init() 之后、控制台线程启动之前恢复。不调用 set_irq：中断线的电平
+ * 已经随 KVM 中断控制器的状态一起恢复了。rx_count 超出容量返回 -1。
+ */
+int serial_restore(struct serial *serial, const struct serial_state *state);
+
 #endif

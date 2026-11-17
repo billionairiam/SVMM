@@ -17,7 +17,7 @@
  *
  * in_fd 是终端时切到 raw 模式：回显、行编辑、Ctrl-C 等全部交给客户机的
  * tty 层处理。raw 模式下宿主机收不到 SIGINT，所以用 Ctrl-A x 退出 VMM，
- * Ctrl-A Ctrl-A 发送一个字面的 Ctrl-A。in_fd 是管道或文件时原样转发，
+ * Ctrl-A s 保存热快照（Stage 11），Ctrl-A Ctrl-A 发送一个字面的 Ctrl-A。in_fd 是管道或文件时原样转发，
  * 读到 EOF 后线程结束，客户机继续运行。
  */
 
@@ -45,6 +45,8 @@ static void *console_thread(void *opaque)
     /* 收到 Ctrl-A x，处理完本批字节后退出循环。 */
     bool quit = false;
     uint8_t input[256];
+    /* 本批字节里出现了 Ctrl-A s。 */
+    bool snapshot;
     /* 去掉转义序列后要送给客户机的字节，不会比 input 多。 */
     uint8_t output[sizeof(input)];
     while (!quit) {
@@ -69,10 +71,12 @@ static void *console_thread(void *opaque)
          * 过滤转义序列。只有终端（raw 模式）才解释 Ctrl-A，管道和文件
          * 输入原样转发，这样二进制数据里的 0x01 不会被吞掉。
          *   Ctrl-A x / X     退出 VMM，同一批中其后的字节被丢弃
+         *   Ctrl-A s / S     请求保存热快照（Stage 11），本批其余字节照常转发
          *   Ctrl-A Ctrl-A    向客户机发送一个 Ctrl-A
          *   Ctrl-A 其他字符  两个字节都丢弃
          */
         size_t count = 0;
+        snapshot = false;
         for (ssize_t i = 0; i < n && !quit; ++i) {
             uint8_t byte = input[i];
             if (!console->raw) {
@@ -81,6 +85,8 @@ static void *console_thread(void *opaque)
                 escape = false;
                 if (byte == 'x' || byte == 'X')
                     quit = true;
+                else if (byte == 's' || byte == 'S')
+                    snapshot = true;
                 else if (byte == CONSOLE_ESCAPE)
                     output[count++] = byte;
             } else if (byte == CONSOLE_ESCAPE) {
@@ -96,6 +102,12 @@ static void *console_thread(void *opaque)
         int result = count ? serial_receive(console->serial, output, count) : 0;
         if (result < 0)
             return NULL;
+        if (snapshot) {
+            if (console->snapshot)
+                console->snapshot(console->snapshot_opaque);
+            else
+                fprintf(stderr, "\r\nINFO: Ctrl-A s ignored: no --warm-save NAME given\r\n");
+        }
     }
     /*
      * 在线程即将结束时才通知退出。quit 回调会让 vCPU 停下，主线程随后
@@ -111,13 +123,16 @@ static void *console_thread(void *opaque)
  * 控制台线程。线程创建失败时恢复终端设置并返回 -1。
  */
 int console_start(struct console *console, struct serial *serial, int in_fd,
-                  console_quit_fn quit, void *quit_opaque)
+                  console_quit_fn quit, void *quit_opaque, console_quit_fn snapshot,
+                  void *snapshot_opaque)
 {
     memset(console, 0, sizeof(*console));
     console->serial = serial;
     console->in_fd = in_fd;
     console->quit = quit;
     console->quit_opaque = quit_opaque;
+    console->snapshot = snapshot;
+    console->snapshot_opaque = snapshot_opaque;
 
     /*
      * 终端默认是“规范模式”：宿主机的 tty 层自己做回显、按行缓冲、处理

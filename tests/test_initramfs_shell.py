@@ -47,11 +47,14 @@ def setUpModule():
 class Guest:
     """启动 VMM，并在后台收集客户机串口输出，提供 expect/send。"""
 
-    def __init__(self, tty=False, args=None, prefix=()):
+    def __init__(self, tty=False, args=None, prefix=(), base_args=None):
         """args 是 `run --kernel KERNEL` 之后的参数；默认只加上 --initrd。
-        prefix 放在 VMM 前面，例如 ["ip", "netns", "exec", NS]。"""
+        prefix 放在 VMM 前面，例如 ["ip", "netns", "exec", NS]。
+        base_args 替换 `run --kernel KERNEL`，例如热快照恢复时的 `run --restore NAME`。"""
         if args is None:
             args = ["--initrd", INITRAMFS]
+        if base_args is None:
+            base_args = ["run", "--kernel", KERNEL]
         self.master = None
         if tty:
             self.master, slave = pty.openpty()
@@ -61,7 +64,7 @@ class Guest:
         else:
             stdin = stdout = subprocess.PIPE
         self.proc = subprocess.Popen(
-            [*prefix, VMM, "run", "--kernel", KERNEL, *args], cwd=ROOT, stdin=stdin, stdout=stdout,
+            [*prefix, VMM, *base_args, *args], cwd=ROOT, stdin=stdin, stdout=stdout,
             stderr=subprocess.PIPE)
         self.output = b""
         self.cursor = 0

@@ -204,4 +204,48 @@ int virtio_mmio_run_queue(struct virtio_mmio *dev, uint32_t queue,
  */
 void *virtio_mmio_gpa(const struct virtio_mmio *dev, uint64_t gpa, uint64_t len);
 
+/*
+ * Stage 11 热快照：传输层里不在客户机内存中的那部分状态。ring 内容本身在客户机
+ * 内存里，这里只记 ring 的 GPA 和 device 侧的两个计数器。config 是 backend
+ * 配置空间的副本（virtio-blk 的容量、virtio-net 的 MAC），恢复时必须和这次
+ * 打开的设备完全一致。
+ */
+struct virtio_mmio_queue_state {
+    uint64_t desc;
+    uint64_t avail;
+    uint64_t used;
+    uint32_t num;
+    uint32_t ready;
+    uint16_t last_seen_avail;
+    uint16_t next_used_idx;
+    uint32_t pad;
+};
+
+struct virtio_mmio_state {
+    uint32_t device_id;
+    uint32_t num_queues;
+    uint32_t status;
+    uint32_t device_features_sel;
+    uint32_t driver_features_sel;
+    uint32_t queue_sel;
+    uint64_t driver_features;
+    uint32_t interrupt_status;
+    uint32_t irq_level;
+    uint32_t config_size;
+    uint32_t pad;
+    uint8_t config[64];
+    struct virtio_mmio_queue_state queues[VIRTIO_MMIO_MAX_QUEUES];
+};
+
+/* 持锁读出传输层状态。 */
+void virtio_mmio_save(struct virtio_mmio *dev, struct virtio_mmio_state *state);
+
+/*
+ * 写回一个刚 virtio_mmio_init() 的设备。fail-closed：设备类型、队列数、配置空间
+ * 和保存时不同，driver_features 含设备没提供的位，或某个 ready 队列的布局不合法
+ * （大小、对齐、不在客户机内存里）都返回 -1。不调用 set_irq 和 driver_ok：中断线
+ * 电平随 KVM 中断控制器一起恢复，virtio-net 的 RX 线程启动后会自己去看队列。
+ */
+int virtio_mmio_restore(struct virtio_mmio *dev, const struct virtio_mmio_state *state);
+
 #endif

@@ -17,8 +17,9 @@ static void print_usage(FILE *stream)
 {
     fprintf(stream,
             "Usage: " PROGRAM " run --kernel PATH [options]\n"
+            "       " PROGRAM " run --restore NAME [--disk PATH] [--tap IFNAME] [options]\n"
             "       " PROGRAM " snapshot list|save|validate|delete [options]\n"
-            "                (cold snapshots of --disk; see '" PROGRAM " snapshot --help')\n"
+            "                (cold and warm snapshots; see '" PROGRAM " snapshot --help')\n"
             "\n"
             "Boot a Linux bzImage in a KVM sandbox; the guest serial console is\n"
             "attached to this process's stdin/stdout.\n"
@@ -46,6 +47,13 @@ static void print_usage(FILE *stream)
             "      --nproc N        with --jail: RLIMIT_NPROC and pids.max (default: %u)\n"
             "  -s, --snapshot NAME  before booting, restore cold snapshot NAME into --disk\n"
             "                       (Stage 10); --disk is overwritten, requires --disk\n"
+            "      --warm-save NAME allow a warm snapshot (Stage 11): Ctrl-A s or SIGUSR2\n"
+            "                       pauses the VM, saves memory + CPU + device state +\n"
+            "                       --disk as snapshot NAME and exits; not with --jail\n"
+            "      --restore NAME   resume warm snapshot NAME where it was paused, no boot;\n"
+            "                       pass the same --disk/--tap set as when it was saved\n"
+            "                       (--disk is overwritten); takes no --kernel, --initrd,\n"
+            "                       --mem, --cmdline, --snapshot or --jail\n"
             "  -h, --help           show this help\n"
             "\n"
             "When stdin is a terminal, press Ctrl-A x to quit.\n",
@@ -101,6 +109,8 @@ enum {
     OPT_MEMORY_MAX,
     OPT_NOFILE,
     OPT_NPROC,
+    OPT_WARM_SAVE,
+    OPT_RESTORE,
 };
 
 int cli_parse(int argc, char **argv, struct sandbox_config *config)
@@ -136,6 +146,8 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
         { "nofile", required_argument, NULL, OPT_NOFILE },
         { "nproc", required_argument, NULL, OPT_NPROC },
         { "snapshot", required_argument, NULL, 's' },
+        { "warm-save", required_argument, NULL, OPT_WARM_SAVE },
+        { "restore", required_argument, NULL, OPT_RESTORE },
         { "help", no_argument, NULL, 'h' },
         { 0 },
     };
@@ -153,9 +165,14 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
     const char *jail_suboption = NULL;
     unsigned long long value;
     int index;
+    /* --restore 时这些来自快照，给了就是用法错误；--mem 有默认值，只能另外记。 */
+    const char *boot_option = NULL;
     while ((opt = getopt_long(sub_argc, sub_argv, "+:k:i:m:c:d:t:n:js:h", options, &index)) != -1) {
-        if (opt >= OPT_CPU_MAX && !jail_suboption)
+        if (opt >= OPT_CPU_MAX && opt <= OPT_NPROC && !jail_suboption)
             jail_suboption = options[index].name;
+        if (!boot_option && (opt == 'k' || opt == 'i' || opt == 'm' || opt == 'c' || opt == 's'))
+            boot_option = opt == 'k' ? "--kernel" : opt == 'i' ? "--initrd" :
+                          opt == 'm' ? "--mem" : opt == 'c' ? "--cmdline" : "--snapshot";
         switch (opt) {
         case 'k':
             config->kernel_path = optarg;
@@ -220,6 +237,16 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
             else
                 config->jail.nproc = (unsigned)value;
             break;
+        case OPT_WARM_SAVE:
+        case OPT_RESTORE:
+            if (!snapshot_name_valid(optarg))
+                return usage_error("invalid snapshot name '%s' (1-%d characters of "
+                                   "[A-Za-z0-9_-])", optarg, SNAPSHOT_NAME_MAX);
+            if (opt == OPT_WARM_SAVE)
+                config->warm_save_name = optarg;
+            else
+                config->restore_name = optarg;
+            break;
         case 'h':
             print_usage(stdout);
             exit(0);
@@ -233,8 +260,17 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
     }
     if (optind < sub_argc)
         return usage_error("unexpected argument '%s'", sub_argv[optind]);
-    if (!config->kernel_path || !*config->kernel_path)
+    if (config->restore_name && boot_option)
+        return usage_error("--restore takes the kernel, memory size and command line from "
+                           "the snapshot; remove %s", boot_option);
+    if (!config->restore_name && (!config->kernel_path || !*config->kernel_path))
         return usage_error("--kernel is required");
+    if (config->warm_save_name && config->jail.enabled)
+        return usage_error("--warm-save cannot be combined with --jail (the snapshot is "
+                           "written by the VMM process, which --jail locks down)");
+    if (config->restore_name && config->jail.enabled)
+        return usage_error("--restore cannot be combined with --jail (memory.max would be "
+                           "derived from --mem, not from the snapshot)");
     if (config->snapshot_name && !config->disk_path)
         return usage_error("--snapshot requires --disk (the snapshot is restored into it)");
     if (jail_suboption && !config->jail.enabled)
@@ -256,13 +292,18 @@ static void print_snapshot_usage(FILE *stream)
             SNAPSHOT_DEFAULT_DIR "/NAME/).\n"
             "Restore with '" PROGRAM " run --disk PATH --snapshot NAME ...'.\n"
             "\n"
+            "Warm snapshots (Stage 11) are created by a running sandbox started with\n"
+            "'--warm-save NAME' (Ctrl-A s or SIGUSR2) and add memory.bin + vmstate.bin;\n"
+            "resume one with '" PROGRAM " run --restore NAME [--disk PATH] [--tap IFNAME]'.\n"
+            "\n"
             "Actions:\n"
-            "  list                         list snapshots (stdout: NAME SIZE CREATED_AT)\n"
+            "  list                         list snapshots (stdout: NAME DISK_SIZE\n"
+            "                               CREATED_AT TYPE, TYPE is cold or warm)\n"
             "  save --name NAME --disk PATH [--kernel PATH] [--initrd PATH] [--mem MB]\n"
             "       [--cmdline STR]         copy PATH into snapshot NAME; refuses an\n"
             "                               existing NAME or a disk in use by a sandbox;\n"
             "                               the optional values are recorded only\n"
-            "  validate --name NAME         check the manifest and the disk checksum\n"
+            "  validate --name NAME         check the manifest and every file's checksum\n"
             "  delete --name NAME           remove snapshot NAME\n"
             "\n"
             "NAME: 1-%d characters of [A-Za-z0-9_-].\n"

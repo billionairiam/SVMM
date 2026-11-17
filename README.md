@@ -1,3 +1,112 @@
+# Stage 11：热快照——从暂停点毫秒级恢复
+
+这一阶段没有对应的教程，是按自己的理解实现的。冷快照（Stage 10）只存磁盘，恢复要重新 boot；热快照把整台机器存下来：客户机内存、KVM 里的 VM/vCPU 状态、VMM 用户态的设备状态，以及同一时刻的 `--disk`。恢复时不加载内核、不重新 boot，客户机从暂停的那条指令继续执行（128 MiB 客户机约 30 ms）。
+
+```sh
+make run-warm KERNEL=/path/to/bzImage SNAPSHOT=ws   # = svmm run ... --disk build/disk.img --warm-save ws
+#   客户机里：X=hello; sleep 1000 &  然后按 Ctrl-A s（或者在别的终端 kill -USR2 <svmm 的 pid>）
+#   INFO: warm snapshot 'ws' saved in ... ms; resume it with `svmm run --restore ws --disk PATH`，VMM 退出
+make run-restore SNAPSHOT=ws                        # = svmm run --restore ws --disk build/disk.img
+#   INFO: warm snapshot 'ws' restored in 27 ms ...   echo $X → hello，后台 sleep 还在
+bin/svmm snapshot list                              # 第 4 列 cold / warm
+bin/svmm snapshot validate --name ws                # manifest + 磁盘 + vmstate 解码 + 内存校验和
+bin/svmm run --restore ws --disk build/disk.img --warm-save ws2   # 恢复出来的 VM 还能再存
+```
+
+快照目录：`snapshots/<name>/{memory.bin,vmstate.bin,disk.img,metadata.json}`（没有 `--disk` 时没有 `disk.img`）。`memory.bin` 是客户机物理内存的原样镜像，全零页是文件洞，所以 128 MiB 的客户机实际只占几十 MiB。`vmstate.bin`（约 16 KiB）是带 tag 的二进制 section 列表，格式见 `src/vmstate.h`：
+
+| 层次 | 内容 | 来源 |
+|---|---|---|
+| VM | 两片 8259 PIC、I/O APIC、PIT、kvmclock | `KVM_GET_IRQCHIP` / `KVM_GET_PIT2` / `KVM_GET_CLOCK` |
+| vCPU | 通用寄存器、段/控制寄存器、XSAVE（FPU/SSE/AVX）、XCR0、调试寄存器、LAPIC、MSR（`KVM_GET_MSR_INDEX_LIST` 报告的全部，含 TSC、kvmclock）、挂起的异常/中断/NMI、mp_state（RUNNABLE/HALTED） | `KVM_GET_REGS` / `SREGS` / `XSAVE` / `XCRS` / `DEBUGREGS` / `LAPIC` / `MSRS` / `VCPU_EVENTS` / `MP_STATE` |
+| 主机检查 | CPUID、TSC 频率 | `KVM_GET_CPUID2` / `KVM_GET_TSC_KHZ` |
+| 设备 | 16550 寄存器和接收队列；每个 virtio-mmio 设备的传输层寄存器、ring GPA、`last_avail` / `next_used` | `serial_save` / `virtio_mmio_save` |
+
+virtqueue 的三块 ring 在客户机内存里，随 `memory.bin` 一起保存；VMM 只需要存那两个不在客户机内存里的计数器。
+
+### 保存
+
+```
+Ctrl-A s / SIGUSR2 ── vCPU 线程从 KVM_RUN 返回（stop_requested + save_requested）
+  1. 停 virtio-net 的 RX 线程（不再往客户机内存里写包）
+  2. vcpu_quiesce：immediate_exit=1 再 KVM_RUN 一次，让 KVM 把上一次 PIO/MMIO 退出做完
+     （IN 的结果写进 RAX、RIP 越过那条指令）。不做这一步，恢复后那条 OUT 会再执行一遍
+  3. 持串口锁：serial_save + vmstate_capture（VM 级、vCPU 级状态）
+  4. virtio_mmio_save（blk / net），编码 vmstate.bin
+  5. 写 snapshots/.tmp-<name>-XXXXXX/：memory.bin（跳过零页，边写边算校验和）、vmstate.bin、
+     disk.img（--disk 的整盘副本）、metadata.json，全部 fsync
+  6. renameat2(临时目录 → snapshots/<name>, RENAME_NOREPLACE)，fsync(snapshots/)
+成功：打印耗时，VMM 退出（退出码 0）
+失败（磁盘满等）：删掉临时目录，打印 "the VM keeps running"，重启 RX 线程，客户机继续跑
+```
+
+内存和磁盘必须是同一时刻：客户机页缓存里还没写回的脏页在 `memory.bin` 里，对应的旧数据在 `disk.img` 里，两者合起来才一致。所以 `--restore` 一定会用快照里的 `disk.img` 覆盖 `--disk`。`--warm-save` 的名字在启动时就检查，已存在会直接报错，而不是跑了半天才发现。
+
+### 恢复（fail-closed）
+
+```
+run --restore NAME（sandbox_run 的第 -1 步，KVM 之前）
+  读 metadata.json + vmstate.bin，校验 manifest、vmstate 校验和、严格解码，
+  设备集合必须和这次的 --disk / --tap 一致，内存大小取自快照
+KVM_CREATE_VM ... guest_memory_init_file：mmap(memory.bin, MAP_PRIVATE) —— 按需读入、写时复制，
+                                          快照文件永远不会被客户机改写
+  校验内存校验和 ── vcpu_init ── vmstate_apply ── 最后才恢复 --disk 并打开 virtio-blk
+  virtio_mmio_restore，serial_restore，跳过 ACPI / 内核加载 / 启动寄存器，直接 KVM_RUN
+```
+
+任何一步失败：`stage=failed_restore`，退出码 1，客户机一条指令都没执行，`--disk` 一个字节都没动（磁盘是最后才替换的）。
+
+`vmstate_apply` 的顺序有讲究：
+
+- **先查 TSC 频率**，再把状态写进 KVM。
+- **CPUID 最后比较**。KVM 会根据当前的 CR4/XCR0/APIC 状态改写 CPUID 中的几位：leaf 1 的 OSXSAVE 和 APIC、leaf 7 的 OSPKE、leaf 0xD 的 XSAVE 区大小。所以要等 SREGS / XCRS / MSRS 都设好以后，CPUID 才和保存时的可比。
+- **LAPIC 在 MSRS 之前**：只有 LAPIC 处在 TSC-deadline 模式时，`MSR_IA32_TSC_DEADLINE` 才能写进去。
+- **TSC 通过 `MSR_IA32_TSC` 恢复**，客户机时间从暂停点接着走。
+- **kvmclock 用 `KVM_SET_CLOCK` 恢复**。默认 clocksource 是 tsc，测试里另外用 `clocksource=kvm-clock` 覆盖了这条路径。
+
+`snapshot` 子命令认识两种快照：
+
+- `list` 显示类型。
+- `validate` 对热快照做完整校验：manifest、磁盘、vmstate 解码、内存校验和。
+- `delete` 只删那 4 个文件。
+- `run --snapshot` 拒绝热快照，`run --restore` 拒绝冷快照。
+- 冷快照的 manifest 旁边如果出现 `memory.bin` / `vmstate.bin`，也视为损坏。
+
+### 限制
+
+- **只能在同一台主机（同样的 CPU 和 KVM）上恢复**，CPUID 或 TSC 频率不同就拒绝。不做跨主机迁移需要的 CPUID 掩码和 TSC 缩放。
+- **保存后 VMM 退出**，不支持“存完继续跑”。那需要写时复制的内存快照（fork 或 userfaultfd）。
+- **墙上时间落后暂停的时长**：客户机的 TSC 从暂停点继续走。客户机里没有 NTP。
+- **网络**：保存时 VMM 里还没送进客户机的那个 RX 帧会被丢掉，相当于丢一个包。TCP 连接在对端看来是暂停了一段时间，可能已经超时断开。
+- **不支持 `--jail`**：
+  - `--warm-save` 不行，因为快照由 VMM 进程自己写，而 jail 把这个进程锁住了（seccomp 和 capability）。
+  - `--restore` 不行，因为 cgroup 的 `memory.max` 按 `--mem` 计算，而恢复时内存大小来自快照。
+- **XSAVE 区最多 4 KiB**（`KVM_GET_XSAVE`，不用 `XSAVE2`）。开了 AMX 的客户机不支持。
+- **单 vCPU**，和整个 VMM 一样。
+- **kernel / initrd / cmdline 只记录在 manifest 里**，恢复时不需要也不检查。
+
+### 测试
+
+`tests/test_warm_snapshot.py` 开头列出了 14 种失败方式，每个测试对应其中几条：
+
+- 恢复后 shell 变量、tmpfs 文件、后台进程、未 sync 的数据都在；`sync` + `drop_caches` 后读回一致，`e2fsck` 干净。
+- 同一快照恢复两次起点相同，快照文件不变。
+- 链式保存再恢复。
+- 磁盘满时保存失败，客户机继续运行，之后还能再存。
+- kvmclock 时间连续。
+- 客户机狂打串口时反复保存和恢复 4 次，输出逐字节连续。
+- virtio-net 恢复后还能 ping。
+- 坏快照全部 fail-closed：改字节、截断、丢文件、错类型、错内存大小、未知、重复或缺少 section、尾随字节、CPUID 或 TSC 不同、设备不匹配、冷热混用。每一种都检查 `--disk` 没被动过。
+- CLI 用法错误。
+
+为了确认测试能抓到 bug，我对实现做了变异，以下每个变异都会让测试失败：
+
+- 去掉 quiesce、kvmclock、LAPIC、MSR、CPUID 或 TSC 检查、内存校验、串口恢复、virtqueue 计数器；
+- 内存改用 `MAP_SHARED`；
+- 零页跳过写错；
+- 先恢复磁盘再校验；
+- 保存失败后退出。
+
 # Stage 10：冷快照——给 sandbox 一个保存按钮
 
 根据 [Runra Stage 10 教程](https://runra.dev/zh/blog/sandbox-from-scratch-10-cold-snapshot)：关机后把 `--disk` 镜像整盘复制一份并附带 manifest，下次启动前恢复，再重新 boot。只保存 workspace（磁盘），不保存内存、寄存器、设备状态（那是 Stage 11 的 warm snapshot）。

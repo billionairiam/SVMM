@@ -53,6 +53,13 @@ struct guest_memory {
 
 /* 分配 size_mb MiB 客户机内存并注册为 KVM 内存槽 0（GPA 从 0 开始）。 */
 int guest_memory_init(struct guest_memory *memory, int vm_fd, size_t size_mb);
+/*
+ * Stage 11 热快照恢复：把快照的内存文件 fd 以 MAP_PRIVATE 映射成客户机内存，
+ * 文件长度必须正好是 size_mb MiB。页面在客户机第一次访问时才从页缓存读进来
+ * （文件里的洞读出来是 0），客户机写入时写时复制成匿名页，快照文件本身永远不变，
+ * 同一个快照可以恢复任意多次。
+ */
+int guest_memory_init_file(struct guest_memory *memory, int vm_fd, size_t size_mb, int fd);
 int guest_memory_load(struct guest_memory *memory, size_t address,
                       const void *source, size_t size);
 void guest_memory_destroy(struct guest_memory *memory);

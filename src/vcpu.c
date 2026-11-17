@@ -362,6 +362,39 @@ void vcpu_request_stop(struct vcpu *vcpu)
         pthread_kill(vcpu->thread, SIGUSR1);
 }
 
+void vcpu_request_save(struct vcpu *vcpu)
+{
+    vcpu->save_requested = 1;
+    vcpu_request_stop(vcpu);
+}
+
+int vcpu_quiesce(struct vcpu *vcpu)
+{
+    /*
+     * immediate_exit=1 时 KVM_RUN 的顺序是：先完成上一次退出留下的 PIO/MMIO
+     * （把 VMM 填好的 IN/读 MMIO 结果写进寄存器、RIP 越过那条指令），再检查
+     * immediate_exit，以 EINTR 返回，一条客户机指令都不执行。
+     */
+    vcpu->run->immediate_exit = 1;
+    int r = ioctl(vcpu->fd, KVM_RUN, 0);
+    int err = errno;
+    vcpu->run->immediate_exit = 0;
+    if (r == 0 || err != EINTR) {
+        fprintf(stderr, "ERROR: quiesce vCPU: KVM_RUN %s\n",
+                r == 0 ? "entered the guest" : strerror(err));
+        return -1;
+    }
+    return 0;
+}
+
+void vcpu_clear_stop(struct vcpu *vcpu)
+{
+    vcpu->save_requested = 0;
+    vcpu->stop_requested = 0;
+    if (vcpu->run)
+        vcpu->run->immediate_exit = 0;
+}
+
 int vcpu_mmio_register(struct vcpu *vcpu, uint64_t base, uint64_t size,
                        void (*access)(void *opaque, uint64_t offset, uint8_t *data,
                                       uint32_t len, int is_write),
@@ -411,7 +444,7 @@ static const struct vcpu_mmio_region *find_mmio(const struct vcpu *vcpu, uint64_
  * I/O 和 MMIO 都按“没有设备”处理后继续运行。
  *
  * 返回 0 表示客户机关机/复位、执行了用户态可见的 HLT，或宿主请求停止
- * （vcpu_request_stop）；-1 表示 KVM 出错、客户机三重故障或遇到无法
+ * （vcpu_request_stop；vcpu_request_save 时 reason 是 warm_save）；-1 表示 KVM 出错、客户机三重故障或遇到无法
  * 处理的退出。stats 记录退出次数、串口退出次数和最后一次
  * 退出原因，无论哪种结果都会通过 vcpu_finish() 输出。
  */
@@ -425,6 +458,10 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
     vcpu->thread_valid = 1;
     for (;;) {
         if (vcpu->stop_requested) {
+            if (vcpu->save_requested) {
+                fprintf(stderr, "\r\nINFO: vCPU paused for warm snapshot\r\n");
+                return vcpu_finish(stats, "warm_save", 0);
+            }
             fprintf(stderr, "INFO: VMM stopped by host request\n");
             return vcpu_finish(stats, "host_stop", 0);
         }

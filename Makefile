@@ -5,7 +5,7 @@ CPPFLAGS += -Isrc
 .DEFAULT_GOAL := all
 
 SOURCES := src/main.c src/cli.c src/sandbox.c src/snapshot.c src/net-policy.c src/jail.c src/kvm.c src/memory.c \
-           src/vcpu.c src/serial.c src/console.c src/metrics.c src/boot/linux.c src/boot/acpi.c \
+           src/vmstate.c src/vcpu.c src/serial.c src/console.c src/metrics.c src/boot/linux.c src/boot/acpi.c \
            src/virtio/virtq.c src/virtio/mmio.c src/virtio/blk.c src/virtio/net.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 # Stage 05 的 virtqueue 是纯用户态代码，不依赖 KVM，单独编进 virtq-demo。
@@ -48,7 +48,7 @@ $(foreach variant,$(ABLATION_VARIANTS),$(eval $(call ABLATION_template,$(variant
 
 .PHONY: all ablation initramfs disk run run-disk run-net run-virtq test clean \
         netns netns-down run-netns jail-setup jail-clean run-jail \
-        snapshot-save snapshot-list run-snapshot help
+        snapshot-save snapshot-list run-snapshot run-warm run-restore help
 
 # make run KERNEL=/boot/vmlinuz-6.16.0 MEM=512
 KERNEL ?= images/bzImage
@@ -173,6 +173,15 @@ run-snapshot: all initramfs
 	@./bin/svmm run --kernel $(KERNEL) --initrd $(INITRD) --mem $(MEM) --disk $(DISK) \
 		--snapshot $(SNAPSHOT)
 
+# Stage 11：热快照。run-warm 里按 Ctrl-A s（或 kill -USR2 <svmm>）保存 SNAPSHOT 并退出，
+# run-restore 从暂停点继续（毫秒级，不重新 boot）；内存大小取自快照。
+run-warm: all initramfs disk
+	@./bin/svmm run --kernel $(KERNEL) --initrd $(INITRD) --mem $(MEM) --disk $(DISK) \
+		--warm-save $(SNAPSHOT)
+
+run-restore: all disk
+	@./bin/svmm run --restore $(SNAPSHOT) --disk $(DISK)
+
 help:
 	@echo "make all          build bin/svmm and bin/virtq-demo"
 	@echo "make initramfs    build $(INITRD)"
@@ -188,6 +197,8 @@ help:
 	@echo "make snapshot-save     save $(DISK) as cold snapshot SNAPSHOT=$(SNAPSHOT) (VM shut down)"
 	@echo "make snapshot-list     list snapshots in ./snapshots"
 	@echo "make run-snapshot      restore SNAPSHOT=$(SNAPSHOT) into $(DISK), then boot like run-disk"
+	@echo "make run-warm          run-disk; Ctrl-A s saves warm snapshot SNAPSHOT=$(SNAPSHOT) and exits"
+	@echo "make run-restore       resume warm snapshot SNAPSHOT=$(SNAPSHOT) with $(DISK) (no reboot)"
 	@echo "make test         unit + E2E tests (E2E needs BZIMAGE_PATH and root)"
 	@echo "make clean        remove build/ and bin/"
 
@@ -213,6 +224,7 @@ test: bin/test_metrics bin/test_vcpu_errors bin/test_virtq bin/test_virtio_blk \
 	python3 -m unittest -v tests/test_network_policy.py
 	python3 -m unittest -v tests/test_jailer.py
 	python3 -m unittest -v tests/test_snapshot.py
+	python3 -m unittest -v tests/test_warm_snapshot.py
 
 clean:
 	rm -rf build bin

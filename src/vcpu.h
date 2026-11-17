@@ -30,6 +30,8 @@ struct vcpu {
     size_t run_size;
     /* vcpu_request_stop() 设置；可能在信号处理函数中写入。 */
     volatile sig_atomic_t stop_requested;
+    /* Stage 11：这次停止是为了保存热快照（vcpu_request_save()）。 */
+    volatile sig_atomic_t save_requested;
     pthread_t thread;
     volatile sig_atomic_t thread_valid;
     /*
@@ -76,6 +78,22 @@ int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
 int vcpu_run(struct vcpu *vcpu, struct serial *serial,
              struct vcpu_run_stats *stats);
 void vcpu_request_stop(struct vcpu *vcpu);
+
+/*
+ * Stage 11 热快照。vcpu_request_save() 和 vcpu_request_stop() 一样可以在信号处理
+ * 函数或其他线程里调用，只是多记一个 save_requested，vcpu_run() 以 reason=warm_save
+ * 返回 0。
+ *
+ * vcpu_quiesce()：KVM_RUN 因 PIO/MMIO 退出后，那次访问要等下一次 KVM_RUN 才真正
+ * 完成（IN 的结果写进寄存器、RIP 前进），这部分状态不在 KVM_GET_REGS 能读到的地方。
+ * 这里置 immediate_exit 再进一次 KVM_RUN：内核先完成挂起的访问，然后不执行任何客户机
+ * 指令就以 EINTR 返回，之后读出的寄存器才是一致的。
+ *
+ * vcpu_clear_stop()：保存失败、要让客户机继续运行时清掉停止请求。
+ */
+void vcpu_request_save(struct vcpu *vcpu);
+int vcpu_quiesce(struct vcpu *vcpu);
+void vcpu_clear_stop(struct vcpu *vcpu);
 /*
  * 注册一个 MMIO 设备区间。size 为 0、区间回绕、与已注册区间重叠或表已满时
  * 打印错误并返回 -1（重叠意味着同一个地址有两个设备，是 VMM 配置错误）。

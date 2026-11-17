@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 /*
  * 客户机“物理内存”其实就是 VMM 进程里的一段普通虚拟内存。
@@ -26,7 +27,8 @@
  *
  * 本项目只有一个槽（slot 0），GPA 从 0 开始，所以 GPA 和偏移相同。
  */
-int guest_memory_init(struct guest_memory *memory, int vm_fd, size_t size_mb)
+/* fd < 0：匿名内存（boot）；fd >= 0：把快照的内存文件私有映射进来（Stage 11 恢复）。 */
+static int map_guest_memory(struct guest_memory *memory, int vm_fd, size_t size_mb, int fd)
 {
     memory->data = NULL;
     memory->size = 0;
@@ -41,9 +43,14 @@ int guest_memory_init(struct guest_memory *memory, int vm_fd, size_t size_mb)
      * 匿名映射：内核只保留地址范围，页面在第一次被访问时才分配并清零，
      * 所以 --mem 3072 也不会立刻占用 3 GiB 宿主内存。MAP_PRIVATE 即可，
      * 这块内存只在本进程内与 KVM 共享，不需要和其他进程共享。
+     *
+     * 文件映射（热快照恢复）同样是 MAP_PRIVATE：缺页时从文件（页缓存）读，客户机
+     * 写入时复制一份匿名页，永远不会写回快照文件。这就是 Firecracker 的
+     * “懒恢复”：恢复时不用把整块内存读一遍，客户机碰到哪页才读哪页。
      */
-    void *mapping = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *mapping = fd < 0 ? mmap(NULL, size, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+                           : mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
     if (mapping == MAP_FAILED) {
         perror("mmap guest memory");
         return -1;
@@ -67,6 +74,22 @@ int guest_memory_init(struct guest_memory *memory, int vm_fd, size_t size_mb)
         return -1;
     }
     return 0;
+}
+
+int guest_memory_init(struct guest_memory *memory, int vm_fd, size_t size_mb)
+{
+    return map_guest_memory(memory, vm_fd, size_mb, -1);
+}
+
+int guest_memory_init_file(struct guest_memory *memory, int vm_fd, size_t size_mb, int fd)
+{
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || (uint64_t)st.st_size != size_mb * MIB) {
+        fprintf(stderr, "guest memory file must be a regular file of %zu MiB\n", size_mb);
+        errno = EINVAL;
+        return -1;
+    }
+    return map_guest_memory(memory, vm_fd, size_mb, fd);
 }
 
 /*

@@ -2,6 +2,7 @@
 #define SNAPSHOT_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /*
  * Stage 10：冷快照（cold snapshot）。
@@ -60,7 +61,80 @@ int snapshot_load(const char *name, const char *disk_path);
 /* 按名字排序，把每个快照一行写到 stdout：NAME SIZE CREATED_AT（坏的标 invalid）。 */
 int snapshot_list(void);
 
-/* 删除快照：只删 disk.img 和 metadata.json 再 rmdir，目录里有别的东西时拒绝。 */
+/* 删除快照：只删认识的文件（冷：disk.img、metadata.json；热：再加 memory.bin、
+ * vmstate.bin）再 rmdir，目录里有别的东西时拒绝。 */
 int snapshot_delete(const char *name);
+
+/*
+ * ---------- Stage 11：热快照（warm snapshot） ----------
+ *
+ * 运行中的 VM 暂停后，把整台机器存下来，恢复时从暂停的那条指令继续，不再 boot：
+ *
+ *   <root>/<name>/memory.bin      客户机 RAM 原样（全零页留成洞，文件是稀疏的）
+ *   <root>/<name>/vmstate.bin     KVM VM/vCPU 状态 + 设备状态（见 vmstate.h）
+ *   <root>/<name>/disk.img        --disk 的副本（有磁盘时）；和内存出自同一时刻，
+ *                                 客户机页缓存里的东西和磁盘上的东西对得上
+ *   <root>/<name>/metadata.json   snapshot_type "warm"，三个文件的大小和校验和、
+ *                                 guest_mem_mb、devices
+ *
+ * 和冷快照共用名字规则、根目录、manifest 格式、临时目录 + rename 的原子保存，
+ * list / validate / delete 两种都认。
+ */
+
+/* 保存所需的一切，都由 sandbox.c 在 vCPU 暂停后准备好。 */
+struct snapshot_warm_source {
+    const uint8_t *memory;
+    size_t memory_size;
+    const uint8_t *vmstate;
+    size_t vmstate_len;
+    unsigned devices;      /* VMSTATE_DEV_* */
+    int disk_fd;           /* 运行中的磁盘（-1 表示没有）；从它复制，不重新打开 */
+    const char *disk_path; /* 只记录 */
+    struct snapshot_info info;
+};
+
+/* 名字已被占用时返回 -1（启动时就检查，不要等到跑了半天才发现存不了）。 */
+int snapshot_warm_check_new(const char *name);
+
+/* 原子地写出热快照；失败时快照根目录里不留任何东西。 */
+int snapshot_warm_save(const char *name, const struct snapshot_warm_source *src);
+
+/* 恢复时 snapshot_warm_load() 交给 sandbox.c 的东西。 */
+struct snapshot_warm_image {
+    int memory_fd;      /* memory.bin，只读；由 snapshot_warm_release() 关闭 */
+    size_t mem_size_mb;
+    uint64_t memory_hash;
+    uint8_t *vmstate;   /* vmstate.bin 的全部字节，已核对校验和 */
+    size_t vmstate_len;
+    unsigned devices;   /* VMSTATE_DEV_* */
+    uint64_t disk_size; /* 有磁盘时 disk.img 的大小和校验和 */
+    uint64_t disk_hash;
+    char created_at[64];
+};
+
+/*
+ * 第一步校验（不需要 KVM，不改任何东西）：manifest 结构、类型、大小；vmstate.bin
+ * 的校验和；memory.bin 的长度；设备一一对应（快照有磁盘 ⇔ disk_path 非 NULL，
+ * 有网卡 ⇔ has_net）。
+ */
+int snapshot_warm_load(const char *name, const char *disk_path, int has_net,
+                       struct snapshot_warm_image *out);
+
+/*
+ * 核对已经映射好的客户机内存和 manifest 里的 memory_hash：只看 memory.bin 里有数据
+ * 的区段（SEEK_DATA），洞一定是 0。核对的是客户机将要看到的字节本身。
+ */
+int snapshot_warm_verify_memory(const struct snapshot_warm_image *img, const uint8_t *memory,
+                                size_t size);
+
+/*
+ * 最后一步：把 disk.img 校验后原子地复制到 disk_path（同冷快照的 snapshot_load()）。
+ * sandbox.c 在内存和 KVM 状态全部恢复成功之后、打开磁盘之前调用它，这样前面
+ * 任何一步失败，--disk 都一个字节没变。
+ */
+int snapshot_warm_restore_disk(const char *name, const struct snapshot_warm_image *img,
+                               const char *disk_path);
+
+void snapshot_warm_release(struct snapshot_warm_image *img);
 
 #endif

@@ -1,5 +1,6 @@
 #include "virtio/mmio.h"
 
+#include <stdio.h>
 #include <string.h>
 
 /*
@@ -505,4 +506,92 @@ void virtio_mmio_access(struct virtio_mmio *dev, uint64_t offset, uint8_t *data,
     pthread_mutex_lock(&dev->lock);
     access_locked(dev, offset, data, len, is_write);
     pthread_mutex_unlock(&dev->lock);
+}
+
+/* ---------- Stage 11：热快照 ---------- */
+
+void virtio_mmio_save(struct virtio_mmio *dev, struct virtio_mmio_state *state)
+{
+    memset(state, 0, sizeof(*state));
+    pthread_mutex_lock(&dev->lock);
+    const struct virtio_mmio_backend *b = dev->backend;
+    state->device_id = b->device_id;
+    state->num_queues = b->num_queues;
+    state->status = dev->status;
+    state->device_features_sel = dev->device_features_sel;
+    state->driver_features_sel = dev->driver_features_sel;
+    state->queue_sel = dev->queue_sel;
+    state->driver_features = dev->driver_features;
+    state->interrupt_status = dev->interrupt_status;
+    state->irq_level = (uint32_t)dev->irq_level;
+    state->config_size = b->config_size <= sizeof(state->config) ? b->config_size : 0;
+    memcpy(state->config, b->config, state->config_size);
+    for (uint32_t i = 0; i < b->num_queues; i++) {
+        const struct virtio_mmio_queue *q = &dev->queues[i];
+        state->queues[i] = (struct virtio_mmio_queue_state){
+            .desc = q->desc,
+            .avail = q->avail,
+            .used = q->used,
+            .num = q->num,
+            .ready = (uint32_t)q->ready,
+            .last_seen_avail = q->ready ? q->vq.last_seen_avail : 0,
+            .next_used_idx = q->ready ? q->vq.next_used_idx : 0,
+        };
+    }
+    pthread_mutex_unlock(&dev->lock);
+}
+
+int virtio_mmio_restore(struct virtio_mmio *dev, const struct virtio_mmio_state *state)
+{
+    const struct virtio_mmio_backend *b = dev->backend;
+    const char *why = NULL;
+    if (state->device_id != b->device_id || state->num_queues != b->num_queues)
+        why = "device type or queue count differs";
+    else if (b->config_size > sizeof(state->config) || state->config_size != b->config_size ||
+             memcmp(state->config, b->config, b->config_size))
+        why = "configuration space differs (disk size / MAC)";
+    else if (state->driver_features & ~b->features)
+        why = "driver features are not offered by this device";
+    else if (state->queue_sel >= VIRTIO_MMIO_MAX_QUEUES || state->irq_level > 1 ||
+             state->irq_level != (state->interrupt_status != 0))
+        why = "register state is inconsistent";
+    if (why) {
+        fprintf(stderr, "ERROR: virtio-mmio: cannot restore device %u: %s\n", b->device_id, why);
+        return -1;
+    }
+
+    pthread_mutex_lock(&dev->lock);
+    dev->status = state->status;
+    dev->device_features_sel = state->device_features_sel;
+    dev->driver_features_sel = state->driver_features_sel;
+    dev->queue_sel = state->queue_sel;
+    dev->driver_features = state->driver_features;
+    dev->interrupt_status = state->interrupt_status;
+    /* 中断线电平已经随 KVM 中断控制器恢复，这里只同步 device 自己记的电平。 */
+    dev->irq_level = (int)state->irq_level;
+    int ret = 0;
+    for (uint32_t i = 0; i < b->num_queues && ret == 0; i++) {
+        const struct virtio_mmio_queue_state *s = &state->queues[i];
+        struct virtio_mmio_queue *q = &dev->queues[i];
+        *q = (struct virtio_mmio_queue){
+            .num = s->num, .desc = s->desc, .avail = s->avail, .used = s->used,
+        };
+        if (!s->ready)
+            continue;
+        /* 和 driver 写 QueueReady=1 时同样的检查：快照里的 GPA 也不可信。 */
+        if (s->ready != 1 || !queue_setup_valid(dev, q) ||
+            virtq_init_shared(&q->vq, q->num, virtio_mmio_gpa(dev, q->desc, 0),
+                              virtio_mmio_gpa(dev, q->avail, 0),
+                              virtio_mmio_gpa(dev, q->used, 0)) < 0) {
+            fprintf(stderr, "ERROR: virtio-mmio: cannot restore device %u: queue %u layout "
+                    "is invalid\n", b->device_id, i);
+            ret = -1;
+            break;
+        }
+        q->vq.last_seen_avail = s->last_seen_avail;
+        q->vq.next_used_idx = s->next_used_idx;
+        q->ready = 1;
+    }
+    pthread_mutex_unlock(&dev->lock);
+    return ret;
 }

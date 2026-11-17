@@ -1,6 +1,7 @@
 #include "serial.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -357,6 +358,63 @@ int serial_handle_in(struct serial *serial, uint16_t port, uint8_t *value)
         break;
     }
     serial_update_irq_locked(serial);
+    pthread_mutex_unlock(&serial->lock);
+    return 0;
+}
+
+/* ---------- Stage 11：热快照 ---------- */
+
+_Static_assert(sizeof(struct serial_state) == 16 + SERIAL_RX_CAPACITY,
+               "serial_state is part of the vmstate.bin format");
+
+void serial_lock(struct serial *serial)
+{
+    pthread_mutex_lock(&serial->lock);
+}
+
+void serial_unlock(struct serial *serial)
+{
+    pthread_mutex_unlock(&serial->lock);
+}
+
+void serial_save(const struct serial *serial, struct serial_state *state)
+{
+    memset(state, 0, sizeof(*state));
+    state->ier = serial->ier;
+    state->lcr = serial->lcr;
+    state->mcr = serial->mcr;
+    state->fcr = serial->fcr;
+    state->scr = serial->scr;
+    state->dll = serial->dll;
+    state->dlm = serial->dlm;
+    state->thre_pending = serial->thre_pending;
+    state->irq_level = serial->irq_level;
+    state->rx_count = (uint32_t)serial->rx_count;
+    /* 环形队列展开成从队头开始的线性数组，恢复时 rx_head 从 0 开始。 */
+    for (size_t i = 0; i < serial->rx_count; i++)
+        state->rx[i] = serial->rx[(serial->rx_head + i) % SERIAL_RX_CAPACITY];
+}
+
+int serial_restore(struct serial *serial, const struct serial_state *state)
+{
+    if (state->rx_count > SERIAL_RX_CAPACITY || state->thre_pending > 1 ||
+        state->irq_level > 1) {
+        fprintf(stderr, "ERROR: serial: invalid saved state\n");
+        return -1;
+    }
+    pthread_mutex_lock(&serial->lock);
+    serial->ier = state->ier;
+    serial->lcr = state->lcr;
+    serial->mcr = state->mcr;
+    serial->fcr = state->fcr;
+    serial->scr = state->scr;
+    serial->dll = state->dll;
+    serial->dlm = state->dlm;
+    serial->thre_pending = state->thre_pending;
+    serial->irq_level = state->irq_level;
+    serial->rx_head = 0;
+    serial->rx_count = state->rx_count;
+    memcpy(serial->rx, state->rx, state->rx_count);
     pthread_mutex_unlock(&serial->lock);
     return 0;
 }

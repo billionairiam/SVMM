@@ -44,6 +44,13 @@ struct console {
     /* Ctrl-A x 时调用 quit(quit_opaque)；main.c 中它会让 vCPU 停止运行。 */
     console_quit_fn quit;
     void *quit_opaque;
+    /*
+     * Stage 11：Ctrl-A s 时调用 snapshot(snapshot_opaque) 请求保存热快照；
+     * 为 NULL（没有 --warm-save）时只打印一条提示。回调只是发出请求，
+     * 控制台线程继续运行。
+     */
+    console_quit_fn snapshot;
+    void *snapshot_opaque;
 };
 
 /*
@@ -51,7 +58,8 @@ struct console {
  * 成功返回 0；失败返回 -1，此时终端设置已经恢复。
  */
 int console_start(struct console *console, struct serial *serial, int in_fd,
-                  console_quit_fn quit, void *quit_opaque);
+                  console_quit_fn quit, void *quit_opaque, console_quit_fn snapshot,
+                  void *snapshot_opaque);
 /*
  * 结束控制台线程并恢复终端设置。可以重复调用；对未启动或启动失败的
  * console 调用也是安全的（要求结构体已清零或经过 console_start()）。
