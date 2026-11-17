@@ -1,3 +1,81 @@
+# Stage 12：直接运行 OCI / Docker 镜像里的应用
+
+把镜像的 rootfs 转为 ext4，通过现有 virtio-blk 交给 VM；SVMM 提供静态 guest init，负责挂载、网络、应用配置、进程回收和退出状态。镜像里无需安装 Docker Engine、shell 或系统 init。每台 VM 运行一个主应用及其子进程。
+
+### 构建和运行
+
+宿主机需要 Docker CLI/daemon、Python 3、e2fsprogs、musl-gcc、cpio 和 gzip，以及带内建 ACPI、virtio-mmio、virtio-blk、ext4、devtmpfs 的 x86_64 Linux 内核。网络还需要 virtio-net。可以用 `GUEST_CC=...` 指定其他能产出静态 Linux x86_64 程序的编译器。
+
+```sh
+make all workload-initramfs
+
+# 构建需要 root，以保留镜像文件的 UID/GID 和权限；不执行镜像中的代码。
+sudo python3 scripts/build-workload.py \
+  --image ubuntu:24.04 --output build/ubuntu.ext4 \
+  -- /bin/sh -c 'echo hello-from-guest; echo persisted > /message; exit 7'
+
+sudo bin/svmm run --kernel /path/to/bzImage \
+  --initrd build/workload-initramfs.cpio.gz \
+  --disk build/ubuntu.ext4 --workload
+echo $?    # 7：应用的真实退出码
+```
+
+本机测试使用 `/boot/vmlinuz-6.18.0.bak`；`/boot/vmlinuz-6.16.0` 没有启用 virtio-mmio，无法驱动磁盘。旧的 `make initramfs` 和 BusyBox 交互 shell 仍然可用。
+
+镜像不存在时工具会拉取 linux/amd64 版本。镜像层由 Docker 正确合并，工具只创建临时容器并 export，随后删除该容器及匿名卷。输出是独立、可写的整盘 ext4，默认至少 64 MiB，也可以 `--size-mb 256`。已存在的输出会被拒绝，失败不会覆盖旧文件；另一个运行实例应使用另一份磁盘。
+
+### 应用启动配置
+
+默认使用镜像的 ENTRYPOINT、CMD、ENV、WORKDIR、USER：
+
+- `-- COMMAND ARGS...` 替换 CMD，保留镜像 ENTRYPOINT。
+- `--entrypoint /path/to/program` 替换 ENTRYPOINT 并清除镜像默认 CMD；参数放在 `--` 后。
+- `--env KEY=VALUE` 可重复，覆盖同名变量；`--workdir /path` 和 `--user USER[:GROUP]` 覆盖工作目录与身份。
+- USER 支持数字 UID/GID 和镜像 passwd/group 中的名字；未显式指定组时应用相应的补充组。未知用户或组明确失败。
+
+参数按数组传递，空格、引号、换行不会被重新解释成 shell 语法。启动配置和镜像信息保存在磁盘的 `/.svmm/`；镜像已有同名路径时拒绝构建。
+
+`--workload` 要求磁盘和冷启动 initramfs。没有合法退出报告的 guest 关机/复位视为失败；串口中的任意文本均不能作为退出报告。
+
+| 结果 | SVMM 退出码 |
+|---|---|
+| 应用 exit(N) | N |
+| 应用被信号结束 | 128 + 信号编号 |
+| 初始化、配置错误或缺失退出报告 | 125 |
+| 应用无法执行 | 126 |
+| 应用命令不存在 | 127 |
+
+应用 stdio 在串口合流；VMM 指标输出到宿主 stderr。Ctrl-C 可经 guest 控制终端传给应用。宿主 SIGTERM 和 Ctrl-A x 保留立即停止 VM 的行为，不保证应用优雅退出。
+
+### 网络和快照
+
+网络复用现有 `--tap` / `--netns`：guest 为 `192.168.100.2/24`，网关 `192.168.100.1`，DNS 为 `8.8.8.8`。无网卡时支持离线应用。宿主可经 TAP 访问 guest 上监听的服务；镜像 EXPOSE 不会自动创建端口转发。
+
+rootfs、应用写入和启动配置都在 `--disk` 中，冷快照重新启动应用，热快照继续原进程：
+
+```sh
+# 对长时间运行的 workload，在启动命令加 --warm-save app；Ctrl-A s 保存后退出。
+sudo bin/svmm run --kernel /path/to/bzImage \
+  --initrd build/workload-initramfs.cpio.gz --disk build/service.ext4 \
+  --workload --warm-save app
+sudo bin/svmm run --restore app --disk build/service.ext4 --workload
+```
+
+恢复时仍需显式传 `--workload`。复用现有快照格式和同主机恢复限制；`--jail` 可用于普通 workload 启动，仍与 warm-save/restore 互斥。
+
+### 验证和兼容性范围
+
+```sh
+sudo env BZIMAGE_PATH=/path/to/bzImage VIRTIO_BZIMAGE=/path/to/bzImage make test-workload
+```
+
+真实 Docker → ext4 → KVM E2E 覆盖 scratch、参数/环境/身份、信号和错误退出、孤儿回收、落盘与 e2fsck、HTTP/TAP、jail、冷热快照，以及本地已有 Ubuntu 镜像的动态链接程序。缺环境默认跳过；显式指定内核后缺少必需环境则失败。Ubuntu 补充用例仅在该镜像已存在本地时执行。
+
+/run 中镜像预设的文件与用户权限会保留；标准 /dev/fd、stdin、stdout、stderr 别名可供应用使用。可捕获的构建取消信号会清理临时容器，SIGKILL 无法执行清理。运行时挂载点需为真实目录，用户名/组名仅从镜像本地 passwd/group 解析；不会额外推导 Docker 的 HOME/HOSTNAME 环境默认值。
+
+本期支持 Linux amd64 和一个主应用；不提供完整 OCI runtime、Compose、多容器、宿主目录挂载或跨架构模拟。Docker export 不保留所有 xattr/file capability；镜像中的字符/块设备会被拒绝，guest 的设备目录由 init 提供。构建与运行按上面的 root 命令执行；没有实现 rootless UID/GID 映射。
+
+
 # Stage 11：热快照——从暂停点毫秒级恢复
 
 这一阶段没有对应的教程，是按自己的理解实现的。冷快照（Stage 10）只存磁盘，恢复要重新 boot；热快照把整台机器存下来：客户机内存、KVM 里的 VM/vCPU 状态、VMM 用户态的设备状态，以及同一时刻的 `--disk`。恢复时不加载内核、不重新 boot，客户机从暂停的那条指令继续执行（128 MiB 客户机约 30 ms）。

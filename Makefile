@@ -46,7 +46,7 @@ $(foreach variant,$(ABLATION_VARIANTS),$(eval $(call ABLATION_template,$(variant
 
 -include $(DEPFILES) $(ABLATION_DEPFILES)
 
-.PHONY: all ablation initramfs workload-initramfs disk run run-disk run-net run-virtq test clean \
+.PHONY: all ablation initramfs workload-initramfs test-workload disk run run-disk run-net run-virtq test clean \
         netns netns-down run-netns jail-setup jail-clean run-jail \
         snapshot-save snapshot-list run-snapshot run-warm run-restore help
 
@@ -192,9 +192,14 @@ run-warm: all initramfs disk
 run-restore: all disk
 	@./bin/svmm run --restore $(SNAPSHOT) --disk $(DISK)
 
+test-workload: all workload-initramfs
+	python3 -m unittest -v tests/test_workload.py
+
 help:
 	@echo "make all          build bin/svmm and bin/virtq-demo"
 	@echo "make initramfs    build $(INITRD)"
+	@echo "make workload-initramfs  build the static OCI workload guest init"
+	@echo "make test-workload       run real Docker-to-KVM workload E2E"
 	@echo "make run          boot KERNEL with the initramfs"
 	@echo "make run-disk     ... plus $(DISK) as virtio-blk"
 	@echo "make run-net      ... plus TAP=$(TAP) as virtio-net (sudo scripts/setup-tap.sh first)"
@@ -235,6 +240,7 @@ test: bin/test_metrics bin/test_vcpu_errors bin/test_virtq bin/test_virtio_blk \
 	python3 -m unittest -v tests/test_jailer.py
 	python3 -m unittest -v tests/test_snapshot.py
 	python3 -m unittest -v tests/test_warm_snapshot.py
+	python3 -m unittest -v tests/test_workload.py
 
 clean:
 	rm -rf build bin

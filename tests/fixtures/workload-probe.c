@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +34,47 @@ int main(int argc, char **argv)
 {
     setbuf(stdout, NULL);
     const char *mode = argc > 1 ? argv[1] : "inspect";
+    if (!strcmp(mode, "stdio")) {
+        puts("STDIO_WAITING");
+        const char *paths[] = { "/dev/stdout", "/dev/stderr", "/dev/fd/1" };
+        const char *messages[] = { "STDOUT_ALIAS_OK\n", "STDERR_ALIAS_OK\n", "FD_ALIAS_OK\n" };
+        for (int i = 0; i < 3; ++i) {
+            int fd = open(paths[i], O_WRONLY);
+            if (fd < 0 || write(fd, messages[i], strlen(messages[i])) < 0) {
+                perror(paths[i]);
+                return 96;
+            }
+            close(fd);
+        }
+        int fd = open("/dev/stdin", O_RDONLY);
+        char c;
+        if (fd < 0 || read(fd, &c, 1) != 1 || c != 'x') return 97;
+        close(fd);
+        puts("STDIN_ALIAS_OK");
+        return 7;
+    }
+    if (!strcmp(mode, "runtime")) {
+        char data[64] = { 0 };
+        FILE *f = fopen("/run/app/seed", "r");
+        if (!f || !fgets(data, sizeof(data), f)) return 96;
+        fclose(f);
+        if (strcmp(data, "runtime-from-image\n")) return 97;
+        f = fopen("/run/app/writable", "w");
+        if (!f) return 98;
+        fputs("runtime-written\n", f);
+        fclose(f);
+        puts("RUN_DIRECTORY_PRESERVED");
+        return 7;
+    }
+    if (!strcmp(mode, "fifo")) {
+        int fd = open("/work/pipe", O_RDWR | O_NONBLOCK);
+        char c;
+        if (fd < 0 || write(fd, "Q", 1) != 1 || read(fd, &c, 1) != 1 || c != 'Q')
+            return 96;
+        close(fd);
+        puts("FIFO_IO_OK");
+        return 7;
+    }
     if (!strcmp(mode, "signal")) {
         raise(SIGTERM);
         return 99;

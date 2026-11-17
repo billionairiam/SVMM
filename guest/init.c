@@ -107,14 +107,20 @@ static char *take_string(char **cursor, char *end)
 static struct config load_config(void)
 {
     struct config config = { 0 };
-    int fd = open("/.svmm/workload.bin", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    /* Inspect the inode before opening it for I/O: a FIFO must not block PID 1. */
+    int path_fd = open("/.svmm/workload.bin", O_PATH | O_CLOEXEC | O_NOFOLLOW);
     struct stat st;
-    if (fd < 0 || fstat(fd, &st) < 0)
+    if (path_fd < 0 || fstat(path_fd, &st) < 0)
         fail("open workload config");
     if (!S_ISREG(st.st_mode) || st.st_size < 18 || st.st_size > WORKLOAD_CONFIG_MAX) {
         errno = EINVAL;
         fail("invalid workload config size");
     }
+    char descriptor[64];
+    snprintf(descriptor, sizeof(descriptor), "/proc/self/fd/%d", path_fd);
+    int fd = open(descriptor, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    close(path_fd);
+    if (fd < 0) fail("read workload config");
     size_t length = (size_t)st.st_size, done = 0;
     config.storage = malloc(length);
     if (!config.storage) fail("allocate workload config");
@@ -249,6 +255,10 @@ static void identity(char *user)
         if (initgroups(name, gid)) fail("set supplementary groups");
     } else if (setgroups(0, NULL)) fail("clear supplementary groups");
     free(name);
+    /* Reopening /dev/stdout through /proc/self/fd checks the tty inode's
+     * permissions, even though inherited stdio already permits writes. */
+    if (fchown(STDIN_FILENO, uid, gid) || fchmod(STDIN_FILENO, 0600))
+        fail("set workload terminal ownership");
     if (setgid(gid) || setuid(uid)) fail("set workload identity");
 }
 
@@ -322,10 +332,16 @@ int main(void)
     root_mounted = 1;
     make_dir("/dev/pts", 0755);
     mount_fs("devpts", "/dev/pts", "mode=0620,ptmxmode=0666");
+    const char *aliases[] = { "/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr" };
+    const char *targets[] = { "/proc/self/fd", "/proc/self/fd/0",
+                              "/proc/self/fd/1", "/proc/self/fd/2" };
+    for (unsigned i = 0; i < sizeof(aliases) / sizeof(aliases[0]); ++i)
+        if (symlink(targets[i], aliases[i]) < 0 && errno != EEXIST)
+            fail("create standard device alias");
     make_dir("/dev/shm", 01777);
     mount_fs("tmpfs", "/dev/shm", "mode=1777");
+    /* Container images may prepare non-root-owned service directories here. */
     make_dir("/run", 0755);
-    mount_fs("tmpfs", "/run", "mode=0755");
     make_dir("/tmp", 01777);
     if (chmod("/tmp", 01777) < 0) fail("set /tmp mode");
     struct config config = load_config();

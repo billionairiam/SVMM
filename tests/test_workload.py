@@ -16,6 +16,8 @@ import signal
 import subprocess
 import sys
 import tempfile
+import tarfile
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -57,14 +59,22 @@ class WorkloadTest(unittest.TestCase):
                         "-o", str(cls.context / "probe")], check=True)
         (cls.context / "work").mkdir()
         (cls.context / "work/seed").write_text("from-image\n")
+        (cls.context / "run/app").mkdir(parents=True)
+        (cls.context / "run/app/seed").write_text("runtime-from-image\n")
         (cls.context / "work/seed-link").symlink_to("seed")
         (cls.context / "passwd").write_text(
             "root:x:0:0:root:/:/bin/sh\napp:x:1000:1001:app:/work:/bin/false\n")
+        with tarfile.open(cls.context / "fifo.tar", "w") as archive:
+            fifo = tarfile.TarInfo("work/pipe")
+            fifo.type = tarfile.FIFOTYPE
+            fifo.uid, fifo.gid, fifo.mode = 1000, 1001, 0o666
+            archive.addfile(fifo)
         (cls.context / "group").write_text(
             "root:x:0:\nappgroup:x:1001:\nextra:x:1002:app\n")
         (cls.context / "Dockerfile").write_text(
             'FROM scratch\nCOPY probe /probe\nCOPY passwd /etc/passwd\n'
             'COPY group /etc/group\nCOPY --chown=1000:1001 work /work\n'
+            'COPY --chown=1000:1001 run/app /run/app\nADD fifo.tar /\n'
             'USER app:appgroup\nWORKDIR /work\nENV TEST_VALUE=default\n'
             'ENTRYPOINT ["/probe", "inspect"]\nCMD ["default command"]\n')
         subprocess.run(["docker", "build", "--network=none", "-q", "-t", cls.image,
@@ -126,6 +136,110 @@ class WorkloadTest(unittest.TestCase):
     def test_missing_executable_returns_127(self):
         self.build("--entrypoint", "/missing-program")
         self.finish(self.boot(), 127)
+
+    def test_entrypoint_override_clears_image_default_cmd(self):
+        self.build("--entrypoint", "/probe")
+        output = self.finish(self.boot())
+        self.assertIn(b"arg0=2f70726f6265", output)
+        self.assertNotIn(b"arg1=", output)
+
+    def test_standard_device_aliases_reach_application_stdio(self):
+        self.build("--entrypoint", "/probe", command=("stdio",))
+        guest = self.boot()
+        guest.expect(b"STDIO_WAITING", 30)
+        guest.send(b"x\n")
+        output = self.finish(guest)
+        for marker in (b"STDOUT_ALIAS_OK", b"STDERR_ALIAS_OK", b"FD_ALIAS_OK",
+                       b"STDIN_ALIAS_OK"):
+            self.assertIn(marker, output)
+
+    def test_fifo_configuration_fails_promptly(self):
+        self.build()
+        commands = self.tmp / "fifo.commands"
+        commands.write_text("cd /.svmm\nrm workload.bin\nmknod workload.bin p\n")
+        result = subprocess.run(["debugfs", "-w", "-f", str(commands), str(self.disk)],
+                                check=True, capture_output=True)
+        self.assertIn(b"Allocated inode", result.stdout)
+        guest = self.boot()
+        try:
+            guest.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.fail("guest init blocked opening FIFO workload configuration")
+        self.finish(guest, 125)
+
+    def test_image_run_directory_preserves_nonroot_ownership_and_contents(self):
+        self.build("--entrypoint", "/probe", command=("runtime",))
+        output = self.finish(self.boot())
+        self.assertIn(b"RUN_DIRECTORY_PRESERVED", output)
+        self.assertEqual(self.read_file("/run/app/writable"), b"runtime-written\n")
+
+    def test_fifo_permissions_allow_other_user_io(self):
+        self.build("--entrypoint", "/probe", "--user", "2000:2000", command=("fifo",))
+        self.assertIn(b"FIFO_IO_OK", self.finish(self.boot()))
+
+    def test_sigterm_cleans_temporary_docker_container(self):
+        # Pause the real Docker export client so cancellation happens while
+        # the builder owns a container. No Docker or subprocess mocks.
+        argv = [sys.executable, BUILDER, "--image", self.image,
+                "--output", str(self.disk)]
+        proc = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        export_pid = None
+        export_directory = None
+        owned = []
+        def container_ids():
+            result = subprocess.run(
+                ["docker", "ps", "-aq", "--filter", "label=svmm.workload-builder=true",
+                 "--filter", "ancestor=" + self.image], capture_output=True, check=True)
+            return result.stdout.decode().split()
+        try:
+            deadline = time.monotonic() + 20
+            children = Path("/proc/%d/task/%d/children" % (proc.pid, proc.pid))
+            while proc.poll() is None and time.monotonic() < deadline:
+                try:
+                    candidates = children.read_text().split()
+                except FileNotFoundError:
+                    break
+                for candidate in candidates:
+                    try:
+                        command = Path("/proc/%s/cmdline" % candidate).read_bytes()
+                        if b"\0export\0" in command:
+                            os.kill(int(candidate), signal.SIGSTOP)
+                            export_pid = int(candidate)
+                            arguments = command.split(b"\0")
+                            export_directory = Path(os.fsdecode(arguments[arguments.index(b"--output") + 1])).parent
+                            break
+                    except (FileNotFoundError, ProcessLookupError):
+                        pass
+                if export_pid is not None:
+                    break
+                time.sleep(0.001)
+            self.assertIsNotNone(export_pid, "could not observe the real Docker export")
+            owned = container_ids()
+            self.assertTrue(owned, "builder should own an export container")
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=20)
+            # An unfixed builder leaves the paused child holding stdout open.
+            try:
+                os.kill(export_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate(timeout=20)
+            self.assertEqual(container_ids(), [], "SIGTERM leaked the temporary container")
+            self.assertFalse(self.disk.exists(), "cancelled build published an output")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            if export_pid is not None:
+                try:
+                    os.kill(export_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            proc.communicate(timeout=20)
+            if owned:
+                subprocess.run(["docker", "rm", "-f", "-v", *owned],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if export_directory is not None:
+                shutil.rmtree(export_directory, ignore_errors=True)
 
     def test_unknown_user_is_setup_failure(self):
         self.build("--user", "missing-user")

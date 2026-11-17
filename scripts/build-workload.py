@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """Export an OCI image into a writable SVMM root disk without running its code."""
 import argparse
+import atexit
 import json
 import math
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import signal
 import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+import uuid
 
 CONFIG_MAGIC = b"SVMMWL1\0"
 CONFIG_MAX = 1024 * 1024
@@ -87,8 +90,12 @@ def extract(archive_path, root):
                         links.append((path, parts(member.linkname)))
                     elif member.isfifo():
                         os.mkfifo(name, member.mode & 0o7777, dir_fd=parent)
-                        os.chown(name, member.uid, member.gid, dir_fd=parent,
-                                 follow_symlinks=False)
+                        fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                                     dir_fd=parent)
+                        try:
+                            attributes(fd, member)
+                        finally:
+                            os.close(fd)
                     else:
                         raise ValueError("unsupported special file in image: " + repr(member.name))
                 finally:
@@ -132,7 +139,8 @@ def encode(config, options):
     command = options.command
     if command and command[0] == "--":
         command = command[1:]
-    argv = entrypoint + (command if command else (config.get("Cmd") or []))
+    default_cmd = [] if options.entrypoint is not None else (config.get("Cmd") or [])
+    argv = entrypoint + (command if command else default_cmd)
     if not argv or not argv[0]:
         raise ValueError("image has no executable; supply --entrypoint or a command")
     env = {}
@@ -183,18 +191,29 @@ def build(options):
         work = Path(work)
         root = work / "root"
         root.mkdir()
-        container = None
+        container = "svmm-workload-" + uuid.uuid4().hex
+        def cleanup_container():
+            subprocess.run(["docker", "rm", "-f", "-v", container],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # A known name also covers cancellation just after Docker creates the
+        # container but before its ID has been returned to this process.
+        atexit.register(cleanup_container)
         try:
-            created = run("docker", "create", "--label", "svmm.workload-builder=true",
-                          "--entrypoint", "/__svmm_export_only__", image["Id"],
-                          capture_output=True)
-            container = created.stdout.decode().strip()
+            run("docker", "create", "--name", container,
+                "--label", "svmm.workload-builder=true",
+                "--entrypoint", "/__svmm_export_only__", image["Id"],
+                capture_output=True)
             archive = work / "rootfs.tar"
             run("docker", "export", "--output", str(archive), container)
             used = extract(archive, root)
         finally:
-            if container:
-                run("docker", "rm", "-v", container, stdout=subprocess.DEVNULL)
+            previous_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+            try:
+                cleanup_container()
+                atexit.unregister(cleanup_container)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         # Reserved path must not redirect our metadata writes through image links.
         metadata = root / ".svmm"
         if os.path.lexists(metadata):
@@ -224,7 +243,17 @@ def build(options):
     print("workload: wrote %s (%d MiB, %s)" % (output, size_mb, image["Id"]))
 
 
+def terminate(signum, _frame):
+    # Let finally/atexit remove our container; repeated signals must not
+    # interrupt that cleanup. SIGKILL cannot be handled.
+    for caught in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(caught, signal.SIG_IGN)
+    raise SystemExit(128 + signum)
+
+
 def main():
+    for caught in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(caught, terminate)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True)
     parser.add_argument("--output", required=True)

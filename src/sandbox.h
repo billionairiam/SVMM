@@ -88,6 +88,7 @@ void sandbox_config_init(struct sandbox_config *config);
  *
  * 客户机正常结束（poweroff、reset、Ctrl-A x、SIGINT/SIGTERM/SIGHUP）返回 0；
  * 配置无法满足、KVM 出错或客户机三重故障返回 1。
+ * --workload 模式返回应用退出码；缺少有效完成报告或启动失败返回 125。
  */
 int sandbox_run(const struct sandbox_config *config);
 
