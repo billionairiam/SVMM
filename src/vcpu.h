@@ -26,6 +26,8 @@ struct vcpu_mmio_region {
 
 struct vcpu {
     int fd;
+    int workload_mode;
+    int workload_exit_status; /* -1 until a valid completion report */
     struct kvm_run *run;
     size_t run_size;
     /* vcpu_request_stop() 设置；可能在信号处理函数中写入。 */
@@ -62,6 +64,7 @@ struct vcpu_run_stats {
     unsigned long serial_exits;
     unsigned exit_reason;
     int entered;
+    int host_stopped;
     /* 按 kvm_run->exit_reason 分类的退出次数。 */
     unsigned long reason_exits[VCPU_EXIT_REASON_SLOTS];
     /* 按（端口, 方向）分类的 KVM_EXIT_IO 次数，REP INS/OUTS 算一次。 */

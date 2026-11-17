@@ -32,6 +32,8 @@ static void print_usage(FILE *stream)
             "                       \"%s\"\n"
             "  -d, --disk PATH      raw disk image exposed as virtio-blk (/dev/vda);\n"
             "                       opened read-write and locked while the VM runs\n"
+            "      --workload       boot an OCI root disk with the workload initramfs;\n"
+            "                       return the guest application exit status\n"
             "  -t, --tap IFNAME     existing TAP interface exposed as virtio-net (eth0);\n"
             "                       create one with scripts/setup-tap.sh\n"
             "  -n, --netns NAME     enter network namespace /var/run/netns/NAME before\n"
@@ -111,6 +113,7 @@ enum {
     OPT_NPROC,
     OPT_WARM_SAVE,
     OPT_RESTORE,
+    OPT_WORKLOAD,
 };
 
 int cli_parse(int argc, char **argv, struct sandbox_config *config)
@@ -148,6 +151,7 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
         { "snapshot", required_argument, NULL, 's' },
         { "warm-save", required_argument, NULL, OPT_WARM_SAVE },
         { "restore", required_argument, NULL, OPT_RESTORE },
+        { "workload", no_argument, NULL, OPT_WORKLOAD },
         { "help", no_argument, NULL, 'h' },
         { 0 },
     };
@@ -247,6 +251,9 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
             else
                 config->restore_name = optarg;
             break;
+        case OPT_WORKLOAD:
+            config->workload = 1;
+            break;
         case 'h':
             print_usage(stdout);
             exit(0);
@@ -271,6 +278,9 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
     if (config->restore_name && config->jail.enabled)
         return usage_error("--restore cannot be combined with --jail (memory.max would be "
                            "derived from --mem, not from the snapshot)");
+    if (config->workload && (!config->disk_path ||
+        (!config->restore_name && (!config->initrd_path || !*config->initrd_path))))
+        return usage_error("--workload requires --disk and, for cold boot, --initrd");
     if (config->snapshot_name && !config->disk_path)
         return usage_error("--snapshot requires --disk (the snapshot is restored into it)");
     if (jail_suboption && !config->jail.enabled)

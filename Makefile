@@ -46,7 +46,7 @@ $(foreach variant,$(ABLATION_VARIANTS),$(eval $(call ABLATION_template,$(variant
 
 -include $(DEPFILES) $(ABLATION_DEPFILES)
 
-.PHONY: all ablation initramfs disk run run-disk run-net run-virtq test clean \
+.PHONY: all ablation initramfs workload-initramfs disk run run-disk run-net run-virtq test clean \
         netns netns-down run-netns jail-setup jail-clean run-jail \
         snapshot-save snapshot-list run-snapshot run-warm run-restore help
 
@@ -68,6 +68,16 @@ all: bin/svmm bin/virtq-demo
 ablation: $(ABLATION_VARIANTS:%=bin/ablation/%/svmm)
 
 initramfs: build/initramfs.cpio.gz
+
+# Static guest PID 1: independent of the OCI image's libc or shell.
+GUEST_CC ?= musl-gcc
+workload-initramfs: build/workload-initramfs.cpio.gz
+
+build/workload-init: guest/init.c src/workload.h | build
+	$(GUEST_CC) -Isrc -std=c11 -Wall -Wextra -Werror -O2 -static $< -o $@
+
+build/workload-initramfs.cpio.gz: build/workload-init rootfs/build-workload-initramfs.sh | build
+	sh rootfs/build-workload-initramfs.sh $< $@
 
 disk: | build
 	@if [ -e $(DISK) ]; then \

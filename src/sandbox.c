@@ -293,7 +293,7 @@ int sandbox_run(const struct sandbox_config *config)
         BLOG_GUEST_MEMORY_MB : config->mem_size_mb;
     size_t memory_size = 0;
     int serial_ready = 0;
-    int status = 1;
+    int status = config->workload ? 125 : 1;
     /* Stage 11 --restore：快照的内容和解码出的状态。 */
     const char *restore = config->restore_name;
     struct snapshot_warm_image warm = { .memory_fd = -1 };
@@ -524,6 +524,7 @@ int sandbox_run(const struct sandbox_config *config)
         goto done;
     }
 register_mmio:
+    vcpu.workload_mode = config->workload;
     /*
      * 把 virtio 寄存器页登记给 vCPU 的 MMIO 分派。KVM 本身不知道哪个地址属于
      * 哪个设备，它只报告“客户机访问了某个未映射的 GPA”，由 VMM 自己查表。
@@ -597,7 +598,12 @@ register_mmio:
         if (vcpu_run(&vcpu, &serial, &run_stats) < 0)
             break;
         if (!(vcpu.save_requested && config->warm_save_name) || warm_save(&parts) == 0) {
-            status = 0;
+            if (!config->workload || vcpu.save_requested || run_stats.host_stopped)
+                status = 0;
+            else if (vcpu.workload_exit_status >= 0)
+                status = vcpu.workload_exit_status;
+            else
+                fprintf(stderr, "ERROR: guest stopped without a workload exit report\n");
             break;
         }
         vcpu_clear_stop(&vcpu);

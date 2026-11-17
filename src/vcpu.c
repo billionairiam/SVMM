@@ -1,4 +1,5 @@
 #include "vcpu.h"
+#include "workload.h"
 
 #include "ablation.h"
 #include "boot/acpi.h"
@@ -453,6 +454,7 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
 {
     /* 限制“未模拟设备”日志条数，避免内核探测硬件时刷屏。 */
     unsigned ignored_io = 0;
+    vcpu->workload_exit_status = -1;
     *stats = (struct vcpu_run_stats){ 0 };
     vcpu->thread = pthread_self();
     vcpu->thread_valid = 1;
@@ -462,6 +464,7 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
                 fprintf(stderr, "\r\nINFO: vCPU paused for warm snapshot\r\n");
                 return vcpu_finish(stats, "warm_save", 0);
             }
+            stats->host_stopped = 1;
             fprintf(stderr, "INFO: VMM stopped by host request\n");
             return vcpu_finish(stats, "host_stop", 0);
         }
@@ -536,6 +539,18 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
                 return vcpu_finish(stats, "invalid_io_data", -1);
             }
             uint8_t *data = (uint8_t *)run + offset;
+            if (vcpu->workload_mode && run->io.port == WORKLOAD_EXIT_PORT &&
+                run->io.direction == KVM_EXIT_IO_OUT && run->io.size == 4 &&
+                run->io.count == 1) {
+                uint32_t message;
+                memcpy(&message, data, sizeof(message));
+                if ((message & WORKLOAD_EXIT_MASK) == WORKLOAD_EXIT_MAGIC) {
+                    vcpu->workload_exit_status = (int)(message & 0xff);
+                    fprintf(stderr, "INFO: workload exited status=%d\n",
+                            vcpu->workload_exit_status);
+                    return vcpu_finish(stats, "workload_exit", 0);
+                }
+            }
             const char *event = NULL;
             int platform = platform_handle_io(run, data, data_size, &event);
             if (platform > 0) {
