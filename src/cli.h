@@ -10,6 +10,10 @@ struct sandbox_config;
  */
 int cli_parse(int argc, char **argv, struct sandbox_config *config);
 
+/* Canonical image-run arguments, allocated after successful cli_parse. */
+char **cli_image_arguments(int argc, char **argv);
+void cli_free_arguments(char **arguments);
+
 /*
  * `svmm snapshot ACTION [options]`（Stage 10），argv[1] 是 "snapshot"。
  * 返回进程退出码：0 成功，1 操作失败，2 用法错误。

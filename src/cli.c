@@ -17,6 +17,8 @@ static void print_usage(FILE *stream)
 {
     fprintf(stream,
             "Usage: " PROGRAM " run --kernel PATH [options]\n"
+            "       " PROGRAM " run --image IMAGE [options] [-- COMMAND ARGS...]\n"
+            "       " PROGRAM " run --image IMAGE [options] [-- COMMAND ARGS...]\n"
             "       " PROGRAM " run --restore NAME [--disk PATH] [--tap IFNAME] [options]\n"
             "       " PROGRAM " snapshot list|save|validate|delete [options]\n"
             "                (cold and warm snapshots; see '" PROGRAM " snapshot --help')\n"
@@ -25,7 +27,14 @@ static void print_usage(FILE *stream)
             "attached to this process's stdin/stdout.\n"
             "\n"
             "Options:\n"
-            "  -k, --kernel PATH    x86 bzImage to boot (required)\n"
+            "      --image REF      pull if needed, prepare a private rootfs, run in a VM;\n"
+            "                       automatically select kernel and workload initramfs\n"
+            "      --entrypoint EXE with --image: override entrypoint and clear image CMD\n"
+            "      --env KEY=VALUE  with --image: override environment (repeatable)\n"
+            "      --workdir PATH   with --image: override working directory\n"
+            "      --user USER      with --image: override USER[:GROUP]\n"
+            "      --size-mb MB     with --image: writable root disk size (default: auto)\n"
+            "  -k, --kernel PATH    x86 bzImage (auto-selected with --image)\n"
             "  -i, --initrd PATH    initramfs (cpio or cpio.gz) unpacked as the root fs\n"
             "  -m, --mem SIZE_MB    guest memory in MiB, %u-%u (default: %u)\n"
             "  -c, --cmdline STR    kernel command line, default:\n"
@@ -114,6 +123,39 @@ enum {
     OPT_WARM_SAVE,
     OPT_RESTORE,
     OPT_WORKLOAD,
+    OPT_IMAGE,
+    OPT_ENTRYPOINT,
+    OPT_ENV,
+    OPT_WORKDIR,
+    OPT_USER,
+    OPT_SIZE_MB,
+};
+
+static const struct option run_options[] = {
+    { "kernel", required_argument, NULL, 'k' },
+    { "initrd", required_argument, NULL, 'i' },
+    { "mem", required_argument, NULL, 'm' },
+    { "cmdline", required_argument, NULL, 'c' },
+    { "disk", required_argument, NULL, 'd' },
+    { "tap", required_argument, NULL, 't' },
+    { "netns", required_argument, NULL, 'n' },
+    { "jail", no_argument, NULL, 'j' },
+    { "cpu-max", required_argument, NULL, OPT_CPU_MAX },
+    { "memory-max", required_argument, NULL, OPT_MEMORY_MAX },
+    { "nofile", required_argument, NULL, OPT_NOFILE },
+    { "nproc", required_argument, NULL, OPT_NPROC },
+    { "snapshot", required_argument, NULL, 's' },
+    { "warm-save", required_argument, NULL, OPT_WARM_SAVE },
+    { "restore", required_argument, NULL, OPT_RESTORE },
+    { "workload", no_argument, NULL, OPT_WORKLOAD },
+    { "image", required_argument, NULL, OPT_IMAGE },
+    { "entrypoint", required_argument, NULL, OPT_ENTRYPOINT },
+    { "env", required_argument, NULL, OPT_ENV },
+    { "workdir", required_argument, NULL, OPT_WORKDIR },
+    { "user", required_argument, NULL, OPT_USER },
+    { "size-mb", required_argument, NULL, OPT_SIZE_MB },
+    { "help", no_argument, NULL, 'h' },
+    { 0 },
 };
 
 int cli_parse(int argc, char **argv, struct sandbox_config *config)
@@ -135,26 +177,6 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
     if (strcmp(subcommand, "run") != 0)
         return usage_error("unknown subcommand '%s'", subcommand);
 
-    static const struct option options[] = {
-        { "kernel", required_argument, NULL, 'k' },
-        { "initrd", required_argument, NULL, 'i' },
-        { "mem", required_argument, NULL, 'm' },
-        { "cmdline", required_argument, NULL, 'c' },
-        { "disk", required_argument, NULL, 'd' },
-        { "tap", required_argument, NULL, 't' },
-        { "netns", required_argument, NULL, 'n' },
-        { "jail", no_argument, NULL, 'j' },
-        { "cpu-max", required_argument, NULL, OPT_CPU_MAX },
-        { "memory-max", required_argument, NULL, OPT_MEMORY_MAX },
-        { "nofile", required_argument, NULL, OPT_NOFILE },
-        { "nproc", required_argument, NULL, OPT_NPROC },
-        { "snapshot", required_argument, NULL, 's' },
-        { "warm-save", required_argument, NULL, OPT_WARM_SAVE },
-        { "restore", required_argument, NULL, OPT_RESTORE },
-        { "workload", no_argument, NULL, OPT_WORKLOAD },
-        { "help", no_argument, NULL, 'h' },
-        { 0 },
-    };
     /*
      * 从子命令开始交给 getopt_long，"run" 充当 argv[0]。"+" 遇到第一个
      * 非选项参数就停止（不重排），":" 让缺少参数时返回 ':'；
@@ -171,9 +193,10 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
     int index;
     /* --restore 时这些来自快照，给了就是用法错误；--mem 有默认值，只能另外记。 */
     const char *boot_option = NULL;
-    while ((opt = getopt_long(sub_argc, sub_argv, "+:k:i:m:c:d:t:n:js:h", options, &index)) != -1) {
+    int image_options = 0;
+    while ((opt = getopt_long(sub_argc, sub_argv, "+:k:i:m:c:d:t:n:js:h", run_options, &index)) != -1) {
         if (opt >= OPT_CPU_MAX && opt <= OPT_NPROC && !jail_suboption)
-            jail_suboption = options[index].name;
+            jail_suboption = run_options[index].name;
         if (!boot_option && (opt == 'k' || opt == 'i' || opt == 'm' || opt == 'c' || opt == 's'))
             boot_option = opt == 'k' ? "--kernel" : opt == 'i' ? "--initrd" :
                           opt == 'm' ? "--mem" : opt == 'c' ? "--cmdline" : "--snapshot";
@@ -251,6 +274,34 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
             else
                 config->restore_name = optarg;
             break;
+        case OPT_IMAGE:
+            if (!*optarg)
+                return usage_error("--image requires a non-empty image reference");
+            config->image = optarg;
+            break;
+        case OPT_ENV:
+            if (!strchr(optarg, '=') || *optarg == '=')
+                return usage_error("--env requires KEY=VALUE");
+            image_options = 1;
+            break;
+        case OPT_WORKDIR:
+            if (*optarg != '/')
+                return usage_error("--workdir requires an absolute path");
+            image_options = 1;
+            break;
+        case OPT_USER:
+            if (!*optarg)
+                return usage_error("--user requires a user or numeric identity");
+            image_options = 1;
+            break;
+        case OPT_SIZE_MB:
+            if (parse_uint(optarg, 16, 1u << 20, &value) < 0)
+                return usage_error("--size-mb must be an integer from 16 to %u", 1u << 20);
+            image_options = 1;
+            break;
+        case OPT_ENTRYPOINT:
+            image_options = 1;
+            break;
         case OPT_WORKLOAD:
             config->workload = 1;
             break;
@@ -265,12 +316,17 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
             return usage_error("unknown option '%s'", sub_argv[optind - 1]);
         }
     }
-    if (optind < sub_argc)
+    if (optind < sub_argc &&
+        (!config->image || optind == 0 || strcmp(sub_argv[optind - 1], "--")))
         return usage_error("unexpected argument '%s'", sub_argv[optind]);
+    if (image_options && !config->image)
+        return usage_error("--entrypoint/--env/--workdir/--user/--size-mb require --image");
+    if (config->image && (config->disk_path || config->snapshot_name || config->restore_name))
+        return usage_error("--image cannot be combined with --disk, --snapshot or --restore");
     if (config->restore_name && boot_option)
         return usage_error("--restore takes the kernel, memory size and command line from "
                            "the snapshot; remove %s", boot_option);
-    if (!config->restore_name && (!config->kernel_path || !*config->kernel_path))
+    if (!config->image && !config->restore_name && (!config->kernel_path || !*config->kernel_path))
         return usage_error("--kernel is required");
     if (config->warm_save_name && config->jail.enabled)
         return usage_error("--warm-save cannot be combined with --jail (the snapshot is "
@@ -278,7 +334,7 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
     if (config->restore_name && config->jail.enabled)
         return usage_error("--restore cannot be combined with --jail (memory.max would be "
                            "derived from --mem, not from the snapshot)");
-    if (config->workload && (!config->disk_path ||
+    if (config->workload && !config->image && (!config->disk_path ||
         (!config->restore_name && (!config->initrd_path || !*config->initrd_path))))
         return usage_error("--workload requires --disk and, for cold boot, --initrd");
     if (config->snapshot_name && !config->disk_path)
@@ -288,6 +344,72 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
     if (config->jail.enabled)
         jail_profile_finish(&config->jail, config->mem_size_mb);
     return 0;
+}
+
+
+/* Reuse the native option table rather than interpreting raw arguments again
+ * in Python. Canonical --name=value tokens preserve opaque option values and
+ * grouped short options; only the real application separator stays "--". */
+void cli_free_arguments(char **arguments)
+{
+    if (!arguments) return;
+    for (size_t i = 0; arguments[i]; ++i) free(arguments[i]);
+    free(arguments);
+}
+
+static int image_argument_add(char ***arguments, size_t *count, size_t *capacity,
+                              char *value)
+{
+    if (!value) return -1;
+    if (*count + 1 >= *capacity) {
+        size_t next = *capacity * 2;
+        char **grown = realloc(*arguments, next * sizeof(char *));
+        if (!grown) {
+            free(value);
+            return -1;
+        }
+        *arguments = grown;
+        *capacity = next;
+    }
+    (*arguments)[(*count)++] = value;
+    (*arguments)[*count] = NULL;
+    return 0;
+}
+
+char **cli_image_arguments(int argc, char **argv)
+{
+    size_t count = 0, capacity = 16;
+    char **arguments = calloc(capacity, sizeof(char *));
+    if (!arguments) return NULL;
+    optind = 0;
+    opterr = 0;
+    int option, index;
+    while ((option = getopt_long(argc - 1, argv + 1, "+:k:i:m:c:d:t:n:js:h",
+                                 run_options, &index)) != -1) {
+        const struct option *entry = run_options;
+        while (entry->name && entry->val != option) ++entry;
+        if (!entry->name) {
+            errno = EINVAL;
+            goto fail;
+        }
+        char *value = NULL;
+        int length = entry->has_arg == required_argument ?
+            asprintf(&value, "--%s=%s", entry->name, optarg) :
+            asprintf(&value, "--%s", entry->name);
+        if (length < 0 || image_argument_add(&arguments, &count, &capacity, value) < 0)
+            goto fail;
+    }
+    if (optind < argc - 1) {
+        if (image_argument_add(&arguments, &count, &capacity, strdup("--")) < 0)
+            goto fail;
+        for (int i = optind + 1; i < argc; ++i)
+            if (image_argument_add(&arguments, &count, &capacity, strdup(argv[i])) < 0)
+                goto fail;
+    }
+    return arguments;
+fail:
+    cli_free_arguments(arguments);
+    return NULL;
 }
 
 /* ---------- svmm snapshot ---------- */

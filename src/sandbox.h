@@ -27,8 +27,10 @@
  *   restore_name   PUT /snapshot/load + resume_vm（热快照，不 boot）
  */
 struct sandbox_config {
-    /* x86 bzImage 路径，必填。 */
+    /* x86 bzImage 路径；--image 可由协调器选择，普通冷启动必填。 */
     const char *kernel_path;
+    /* Host-side OCI image preparation; dispatched before sandbox_run. */
+    const char *image;
     /* initramfs（cpio 或 cpio.gz）路径；NULL 或空串表示不加载。 */
     const char *initrd_path;
     /* 客户机内存大小，单位 MiB，范围见 memory.h。 */

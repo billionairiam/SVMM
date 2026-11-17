@@ -2,7 +2,32 @@
 
 把镜像的 rootfs 转为 ext4，通过现有 virtio-blk 交给 VM；SVMM 提供静态 guest init，负责挂载、网络、应用配置、进程回收和退出状态。镜像里无需安装 Docker Engine、shell 或系统 init。每台 VM 运行一个主应用及其子进程。
 
-### 构建和运行
+### 一条命令启动镜像
+
+```sh
+make all
+sudo bin/svmm run --image my-app:latest
+
+# 也可以覆盖镜像命令和环境：
+sudo bin/svmm run --image ubuntu:24.04 --env HELLO=world \
+  -- /bin/sh -c 'echo "$HELLO"; exit 7'
+```
+
+本地没有镜像时自动拉取，随后准备独立的可写 ext4 rootfs 并启动 VM；应用退出码直接返回。每次运行创建新的临时磁盘，退出后清理。镜像原有 ENTRYPOINT、CMD、ENV、WORKDIR、USER 默认生效；`--entrypoint`、`--env`、`--workdir`、`--user`、`--size-mb` 均可直接用于 `run --image`。`--` 后的参数原样交给应用。
+
+内核按以下顺序选择：`--kernel`、`SVMM_KERNEL`、仓库的 `images/bzImage`，最后从 `/boot/vmlinuz-*` 中查找配置确认具备所需内建驱动和运行时能力的内核。找不到时会在拉取镜像前给出明确错误。首次使用会自动构建默认 workload initramfs；也可通过 `--initrd` 或 `SVMM_INITRD` 指定。
+
+```sh
+sudo bin/svmm run --image my-app:latest --kernel /path/to/bzImage
+sudo bin/svmm run --image my-app:latest --tap tap0 --jail
+sudo bin/svmm run --image my-app:latest --warm-save app
+# Ctrl-A s 或向启动进程发送 SIGUSR2 保存；临时磁盘清理后快照仍可恢复：
+sudo bin/svmm run --restore app --disk build/restored.ext4 --workload
+```
+
+`--image` 与 `--disk`、`--snapshot`、`--restore` 互斥。需要直接管理磁盘和持久化时使用下面的手动路径。现有 TAP/netns 由用户配置；镜像准备和临时文件清理位于 VMM jail 之外。请保留仓库的 bin/scripts/guest/rootfs 布局，方便二进制定位运行资源，调用时可位于任意工作目录。
+
+### 手动构建和运行
 
 宿主机需要 Docker CLI/daemon、Python 3、e2fsprogs、musl-gcc、cpio 和 gzip，以及带内建 ACPI、virtio-mmio、virtio-blk、ext4、devtmpfs 的 x86_64 Linux 内核。网络还需要 virtio-net。可以用 `GUEST_CC=...` 指定其他能产出静态 Linux x86_64 程序的编译器。
 

@@ -193,11 +193,12 @@ run-restore: all disk
 	@./bin/svmm run --restore $(SNAPSHOT) --disk $(DISK)
 
 test-workload: all workload-initramfs
-	python3 -m unittest -v tests/test_workload.py
+	python3 -m unittest -v tests/test_workload.py tests/test_run_image.py
 
 help:
 	@echo "make all          build bin/svmm and bin/virtq-demo"
 	@echo "make initramfs    build $(INITRD)"
+	@echo "bin/svmm run --image IMAGE  prepare and run an OCI image in a VM"
 	@echo "make workload-initramfs  build the static OCI workload guest init"
 	@echo "make test-workload       run real Docker-to-KVM workload E2E"
 	@echo "make run          boot KERNEL with the initramfs"
@@ -241,6 +242,7 @@ test: bin/test_metrics bin/test_vcpu_errors bin/test_virtq bin/test_virtio_blk \
 	python3 -m unittest -v tests/test_snapshot.py
 	python3 -m unittest -v tests/test_warm_snapshot.py
 	python3 -m unittest -v tests/test_workload.py
+	python3 -m unittest -v tests/test_run_image.py
 
 clean:
 	rm -rf build bin
