@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 
 struct kvm_context;
 struct kvm_run;
@@ -14,17 +15,24 @@ struct linux_initrd;
 
 #define TDX_PAGE_SIZE 4096u
 #define TDX_GPA_SHARED (UINT64_C(1) << 47)
+#define TDX_HIGH_RAM_BASE (UINT64_C(1) << 32)
+#define TDX_MAX_MEM_MB (32u * 1024u)
 
 struct tdx_range {
     uint64_t start, size;
 };
 
 struct tdx_vm {
-    int vm_fd, ram_fd, firmware_fd;
+    int vm_fd, ram_fd, high_ram_fd, firmware_fd;
     struct guest_memory *ram;
+    uint64_t low_ram_size, high_ram_size;
     uint8_t *firmware;
     uint64_t firmware_base, firmware_size;
     uint8_t *shared_pages;
+    pthread_mutex_t dma_lock;
+    int dma_lock_ready;
+    uint64_t xfam;
+    uint32_t cpuid_avx;
 };
 
 /* Parsed, bounded boot material. No pointers to KVM private pages. */

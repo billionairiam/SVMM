@@ -5,6 +5,7 @@
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/reboot.h>
+#include <sys/sysinfo.h>
 #include <unistd.h>
 
 /* Linux TDX guest UAPI. The first 256 bytes of TDREPORT are REPORTMACSTRUCT. */
@@ -33,6 +34,13 @@ int main(void)
         fputs("TDREPORT says debug enabled\n", stderr);
     } else {
         puts("SVMM_TDREPORT_OK");
+        struct sysinfo info;
+        if (sysinfo(&info) == 0)
+            printf("SVMM_TD_RAM=%llu\n", (unsigned long long)info.totalram * info.mem_unit);
+        if (__builtin_cpu_supports("avx")) {
+            __asm__ volatile("vxorps %%ymm0, %%ymm0, %%ymm0" ::: "ymm0");
+            puts("SVMM_TD_AVX_OK");
+        }
         fflush(stdout);
     }
     close(fd);

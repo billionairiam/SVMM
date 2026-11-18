@@ -204,9 +204,8 @@ static struct virtio_mmio_queue *live_queue(struct virtio_mmio *dev, uint32_t qu
         (dev->status & (VIRTIO_STATUS_DEVICE_NEEDS_RESET | VIRTIO_STATUS_FAILED)))
         return NULL;
     struct virtio_mmio_queue *q = &dev->queues[queue];
-    /* A TD may have converted any part of an already registered ring
-     * since its previous kick. Its only device runs synchronously on the
-     * same vCPU thread as MapGPA so the ranges stay stable for this kick. */
+    /* A TD may have converted queue pages back to private. Callers hold
+     * the DMA lock from this validation through queue processing. */
     if (dev->translate_dma && !queue_setup_valid(dev, q)) {
         needs_reset(dev);
         return NULL;
@@ -240,18 +239,32 @@ static void queue_processed(struct virtio_mmio *dev, struct virtq *vq, uint16_t 
         needs_reset(dev);
 }
 
+static void lock_device(struct virtio_mmio *dev)
+{
+    pthread_mutex_lock(&dev->lock);
+    if (dev->dma_lock)
+        pthread_mutex_lock(dev->dma_lock);
+}
+
+static void unlock_device(struct virtio_mmio *dev)
+{
+    if (dev->dma_lock)
+        pthread_mutex_unlock(dev->dma_lock);
+    pthread_mutex_unlock(&dev->lock);
+}
+
 int virtio_mmio_run_queue(struct virtio_mmio *dev, uint32_t queue,
                           int (*fn)(struct virtio_mmio *dev, struct virtq *vq, void *arg),
                           void *arg)
 {
-    pthread_mutex_lock(&dev->lock);
+    lock_device(dev);
     struct virtio_mmio_queue *q = live_queue(dev, queue);
     if (q) {
         uint16_t before = q->vq.next_used_idx;
         int rc = fn(dev, &q->vq, arg);
         queue_processed(dev, &q->vq, before, rc);
     }
-    pthread_mutex_unlock(&dev->lock);
+    unlock_device(dev);
     return q != NULL;
 }
 
@@ -516,9 +529,9 @@ bad:
 void virtio_mmio_access(struct virtio_mmio *dev, uint64_t offset, uint8_t *data,
                         uint32_t len, int is_write)
 {
-    pthread_mutex_lock(&dev->lock);
+    lock_device(dev);
     access_locked(dev, offset, data, len, is_write);
-    pthread_mutex_unlock(&dev->lock);
+    unlock_device(dev);
 }
 
 /* ---------- Stage 11：热快照 ---------- */

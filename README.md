@@ -11,11 +11,18 @@ echo $?
 
 # 配置默认固件和内核后，直接运行镜像的 ENTRYPOINT 和 CMD。
 sudo bin/svmm run --tdx --image my-app:latest
+
+# 复用现有 TAP 和网络命名空间。
+sudo bin/svmm run --tdx --image my-app:latest --tap tap0 --netns sandbox-ns --mem 4096
 ```
 
 需要启用 TDX 的 Intel 宿主机和提供该 KVM ABI 的 Linux。在 Linux 7.0 上验证。固件使用 TD-Shim 的 Linux payload 构建（上游仓库的 `bash sh_script/build_final.sh boot_kernel`）。可通过 `SVMM_TD_SHIM` 或仓库的 `images/td-shim.bin` 设置默认固件。显式 `--kernel` 优先，其次是 `SVMM_KERNEL`、`images/tdx-bzImage` 与兼容的 `/boot/vmlinuz-*`。
 
 Guest 内核需要内建 `INTEL_TDX_GUEST`、`KVM_GUEST`、`X86_X2APIC`、`SWIOTLB`、`DEVPORT`，以及普通 workload 所需的 ACPI、串口、initramfs、virtio-mmio、virtio-blk 和 ext4。`DEVPORT` 用于由 guest 内核写出应用退出码，guest 安全策略要允许 PID 1 打开 `/dev/port`。硬件验证还需要内建 `TDX_GUEST_DRIVER`。
+
+使用 `--tap` 时内核还需要内建 `VIRTIO_NET`。镜像启动会检查候选文件的 64 位 bzImage 头和长度，自动选核时会按所用设备检查内核配置。带 TAP 自动选择随包内核时，从 `images/tdx-bzImage.config` 读取配置，也可以用 `--kernel` 指定已知兼容的内核。TAP 和 netns 由宿主配置，可复用 `scripts/setup-tap.sh` 和 `scripts/setup-netns-policy.sh`。workload 默认配置 `eth0` 为 `192.168.100.2/24`，网关为 `192.168.100.1`。
+
+TDX 的 `--mem` 上限为 32768 MiB。超过 3072 MiB 的 RAM 放到 4 GiB 以上，保留低地址设备和固件窗口。宿主 KVM TDX 支持 AVX 时，SVMM 会启用相应的 CPU 状态和可协商的 CPUID 位。
 
 也可以提供已有的 ext4 镜像，退出后保留磁盘写入。
 
@@ -25,14 +32,16 @@ sudo bin/svmm run --tdx --td-shim /path/to/td-shim.bin \
   --workload --disk build/app.ext4
 ```
 
-首版支持离线运行。TD 的私有内存由硬件保护，设备只访问 guest 显式共享的 virtio 队列与 DMA 缓冲区。宿主可以读取 OCI 盘镜像及串口输出。启动测量覆盖导入的固件、启动参数、内核与 initramfs。本地 TDREPORT 用来验证真实 TD 启动，远程 Quote 和密钥下发需要单独接入。TDX 模式拒绝网络、jail 和快照配置。TDX 初始化失败时命令直接退出。
+TD 的私有内存由硬件保护，设备只访问 guest 显式共享的 virtio 队列与 DMA 缓冲区。宿主可以读取 OCI 盘镜像、串口输出和 TAP 流量。启动测量覆盖导入的固件、启动参数、内核与 initramfs。本地 TDREPORT 用来验证真实 TD 启动，远程 Quote 和密钥下发需要单独接入。TDX 模式拒绝 jail 和快照配置。TDX 初始化失败时命令直接退出。
+
+网络、AVX 和大内存更新调整了 TD 的启动测量。固定使用旧 MRTD 的部署需要更新预期值。
 
 ```sh
 sudo env SVMM_TEST_TDX_KERNEL=/path/to/tdx-bzImage \
   SVMM_TEST_TD_SHIM=/path/to/td-shim.bin make test-tdx
 ```
 
-测试在真实硬件上检查非调试 TD 的 TDREPORT、ext4 读写、退出码、镜像默认命令、Registry 拉取及失败路径。测试镜像默认为 `ubuntu:24.04`，可用 `SVMM_TEST_TDX_IMAGE` 指定带 `/bin/sh` 的兼容镜像。
+测试在真实硬件上检查非调试 TD 的 TDREPORT、内核兼容性、AVX 指令、4 GiB 内存布局、TCP 收发、ext4 读写、退出码、镜像默认命令、Registry 拉取及失败路径。网络用例需要 `ip` 和 `/dev/net/tun`，使用临时 netns。测试镜像默认为 `ubuntu:24.04`，可用 `SVMM_TEST_TDX_IMAGE` 指定带 `/bin/sh` 的兼容镜像。
 
 # Stage 12：直接运行 OCI / Docker 镜像里的应用
 

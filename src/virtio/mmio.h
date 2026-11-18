@@ -159,6 +159,7 @@ struct virtio_mmio {
     /* Optional private-VM DMA translator. Installed before the first KVM_RUN. */
     void *(*translate_dma)(void *opaque, uint64_t gpa, uint64_t len);
     void *dma_opaque;
+    pthread_mutex_t *dma_lock;
 
     /* driver 可见的寄存器状态。 */
     uint32_t status;

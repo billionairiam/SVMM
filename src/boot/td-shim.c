@@ -220,7 +220,7 @@ static int append_guid(struct hob_writer *w, const uint8_t guid[16],
            append(w, padding, (8 - size % 8) % 8) ? -1 : 0;
 }
 
-static int build_hob(const struct section *section, struct guest_memory *ram, uint64_t entry)
+static int build_hob(const struct section *section, struct tdx_vm *td, uint64_t entry)
 {
     static const uint8_t payload_guid[16] = {
         0x12, 0xa4, 0x6f, 0xb9, 0x1f, 0x46, 0xe3, 0x4b,
@@ -236,16 +236,24 @@ static int build_hob(const struct section *section, struct guest_memory *ram, ui
     };
     struct hob_memory memory = {
         .header = { .type = 3, .length = sizeof(memory) },
-        .attributes = 7, .size = ram->size,
+        .attributes = 7, .size = td->low_ram_size,
     };
     struct {
         uint32_t format, reserved;
         uint64_t entry;
     } payload = { .format = 2, .entry = entry }; /* RawVmLinux */
     struct hob_header end = { .type = 0xffff, .length = sizeof(end) };
+    struct guest_memory *ram = td->ram;
     struct hob_writer w = { .data = ram->data + section->address, .size = section->size };
-    if (append(&w, &phit, sizeof(phit)) || append(&w, &memory, sizeof(memory)) ||
-        append_guid(&w, payload_guid, &payload, sizeof(payload)))
+    if (append(&w, &phit, sizeof(phit)) || append(&w, &memory, sizeof(memory)))
+        return -1;
+    if (td->high_ram_size) {
+        memory.start = TDX_HIGH_RAM_BASE;
+        memory.size = td->high_ram_size;
+        if (append(&w, &memory, sizeof(memory)))
+            return -1;
+    }
+    if (append_guid(&w, payload_guid, &payload, sizeof(payload)))
         return -1;
     const unsigned tables[] = { ACPI_FADT_ADDR, ACPI_DSDT_ADDR, ACPI_MADT_ADDR };
     for (size_t i = 0; i < sizeof(tables) / sizeof(*tables); ++i) {
@@ -301,15 +309,15 @@ int td_shim_stage(const struct td_shim *shim, struct tdx_vm *td,
         goto invalid;
     memcpy(&header, image->data + header_offset, sizeof(header));
     uint64_t kernel = image->runtime_start;
+    uint64_t stub_end = shim->payload.address + TDX_PAGE_SIZE;
     uint64_t initrd_size = ALIGN_PAGE(initrd->size);
-    uint64_t limit = ram->size - SHIM_RUNTIME_RESERVE;
+    uint64_t limit = td->low_ram_size - SHIM_RUNTIME_RESERVE;
     if (!within(kernel, image->init_size, limit) ||
         (initrd->size && !within(initrd->addr, initrd_size, limit))) {
         fprintf(stderr, "ERROR: kernel or initrd overlaps the TD-Shim runtime reservation\n");
         return -1;
     }
-    if (!(header.xloadflags & XLF_KERNEL_64) || kernel < shim->payload.address + TDX_PAGE_SIZE ||
-        !within(kernel, image->kernel_size, shim->payload.address + shim->payload.size) ||
+    if (!(header.xloadflags & XLF_KERNEL_64) || kernel < stub_end || kernel % TDX_PAGE_SIZE ||
         image->kernel_size <= 0x200 ||
         !within(shim->payload.address, shim->payload.size, limit) ||
         (initrd->size && (initrd->addr < kernel + image->init_size ||
@@ -343,12 +351,13 @@ int td_shim_stage(const struct td_shim *shim, struct tdx_vm *td,
     memcpy(ram->data + header.cmd_line_ptr, cmdline, strlen(cmdline) + 1);
     memcpy(ram->data + kernel, image->data + image->setup_size, image->kernel_size);
     stage_linux_stub(ram->data + shim->payload.address, &header, (uint32_t)kernel + 0x200);
-    if (build_hob(&shim->hob, ram, shim->payload.address) < 0)
+    if (build_hob(&shim->hob, td, shim->payload.address) < 0)
         goto invalid;
 
     *hob = shim->hob.address;
-    measure[0] = (struct tdx_range){ *hob, ALIGN_PAGE(kernel + image->kernel_size) - *hob };
-    measure[1] = (struct tdx_range){ initrd->addr, initrd_size };
+    measure[0] = (struct tdx_range){ *hob, stub_end - *hob };
+    measure[1] = (struct tdx_range){ kernel, ALIGN_PAGE(image->kernel_size) };
+    measure[2] = (struct tdx_range){ initrd->addr, initrd_size };
     return 0;
 invalid:
     fprintf(stderr, "ERROR: incompatible TD-Shim, bzImage or initrd layout\n");

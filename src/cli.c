@@ -3,6 +3,7 @@
 #include "memory.h"
 #include "sandbox.h"
 #include "snapshot.h"
+#include "tdx.h"
 
 #include <errno.h>
 #include <getopt.h>
@@ -39,6 +40,7 @@ static void print_usage(FILE *stream)
             "  -k, --kernel PATH    x86 bzImage (auto-selected with --image)\n"
             "  -i, --initrd PATH    initramfs (cpio or cpio.gz) unpacked as the root fs\n"
             "  -m, --mem SIZE_MB    guest memory in MiB, %u-%u (default: %u)\n"
+            "                       --tdx supports up to %u MiB\n"
             "  -c, --cmdline STR    kernel command line, default:\n"
             "                       \"%s\"\n"
             "  -d, --disk PATH      raw disk image exposed as virtio-blk (/dev/vda);\n"
@@ -70,7 +72,7 @@ static void print_usage(FILE *stream)
             "  -h, --help           show this help\n"
             "\n"
             "When stdin is a terminal, press Ctrl-A x to quit.\n",
-            GUEST_MEMORY_MIN_MB, GUEST_MEMORY_MAX_MB, DEFAULT_GUEST_MEM_MB,
+            GUEST_MEMORY_MIN_MB, GUEST_MEMORY_MAX_MB, DEFAULT_GUEST_MEM_MB, TDX_MAX_MEM_MB,
             SANDBOX_DEFAULT_CMDLINE, JAIL_CPU_PERIOD_US, JAIL_DEFAULT_CPU_MAX_US,
             JAIL_DEFAULT_MEMORY_OVERHEAD_MB, JAIL_DEFAULT_NOFILE, JAIL_DEFAULT_NPROC);
 }
@@ -88,14 +90,14 @@ static int usage_error(const char *format, ...)
 }
 
 /* 只接受纯十进制数字：拒绝空串、前导空白和正负号（strtoull 会接受它们）。 */
-static int parse_mem_mb(const char *text, size_t *mem_mb)
+static int parse_mem_mb(const char *text, unsigned max_mb, size_t *mem_mb)
 {
     if (*text < '0' || *text > '9')
         return -1;
     char *end;
     errno = 0;
     unsigned long long value = strtoull(text, &end, 10);
-    if (errno || *end || value < GUEST_MEMORY_MIN_MB || value > GUEST_MEMORY_MAX_MB)
+    if (errno || *end || value < GUEST_MEMORY_MIN_MB || value > max_mb)
         return -1;
     *mem_mb = (size_t)value;
     return 0;
@@ -200,6 +202,8 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
     int index;
     /* --restore 时这些来自快照，给了就是用法错误；--mem 有默认值，只能另外记。 */
     const char *boot_option = NULL;
+    const char *invalid_memory_option = NULL;
+    const char *large_memory_option = NULL;
     int image_options = 0;
     while ((opt = getopt_long(sub_argc, sub_argv, "+:k:i:m:c:d:t:n:js:h", run_options, &index)) != -1) {
         if (opt >= OPT_CPU_MAX && opt <= OPT_NPROC && !jail_suboption)
@@ -215,9 +219,10 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
             config->initrd_path = optarg;
             break;
         case 'm':
-            if (parse_mem_mb(optarg, &config->mem_size_mb) < 0)
-                return usage_error("--mem must be an integer from %u to %u (MiB), got '%s'",
-                                   GUEST_MEMORY_MIN_MB, GUEST_MEMORY_MAX_MB, optarg);
+            if (parse_mem_mb(optarg, TDX_MAX_MEM_MB, &config->mem_size_mb) < 0)
+                invalid_memory_option = optarg;
+            else if (config->mem_size_mb > GUEST_MEMORY_MAX_MB)
+                large_memory_option = optarg;
             break;
         case 'c':
             config->cmdline = optarg;
@@ -340,9 +345,15 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
         return usage_error("--image cannot be combined with --disk, --snapshot or --restore");
     if (config->td_shim_path && !config->tdx)
         return usage_error("--td-shim requires --tdx");
-    if (config->tdx && (config->tap_name || config->netns_name || config->jail.enabled ||
+    if (!config->tdx && !invalid_memory_option)
+        invalid_memory_option = large_memory_option;
+    if (invalid_memory_option)
+        return usage_error("--mem must be an integer from %u to %u (MiB), got '%s'",
+                           GUEST_MEMORY_MIN_MB, config->tdx ? TDX_MAX_MEM_MB : GUEST_MEMORY_MAX_MB,
+                           invalid_memory_option);
+    if (config->tdx && (config->jail.enabled ||
                         config->warm_save_name || config->restore_name || config->snapshot_name))
-        return usage_error("--tdx does not support networking, jail or snapshots");
+        return usage_error("--tdx does not support jail or snapshots");
     if (config->tdx && config->cmdline == default_cmdline)
         config->cmdline = "console=ttyS0 earlycon=uart8250,io,0x3f8 loglevel=7 reboot=acpi panic=1 nokaslr";
     if (config->restore_name && boot_option)
@@ -542,7 +553,7 @@ int cli_snapshot(int argc, char **argv)
             info.initrd_path = optarg;
             break;
         case 'm':
-            if (parse_mem_mb(optarg, &info.mem_size_mb) < 0)
+            if (parse_mem_mb(optarg, GUEST_MEMORY_MAX_MB, &info.mem_size_mb) < 0)
                 return snapshot_usage_error("--mem must be an integer from %u to %u (MiB), "
                                             "got '%s'", GUEST_MEMORY_MIN_MB,
                                             GUEST_MEMORY_MAX_MB, optarg);

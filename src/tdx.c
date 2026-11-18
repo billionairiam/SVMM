@@ -24,6 +24,10 @@ enum td_command {
     TD_CAPABILITIES, TD_INIT_VM, TD_INIT_VCPU, TD_INIT_MEMORY, TD_FINALIZE, TD_GET_CPUID,
 };
 #define TD_SEPT_VE_DISABLE (UINT64_C(1) << 28)
+#define TD_XFAM_SSE UINT64_C(3) /* x87 and SSE */
+#define TD_XFAM_AVX (UINT64_C(1) << 2)
+#define CPUID_AVX (1u << 28)
+#define CPUID_F16C (1u << 29)
 #define TD_CPUID_MAX 256u
 #define TD_MAP_GPA 12u
 #define TD_MAP_PRIVATE 0x10u
@@ -108,14 +112,24 @@ static int create_td(int fd)
     return vm;
 }
 
-static int check_td_capabilities(int vm)
+static int check_td_capabilities(int vm, struct tdx_vm *td)
 {
     struct td_capabilities caps = { .cpuid.count = TD_CPUID_MAX };
     if (td_call(vm, TD_CAPABILITIES, 0, (uintptr_t)&caps) < 0)
         return -1;
-    if (!(caps.attrs & TD_SEPT_VE_DISABLE) || (caps.xfam & 3u) != 3u) {
+    if (!(caps.attrs & TD_SEPT_VE_DISABLE) || (caps.xfam & TD_XFAM_SSE) != TD_XFAM_SSE) {
         fprintf(stderr, "ERROR: TDX host needs SEPT #VE disable and x87/SSE state\n");
         return -1;
+    }
+    if (td) {
+        td->xfam = caps.xfam & (TD_XFAM_SSE | TD_XFAM_AVX);
+        if (td->xfam & TD_XFAM_AVX) {
+            for (uint32_t i = 0; i < caps.cpuid.count; ++i) {
+                const struct kvm_cpuid_entry2 *entry = &caps.cpuid.entries[i];
+                if (entry->function == 1)
+                    td->cpuid_avx = entry->ecx & (CPUID_AVX | CPUID_F16C);
+            }
+        }
     }
     return 0;
 }
@@ -132,7 +146,7 @@ int tdx_preflight(const char *firmware)
     int vm = create_td(fd);
     int result = -1;
     if (vm >= 0) {
-        result = check_td_capabilities(vm);
+        result = check_td_capabilities(vm, NULL);
         close(vm);
     }
     close(fd);
@@ -187,40 +201,63 @@ int tdx_vm_open(struct tdx_vm *td, struct kvm_context *kvm, struct guest_memory 
     if (kvm->system_fd < 0)
         return -1;
     kvm->vm_fd = create_td(kvm->system_fd);
-    if (kvm->vm_fd < 0 || check_td_capabilities(kvm->vm_fd) < 0)
+    if (kvm->vm_fd < 0 || check_td_capabilities(kvm->vm_fd, td) < 0)
         return -1;
     td->vm_fd = kvm->vm_fd;
     if (enable_cap(td->vm_fd, KVM_CAP_SPLIT_IRQCHIP, 24) ||
         enable_cap(td->vm_fd, KVM_CAP_EXIT_HYPERCALL, 1u << TD_MAP_GPA))
         return -1;
 
+    int error = pthread_mutex_init(&td->dma_lock, NULL);
+    if (error) {
+        fprintf(stderr, "ERROR: initialize TDX DMA lock: %s\n", strerror(error));
+        return -1;
+    }
+    td->dma_lock_ready = 1;
+
     td->ram = memory;
-    void *mapping = mmap(NULL, ram_size, PROT_READ | PROT_WRITE,
+    uint64_t low_limit = (uint64_t)GUEST_MEMORY_MAX_MB * MIB;
+    td->low_ram_size = ram_size < low_limit ? ram_size : low_limit;
+    td->high_ram_size = ram_size - td->low_ram_size;
+    uint64_t map_size = td->high_ram_size ? TDX_HIGH_RAM_BASE + td->high_ram_size : ram_size;
+    void *mapping = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mapping == MAP_FAILED) {
         perror("allocate TDX RAM backing");
         return -1;
     }
     memory->data = mapping;
-    memory->size = ram_size;
-    td->shared_pages = calloc(ram_size / TDX_PAGE_SIZE, 1);
+    memory->size = map_size;
+    td->shared_pages = calloc(map_size / TDX_PAGE_SIZE, 1);
     if (!td->shared_pages) {
         perror("allocate TDX shared page map");
         return -1;
     }
-    td->ram_fd = private_slot(td->vm_fd, 0, 0, ram_size, mapping);
-    return td->ram_fd < 0 ? -1 : 0;
+    td->ram_fd = private_slot(td->vm_fd, 0, 0, td->low_ram_size, memory->data);
+    if (td->ram_fd < 0)
+        return -1;
+    if (td->high_ram_size) {
+        td->high_ram_fd = private_slot(td->vm_fd, 2, TDX_HIGH_RAM_BASE,
+                                      td->high_ram_size, memory->data + TDX_HIGH_RAM_BASE);
+        if (td->high_ram_fd < 0)
+            return -1;
+    }
+    return 0;
 }
 
 static int launch_cpu(struct tdx_vm *td, struct kvm_context *kvm,
                       struct vcpu *vcpu, uint64_t hob)
 {
-    /* Keep optional state at architectural defaults. Select four-level
-     * EPT in the one required configurable CPUID entry. */
+    /* Select four-level EPT. AVX needs both xstate and any configurable
+     * instruction bits advertised by the TDX capabilities. */
     struct td_parameters params = {
-        .attrs = TD_SEPT_VE_DISABLE, .xfam = 3,
+        .attrs = TD_SEPT_VE_DISABLE, .xfam = td->xfam,
         .cpuid = { .count = 1, .entries = { { .function = 0x80000008, .eax = 48u << 16 } } },
     };
+    if (td->cpuid_avx)
+        params.cpuid.entries[params.cpuid.count++] = (struct kvm_cpuid_entry2){
+            .function = 1, .ecx = td->cpuid_avx,
+        };
     if (td_call(td->vm_fd, TD_INIT_VM, 0, (uintptr_t)&params) < 0 ||
         vcpu_open(vcpu, kvm, 0) < 0)
         return -1;
@@ -292,8 +329,8 @@ int tdx_boot(struct tdx_vm *td, struct kvm_context *kvm, struct vcpu *vcpu,
     for (size_t i = 0; i < 3; ++i) {
         if (!ranges[i].size)
             continue;
-        if (ranges[i].start < cursor || ranges[i].start > td->ram->size ||
-            ranges[i].size > td->ram->size - ranges[i].start)
+        if (ranges[i].start < cursor || ranges[i].start > td->low_ram_size ||
+            ranges[i].size > td->low_ram_size - ranges[i].start)
             return -1;
         if (import_pages(vcpu->fd, td->ram->data + cursor, cursor, ranges[i].start - cursor, 0) ||
             import_pages(vcpu->fd, td->ram->data + ranges[i].start,
@@ -301,7 +338,9 @@ int tdx_boot(struct tdx_vm *td, struct kvm_context *kvm, struct vcpu *vcpu,
             return -1;
         cursor = ranges[i].start + ranges[i].size;
     }
-    if (import_pages(vcpu->fd, td->ram->data + cursor, cursor, td->ram->size - cursor, 0) ||
+    if (import_pages(vcpu->fd, td->ram->data + cursor, cursor, td->low_ram_size - cursor, 0) ||
+        (td->high_ram_size && import_pages(vcpu->fd, td->ram->data + TDX_HIGH_RAM_BASE,
+                                           TDX_HIGH_RAM_BASE, td->high_ram_size, 0)) ||
         import_pages(vcpu->fd, td->firmware, td->firmware_base, td->firmware_size, 1) ||
         td_call(td->vm_fd, TD_FINALIZE, 0, 0) < 0)
         return -1;
@@ -314,6 +353,16 @@ int tdx_boot(struct tdx_vm *td, struct kvm_context *kvm, struct vcpu *vcpu,
     vcpu->hypercall_opaque = td;
     fprintf(stderr, "INFO: TDX launch finalized (debug disabled)\n");
     return 0;
+}
+
+static int ram_fd_for_range(const struct tdx_vm *td, uint64_t start, uint64_t size)
+{
+    if (start < td->low_ram_size && size <= td->low_ram_size - start)
+        return td->ram_fd;
+    if (start >= TDX_HIGH_RAM_BASE && start - TDX_HIGH_RAM_BASE < td->high_ram_size &&
+        size <= td->high_ram_size - (start - TDX_HIGH_RAM_BASE))
+        return td->high_ram_fd;
+    return -1;
 }
 
 int tdx_handle_hypercall(void *opaque, struct kvm_run *run)
@@ -330,14 +379,26 @@ int tdx_handle_hypercall(void *opaque, struct kvm_run *run)
         return 0;
     }
     uint64_t size = pages * TDX_PAGE_SIZE;
+    int fd = ram_fd_for_range(td, start, size);
+    if (fd < 0) {
+        run->hypercall.ret = -EINVAL;
+        return 0;
+    }
+    uint64_t offset = fd == td->high_ram_fd ? start - TDX_HIGH_RAM_BASE : start;
     int priv = mode == TD_MAP_PRIVATE;
+    pthread_mutex_lock(&td->dma_lock);
+    /* Device threads must stop using these pages even if changing one of
+     * the backings fails after KVM has changed the memory attribute. */
+    memset(td->shared_pages + start / TDX_PAGE_SIZE, 0, pages);
     if (memory_attributes(td->vm_fd, start, size, priv) < 0 ||
         (priv ? madvise(td->ram->data + start, size, MADV_DONTNEED) :
-         fallocate(td->ram_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, start, size)) < 0) {
+         fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, size)) < 0) {
         perror("convert TDX backing");
+        pthread_mutex_unlock(&td->dma_lock);
         return -1; /* No device access after a partial transition. */
     }
     memset(td->shared_pages + start / TDX_PAGE_SIZE, !priv, pages);
+    pthread_mutex_unlock(&td->dma_lock);
     run->hypercall.ret = 0;
     return 0;
 }
@@ -346,7 +407,7 @@ void *tdx_dma(void *opaque, uint64_t address, uint64_t length)
 {
     const struct tdx_vm *td = opaque;
     uint64_t start = address & ~TDX_GPA_SHARED;
-    if (start >= td->ram->size || length > td->ram->size - start)
+    if (ram_fd_for_range(td, start, length) < 0)
         return NULL;
     size_t first = start / TDX_PAGE_SIZE;
     size_t last = (start + (length ? length - 1 : 0)) / TDX_PAGE_SIZE;
@@ -359,11 +420,15 @@ void *tdx_dma(void *opaque, uint64_t address, uint64_t length)
 
 void tdx_vm_close(struct tdx_vm *td)
 {
+    if (td->dma_lock_ready)
+        pthread_mutex_destroy(&td->dma_lock);
     if (td->firmware)
         munmap(td->firmware, td->firmware_size);
     if (td->firmware_fd >= 0)
         close(td->firmware_fd);
     if (td->ram_fd >= 0)
         close(td->ram_fd);
+    if (td->high_ram_fd >= 0)
+        close(td->high_ram_fd);
     free(td->shared_pages);
 }

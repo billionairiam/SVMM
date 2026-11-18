@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -63,25 +64,59 @@ def readable_file(path):
     return path.is_file() and os.access(path, os.R_OK)
 
 
-def kernel_path(explicit, *, tdx=False):
+def tdx_bzimage(path):
+    try:
+        with path.open("rb") as kernel:
+            header = kernel.read(0x264)
+            file_size = os.fstat(kernel.fileno()).st_size
+    except OSError:
+        return False
+    if (len(header) != 0x264 or header[0x1fe:0x200] != b"\x55\xaa" or
+            header[0x202:0x206] != b"HdrS" or
+            struct.unpack_from("<H", header, 0x206)[0] < 0x20c or
+            not (header[0x211] & 1 and header[0x236] & 1)):
+        return False
+    setup_size = ((header[0x1f1] or 4) + 1) * 512
+    payload_size = struct.unpack_from("<I", header, 0x1f4)[0] * 16
+    init_size = struct.unpack_from("<I", header, 0x260)[0]
+    return (setup_size <= 0x10000 and file_size <= 512 * 1024 * 1024 and
+            0 < payload_size <= file_size - setup_size <= init_size)
+
+
+def kernel_config_has(path, required):
+    try:
+        return set(required).issubset(path.read_text().splitlines())
+    except (OSError, UnicodeError):
+        return False
+
+
+def kernel_path(explicit, *, tdx=False, tap=False):
     configured = explicit if explicit is not None else os.environ.get("SVMM_KERNEL")
     if configured is not None:
         path = Path(configured).absolute()
         if not readable_file(path):
             raise ValueError("guest kernel is not readable: " + str(path))
+        if tdx and not tdx_bzimage(path):
+            raise ValueError("TDX guest kernel must be a complete 64-bit Linux bzImage: " + str(path))
         return path
     packaged = ROOT / ("images/tdx-bzImage" if tdx else "images/bzImage")
     required = REQUIRED_KERNEL_OPTIONS
     if tdx:
-        required = tuple(option for option in required
-                         if option not in ("CONFIG_X86_IOPL_IOPERM=y", "CONFIG_VIRTIO_NET=y"))
+        required = tuple(option for option in required if option != "CONFIG_X86_IOPL_IOPERM=y")
+        if not tap:
+            required = tuple(option for option in required if option != "CONFIG_VIRTIO_NET=y")
         required += ("CONFIG_INTEL_TDX_GUEST=y", "CONFIG_KVM_GUEST=y", "CONFIG_X86_X2APIC=y",
                      "CONFIG_SWIOTLB=y", "CONFIG_DEVPORT=y")
     if readable_file(packaged):
-        return packaged
+        if not tdx:
+            return packaged
+        config = packaged.with_suffix(".config")
+        if tdx_bzimage(packaged) and ((not tap and not config.exists()) or
+                                     kernel_config_has(config, required)):
+            return packaged
     candidates = []
     for kernel in Path("/boot").glob("vmlinuz-*"):
-        if not readable_file(kernel):
+        if not readable_file(kernel) or (tdx and not tdx_bzimage(kernel)):
             continue
         version = kernel.name[len("vmlinuz-"):]
         versions = [version]
@@ -89,11 +124,7 @@ def kernel_path(explicit, *, tdx=False):
             if version.endswith(suffix):
                 versions.append(version[:-len(suffix)])
         for candidate in versions:
-            try:
-                config = (kernel.parent / ("config-" + candidate)).read_text().splitlines()
-            except OSError:
-                continue
-            if all(option in config for option in required):
+            if kernel_config_has(kernel.parent / ("config-" + candidate), required):
                 candidates.append(kernel)
                 break
     if not candidates:
@@ -134,6 +165,7 @@ def main():
     parser.add_argument("--size-mb", type=int)
     parser.add_argument("--workload", action="store_true")
     parser.add_argument("--tdx", action="store_true")
+    parser.add_argument("--tap")
     options, vm_options = parser.parse_known_args(raw)
     runner = Runner()
     for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGUSR2):
@@ -141,7 +173,9 @@ def main():
     try:
         if os.geteuid() != 0:
             raise ValueError("run --image as root to preserve image file ownership")
-        kernel = kernel_path(options.kernel, tdx=options.tdx)
+        kernel = kernel_path(options.kernel, tdx=options.tdx, tap=options.tap is not None)
+        if options.tap is not None:
+            vm_options.append("--tap=" + options.tap)
         if options.tdx:
             vm_options.append("--tdx")
         initrd = initrd_path(options.initrd, runner)

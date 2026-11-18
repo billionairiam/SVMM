@@ -285,11 +285,25 @@ static void td_blk_irq(void *opaque, int level)
     ioapic_signal(opaque, VIRTIO_MMIO_IRQ, level);
 }
 
+static void td_net_irq(void *opaque, int level)
+{
+    ioapic_signal(opaque, VIRTIO_MMIO_NET_IRQ, level);
+}
+
+static void td_attach_dma(struct tdx_vm *td, struct virtio_mmio *mmio,
+                          struct virtio_mmio_backend *backend)
+{
+    backend->features |= UINT64_C(1) << VIRTIO_F_ACCESS_PLATFORM;
+    mmio->translate_dma = tdx_dma;
+    mmio->dma_opaque = td;
+    mmio->dma_lock = &td->dma_lock;
+}
+
 int sandbox_run(const struct sandbox_config *config)
 {
     struct kvm_context kvm = { .system_fd = -1, .vm_fd = -1 };
     struct guest_memory memory = { 0 };
-    struct tdx_vm td = { .ram_fd = -1, .firmware_fd = -1 };
+    struct tdx_vm td = { .ram_fd = -1, .high_ram_fd = -1, .firmware_fd = -1 };
     struct td_shim *shim = NULL;
     struct ioapic td_ioapic = { 0 };
     int ioapic_ready = 0;
@@ -474,11 +488,8 @@ int sandbox_run(const struct sandbox_config *config)
         virtio_blk_attach(&blk, memory.data, memory.size,
                           config->tdx ? td_blk_irq : blk_irq,
                           config->tdx ? (void *)&td_ioapic : (void *)&kvm);
-        if (config->tdx) {
-            blk.backend.features |= 1ull << VIRTIO_F_ACCESS_PLATFORM;
-            blk.mmio.translate_dma = tdx_dma;
-            blk.mmio.dma_opaque = &td;
-        }
+        if (config->tdx)
+            td_attach_dma(&td, &blk.mmio, &blk.backend);
         blk_attached = 1;
         fprintf(stderr, "INFO: virtio-blk %s: %llu sectors, mmio 0x%x irq %u\n",
                 config->disk_path, (unsigned long long)blk.config.capacity,
@@ -496,7 +507,11 @@ int sandbox_run(const struct sandbox_config *config)
      * 没有磁盘时地址也不变：每个设备的地址/GSI 固定，便于排查。
      */
     if (config->tap_name) {
-        virtio_net_attach(&net, memory.data, memory.size, net_irq, &kvm);
+        virtio_net_attach(&net, memory.data, memory.size,
+                          config->tdx ? td_net_irq : net_irq,
+                          config->tdx ? (void *)&td_ioapic : (void *)&kvm);
+        if (config->tdx)
+            td_attach_dma(&td, &net.mmio, &net.backend);
         net_attached = 1;
         const uint8_t *mac = net.config.mac;
         fprintf(stderr, "INFO: virtio-net %s: mac %02x:%02x:%02x:%02x:%02x:%02x, "
@@ -504,6 +519,7 @@ int sandbox_run(const struct sandbox_config *config)
                 mac[5], VIRTIO_MMIO_NET_BASE, VIRTIO_MMIO_NET_IRQ);
         acpi_devices[acpi_count++] = (struct acpi_virtio_mmio){
             .base = VIRTIO_MMIO_NET_BASE, .size = VIRTIO_MMIO_SIZE, .gsi = VIRTIO_MMIO_NET_IRQ,
+            .edge_triggered = config->tdx,
         };
         if (restore && virtio_mmio_restore(&net.mmio, &vmstate->net) < 0)
             FAIL("restore");
@@ -528,8 +544,9 @@ int sandbox_run(const struct sandbox_config *config)
     /* 5. 可选的 initramfs：地址和上限都随内存大小计算。 */
     struct linux_initrd initrd = { 0 };
     if (config->initrd_path && *config->initrd_path) {
-        initrd.addr = boot_linux_initrd_addr(&image, memory.size);
-        uint64_t limit = boot_linux_initrd_limit(&image, memory.size);
+        size_t boot_ram_size = config->tdx ? td.low_ram_size : memory.size;
+        initrd.addr = boot_linux_initrd_addr(&image, boot_ram_size);
+        uint64_t limit = boot_linux_initrd_limit(&image, boot_ram_size);
         if (boot_linux_load_initramfs(&memory, config->initrd_path, initrd.addr,
                                       limit, &initrd.size) < 0) {
             metric_failure("initramfs_load", memory_size);
