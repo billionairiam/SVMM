@@ -1,6 +1,10 @@
 # SVMM
 
-SVMM 是运行于 Linux x86_64 上的 Rust KVM VMM。`bin/svmm` 支持 Linux bzImage、OCI workload、virtio-blk/TAP、jailer、冷热快照和原生 Intel TDX。`make` 构建 Rust VMM 和 virtqueue 示例。OCI workload 使用静态链接的 Rust guest PID 1。
+SVMM 是面向 Linux x86_64 的 Rust KVM VMM。它能把 OCI 镜像作为可写 rootfs 启动，支持原生 Intel TDX、virtio-blk、TAP 网络，以及普通 KVM 的 jailer 和冷热快照。
+
+## 快速开始
+
+构建需要 Rust 1.85 或更新版本。OCI workload 还需要 `cpio`、`gzip`、`e2fsprogs`、Docker CLI/daemon，以及可访问的 `/dev/kvm` 和兼容的 guest 内核。
 
 ```sh
 rustup target add x86_64-unknown-linux-musl
@@ -8,9 +12,24 @@ make all workload-initramfs
 sudo bin/svmm run --image ubuntu:24.04 -- /bin/sh -c 'echo hello-from-svmm'
 ```
 
-构建宿主需 Rust 1.85 或更新版本。运行 OCI 镜像还需要 Docker CLI/daemon、e2fsprogs 和可访问的 `/dev/kvm`。Rust 源码位于 `src-rust/`。`stage11` 是 C 版参考分支，`make ablation` 继续使用原教程实验实现。已有 Python 命令入口会转到 Rust 二进制。
+本地缺少镜像时会自动拉取。应用在 VM 内由静态 Rust PID 1 启动，退出码传回宿主。配置好 TDX 内核和 TD-Shim 后，可用 `sudo bin/svmm run --tdx --vcpus 4 --image my-app:latest` 启动 4 vCPU 的 workload。
 
-# Stage 13：在 Intel TDX 中运行 OCI 镜像
+运行时代码在 [src-rust/](src-rust/)，端到端测试在 [tests/](tests/)。教程中的 C 实现可在 [stage11](https://github.com/billionairiam/SVMM/tree/stage11) 查阅，`make ablation` 构建 C 版消融实验。
+
+## AI 编程助手
+
+从仓库根目录打开 Codex 后，可以用 `$svmm-tdx` 这类名称调用下列仓库技能。也可以把对应的 `SKILL.md` 路径交给其他编程助手读取。技能采用仓库内的 `.agents/skills/` 布局。 [OpenAI 仓库技能示例](https://developers.openai.com/blog/skills-agents-sdk)
+
+| Skill | 适用场景 |
+| --- | --- |
+| [`svmm-e2e`](.agents/skills/svmm-e2e/SKILL.md) | 选择与改动相关的启动、串口、virtio、网络或 jailer E2E |
+| [`svmm-oci`](.agents/skills/svmm-oci/SKILL.md) | 排查镜像拉取、rootfs 导出、guest PID 1、退出码或取消后的清理 |
+| [`svmm-tdx`](.agents/skills/svmm-tdx/SKILL.md) | 排查 TD-Shim、原生 KVM TDX、多 vCPU、大内存和共享 DMA |
+| [`svmm-snapshots`](.agents/skills/svmm-snapshots/SKILL.md) | 验证冷热快照、恢复兼容性和损坏快照的拒绝路径 |
+
+例如，给 Codex 发送「用 `$svmm-tdx` 排查 4 vCPU 启动失败，运行对应的真机 E2E」。测试约定见 [AGENTS.md](AGENTS.md)。
+
+## Stage 13：在 Intel TDX 中运行 OCI 镜像
 
 `--tdx` 让 SVMM 通过原生 KVM 启动 Trust Domain。TD-Shim 把控制权交给启用 TDX 的 Linux guest。Guest 用 virtio-blk 挂载现有的 OCI rootfs，应用退出后由 SVMM 返回它的退出码。
 
@@ -60,7 +79,7 @@ sudo env SVMM_TEST_TDX_KERNEL=/path/to/tdx-bzImage \
 
 测试在真实硬件上检查非调试 TD 的 TDREPORT、内核兼容性、AVX 指令、4 GiB 内存布局、TCP 收发、ext4 读写、退出码、镜像默认命令、Registry 拉取及失败路径。多核用例验证 4 个 CPU 上线、应用逐核运行、块设备中断投递到 CPU 3，以及应用退出和宿主停止。网络用例需要 `ip` 和 `/dev/net/tun`，使用临时 netns。测试镜像默认为 `ubuntu:24.04`，可用 `SVMM_TEST_TDX_IMAGE` 指定带 `/bin/sh` 的兼容镜像。
 
-# Stage 12：直接运行 OCI / Docker 镜像里的应用
+## Stage 12：直接运行 OCI / Docker 镜像里的应用
 
 把镜像的 rootfs 转为 ext4，通过现有 virtio-blk 交给 VM；SVMM 提供静态 guest init，负责挂载、网络、应用配置、进程回收和退出状态。镜像里无需安装 Docker Engine、shell 或系统 init。每台 VM 运行一个主应用及其子进程。
 
@@ -163,7 +182,7 @@ sudo env BZIMAGE_PATH=/path/to/bzImage VIRTIO_BZIMAGE=/path/to/bzImage make test
 本期支持 Linux amd64 和一个主应用；不提供完整 OCI runtime、Compose、多容器、宿主目录挂载或跨架构模拟。Docker export 不保留所有 xattr/file capability；镜像中的字符/块设备会被拒绝，guest 的设备目录由 init 提供。构建与运行按上面的 root 命令执行；没有实现 rootless UID/GID 映射。
 
 
-# Stage 11：热快照——从暂停点毫秒级恢复
+## Stage 11：热快照——从暂停点毫秒级恢复
 
 这一阶段没有对应的教程，是按自己的理解实现的。冷快照（Stage 10）只存磁盘，恢复要重新 boot；热快照把整台机器存下来：客户机内存、KVM 里的 VM/vCPU 状态、VMM 用户态的设备状态，以及同一时刻的 `--disk`。恢复时不加载内核、不重新 boot，客户机从暂停的那条指令继续执行（128 MiB 客户机约 30 ms）。
 
@@ -272,7 +291,7 @@ KVM_CREATE_VM ... guest_memory_init_file：mmap(memory.bin, MAP_PRIVATE) —— 
 - 先恢复磁盘再校验；
 - 保存失败后退出。
 
-# Stage 10：冷快照——给 sandbox 一个保存按钮
+## Stage 10：冷快照——给 sandbox 一个保存按钮
 
 根据 [Runra Stage 10 教程](https://runra.dev/zh/blog/sandbox-from-scratch-10-cold-snapshot)：关机后把 `--disk` 镜像整盘复制一份并附带 manifest，下次启动前恢复，再重新 boot。只保存 workspace（磁盘），不保存内存、寄存器、设备状态（那是 Stage 11 的 warm snapshot）。
 
@@ -316,7 +335,7 @@ manifest 校验（fail-closed，任何一项不对都拒绝）：必须是一个
 - **CLI**：`--snapshot` 没有 `--disk`、名字非法都在 CLI 层报用法错误（退出码 2）；快照根目录可以用 `SVMM_SNAPSHOT_DIR` 指定。
 - **测试**：教程是 `tests/test_snapshot.sh` 加 golden output；这里是 `tests/test_snapshot.py`，覆盖 25 种坏 manifest/坏磁盘、磁盘满、运行中的 VM、路径穿越，以及真实客户机的 写文件 → 关机 → save → 改坏 → restore → 文件回来、e2fsck 干净。
 
-# Stage 09：Jailer——cgroup、rlimit、capability 与 seccomp
+## Stage 09：Jailer——cgroup、rlimit、capability 与 seccomp
 
 根据 [Runra Stage 09 教程](https://runra.dev/zh/blog/sandbox-from-scratch-09-jailer-cgroup-seccomp)：KVM 隔离的是客户机，VMM 自己仍然是宿主机上的 root 进程。客户机能驱动的代码（MMIO 分派、virtqueue 解析、串口模型）一旦有漏洞，攻击者拿到的就是这个进程的全部能力。`--jail` 在四个方向上收紧它：
 
@@ -396,7 +415,7 @@ capability 丢早了，`--tap` 和 `--netns` 就不能和 `--jail` 一起用；�
 - `tests/test_jail.c`（`make bin/test_jail && sudo bin/test_jail`）：每个用例 fork 一个子进程，装过滤器后执行运行阶段的调用（应当存活）、危险调用和 `PROT_EXEC` 映射（应当 SIGSYS）、`int $0x80`（检查 arch）、安装前创建的线程调用 `socket`（TSYNC 加 KILL_PROCESS：整个进程被杀）；父进程从 `/proc/<pid>/status` 检查 `Seccomp`、`NoNewPrivs` 和五个 capability 集合。
 - `tests/test_jailer.py`（`BZIMAGE_PATH=... python3 -m unittest -v tests/test_jailer.py`）：带 `--disk --tap --netns --jail` 和终端的完整负载（读写磁盘、ping、大段输入、Ctrl-A x），检查每个线程的 `/proc/<pid>/task/*/status`、`limits` 和 cgroup 文件；客户机 `exit` 和 SIGTERM 退出；客户机死循环时 `cpu.stat` 显示被限流；客户机写满内存时 VMM 被 OOM 杀掉（`memory.events` 的 `oom_kill`）；用 tmpfs 盖住 `/sys/fs/cgroup` 时 WARN 后照常运行；残留 cgroup 的清理；非法选项；不加 `--jail` 时一切照旧。
 
-# Stage 08：网络命名空间与出口策略
+## Stage 08：网络命名空间与出口策略
 
 根据 [Runra Stage 08 教程](https://runra.dev/zh/blog/sandbox-from-scratch-08-network-egress-policy)：KVM 只隔离 CPU 和内存，客户机经 TAP 发出的包在宿主机内核里是普通网络包，能访问云 metadata（`169.254.169.254`）、内网和宿主机自己。Stage 08 让 VMM 进程 `setns` 进一个专门的网络命名空间，客户机的流量只能经过那里的 nftables denylist 出去。
 
@@ -451,7 +470,7 @@ POLICY_ALLOW_PING=10.248.2.5 POLICY_ALLOW_URL=http://example.com/ policy-test
 
 测试：`tests/test_network_policy.py`（端到端，需要 root、`nft`，`BZIMAGE_PATH=... python3 -m unittest -v tests/test_network_policy.py`）。每个测试新建一个“宿主机” netns，被拒的地址都配在它上面并且有 HTTP 服务（没有策略就能连上），`ALLOW_DST` 放行的 `10.0.0.2` 作为对照；另有一个 wan netns 扮演外网，只有两层 MASQUERADE 都生效才能收到回复。宿主 netns 里还放了一个同名的诱饵 `tap0`，验证 VMM 打开的是 sandbox-ns 里的那个。
 
-# Stage 07：virtio-net 与 TAP
+## Stage 07：virtio-net 与 TAP
 
 根据 [Runra Stage 07 教程](https://runra.dev/zh/blog/sandbox-from-scratch-07-virtio-net-tap) 给客户机加一块网卡：`svmm run --tap tap0` 把宿主机上已有的 TAP 接口接成客户机里的 `eth0`（virtio-net），`/init` 自动配置静态地址并 ping 网关。
 
