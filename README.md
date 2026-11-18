@@ -1,3 +1,39 @@
+# Stage 13：在 Intel TDX 中运行 OCI 镜像
+
+`--tdx` 让 SVMM 通过原生 KVM 启动一台单 vCPU 的 Trust Domain。TD-Shim 把控制权交给启用 TDX 的 Linux guest。Guest 用 virtio-blk 挂载现有的 OCI rootfs，应用退出后由 SVMM 返回它的退出码。
+
+```sh
+make all workload-initramfs
+sudo bin/svmm run --tdx --td-shim /path/to/td-shim.bin \
+  --kernel /path/to/tdx-bzImage --image ubuntu:24.04 \
+  -- /bin/sh -c 'echo hello-from-tdx; exit 7'
+echo $?
+
+# 配置默认固件和内核后，直接运行镜像的 ENTRYPOINT 和 CMD。
+sudo bin/svmm run --tdx --image my-app:latest
+```
+
+需要启用 TDX 的 Intel 宿主机和提供该 KVM ABI 的 Linux。在 Linux 7.0 上验证。固件使用 TD-Shim 的 Linux payload 构建（上游仓库的 `bash sh_script/build_final.sh boot_kernel`）。可通过 `SVMM_TD_SHIM` 或仓库的 `images/td-shim.bin` 设置默认固件。显式 `--kernel` 优先，其次是 `SVMM_KERNEL`、`images/tdx-bzImage` 与兼容的 `/boot/vmlinuz-*`。
+
+Guest 内核需要内建 `INTEL_TDX_GUEST`、`KVM_GUEST`、`X86_X2APIC`、`SWIOTLB`、`DEVPORT`，以及普通 workload 所需的 ACPI、串口、initramfs、virtio-mmio、virtio-blk 和 ext4。`DEVPORT` 用于由 guest 内核写出应用退出码，guest 安全策略要允许 PID 1 打开 `/dev/port`。硬件验证还需要内建 `TDX_GUEST_DRIVER`。
+
+也可以提供已有的 ext4 镜像，退出后保留磁盘写入。
+
+```sh
+sudo bin/svmm run --tdx --td-shim /path/to/td-shim.bin \
+  --kernel /path/to/tdx-bzImage --initrd build/workload-initramfs.cpio.gz \
+  --workload --disk build/app.ext4
+```
+
+首版支持离线运行。TD 的私有内存由硬件保护，设备只访问 guest 显式共享的 virtio 队列与 DMA 缓冲区。宿主可以读取 OCI 盘镜像及串口输出。启动测量覆盖导入的固件、启动参数、内核与 initramfs。本地 TDREPORT 用来验证真实 TD 启动，远程 Quote 和密钥下发需要单独接入。TDX 模式拒绝网络、jail 和快照配置。TDX 初始化失败时命令直接退出。
+
+```sh
+sudo env SVMM_TEST_TDX_KERNEL=/path/to/tdx-bzImage \
+  SVMM_TEST_TD_SHIM=/path/to/td-shim.bin make test-tdx
+```
+
+测试在真实硬件上检查非调试 TD 的 TDREPORT、ext4 读写、退出码、镜像默认命令、Registry 拉取及失败路径。测试镜像默认为 `ubuntu:24.04`，可用 `SVMM_TEST_TDX_IMAGE` 指定带 `/bin/sh` 的兼容镜像。
+
 # Stage 12：直接运行 OCI / Docker 镜像里的应用
 
 把镜像的 rootfs 转为 ext4，通过现有 virtio-blk 交给 VM；SVMM 提供静态 guest init，负责挂载、网络、应用配置、进程回收和退出状态。镜像里无需安装 Docker Engine、shell 或系统 init。每台 VM 运行一个主应用及其子进程。

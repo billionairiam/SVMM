@@ -31,6 +31,8 @@ struct sandbox_config {
     const char *kernel_path;
     /* Host-side OCI image preparation; dispatched before sandbox_run. */
     const char *image;
+    int tdx;
+    const char *td_shim_path;
     /* initramfs（cpio 或 cpio.gz）路径；NULL 或空串表示不加载。 */
     const char *initrd_path;
     /* 客户机内存大小，单位 MiB，范围见 memory.h。 */

@@ -1,4 +1,6 @@
 #include "sandbox.h"
+#include "ioapic.h"
+#include "tdx.h"
 
 #include "ablation.h"
 #include "boot/acpi.h"
@@ -273,10 +275,24 @@ void sandbox_config_init(struct sandbox_config *config)
     };
 }
 
+static void td_serial_irq(void *opaque, int level)
+{
+    ioapic_signal(opaque, COM1_IRQ, level);
+}
+
+static void td_blk_irq(void *opaque, int level)
+{
+    ioapic_signal(opaque, VIRTIO_MMIO_IRQ, level);
+}
+
 int sandbox_run(const struct sandbox_config *config)
 {
     struct kvm_context kvm = { .system_fd = -1, .vm_fd = -1 };
     struct guest_memory memory = { 0 };
+    struct tdx_vm td = { .ram_fd = -1, .firmware_fd = -1 };
+    struct td_shim *shim = NULL;
+    struct ioapic td_ioapic = { 0 };
+    int ioapic_ready = 0;
     struct vcpu vcpu = { .fd = -1 };
     struct serial serial;
     struct console console = { 0 };
@@ -405,8 +421,17 @@ int sandbox_run(const struct sandbox_config *config)
             FAIL("net_open");
     }
 
+    if (config->tdx) {
+        shim = td_shim_open(config->td_shim_path);
+        if (!shim || tdx_vm_open(&td, &kvm, &memory, mem_size_mb * MIB) < 0)
+            FAIL("tdx_init");
+        if (ioapic_init(&td_ioapic, kvm.vm_fd))
+            FAIL("tdx_ioapic");
+        ioapic_ready = 1;
+    }
+
     /* 2. 打开 /dev/kvm，创建 VM、内核 irqchip 和 PIT。 */
-    if (kvm_context_init(&kvm) < 0)
+    if (!config->tdx && kvm_context_init(&kvm) < 0)
         FAIL("kvm_init");
 
     /*
@@ -417,7 +442,7 @@ int sandbox_run(const struct sandbox_config *config)
      */
     memory_size = mem_size_mb * MIB;
     metric_stage(stderr, SVMM_VARIANT_NAME, "memory", memory_size);
-    if ((restore ? guest_memory_init_file(&memory, kvm.vm_fd, mem_size_mb, warm.memory_fd) :
+    if (!config->tdx && (restore ? guest_memory_init_file(&memory, kvm.vm_fd, mem_size_mb, warm.memory_fd) :
                    guest_memory_init(&memory, kvm.vm_fd, mem_size_mb)) < 0)
         FAIL("guest_memory");
     metric_stage(stderr, SVMM_VARIANT_NAME, "memory_mapped", memory_size);
@@ -446,13 +471,21 @@ int sandbox_run(const struct sandbox_config *config)
      * 数据 buffer，所以必须在第 3 步之后。
      */
     if (config->disk_path) {
-        virtio_blk_attach(&blk, memory.data, memory.size, blk_irq, &kvm);
+        virtio_blk_attach(&blk, memory.data, memory.size,
+                          config->tdx ? td_blk_irq : blk_irq,
+                          config->tdx ? (void *)&td_ioapic : (void *)&kvm);
+        if (config->tdx) {
+            blk.backend.features |= 1ull << VIRTIO_F_ACCESS_PLATFORM;
+            blk.mmio.translate_dma = tdx_dma;
+            blk.mmio.dma_opaque = &td;
+        }
         blk_attached = 1;
         fprintf(stderr, "INFO: virtio-blk %s: %llu sectors, mmio 0x%x irq %u\n",
                 config->disk_path, (unsigned long long)blk.config.capacity,
                 VIRTIO_MMIO_BASE, VIRTIO_MMIO_IRQ);
         acpi_devices[acpi_count++] = (struct acpi_virtio_mmio){
             .base = VIRTIO_MMIO_BASE, .size = VIRTIO_MMIO_SIZE, .gsi = VIRTIO_MMIO_IRQ,
+            .edge_triggered = config->tdx,
         };
         if (restore && virtio_mmio_restore(&blk.mmio, &vmstate->blk) < 0)
             FAIL("restore");
@@ -506,6 +539,13 @@ int sandbox_run(const struct sandbox_config *config)
                 config->initrd_path, (unsigned long long)initrd.addr, initrd.size);
     }
 
+    if (config->tdx) {
+        if (tdx_boot(&td, &kvm, &vcpu, shim, &image, &initrd, config->cmdline) < 0 ||
+            vcpu_mmio_register(&vcpu, IOAPIC_ADDR, 4096, ioapic_access, &td_ioapic) < 0)
+            FAIL("tdx_boot");
+        goto register_mmio;
+    }
+
     /* 6. 内核载荷、zero page（e820 覆盖整个 --mem）、命令行和 GDT。 */
     if (boot_linux_prepare(&memory, &image, config->cmdline, &initrd) < 0) {
         report_prepare_failure(&image, memory.size);
@@ -555,7 +595,8 @@ register_mmio:
     serial_ready = 1;
     if (restore && serial_restore(&serial, &vmstate->serial) < 0)
         FAIL("restore");
-    serial_set_irq_handler(&serial, serial_irq, &kvm);
+    serial_set_irq_handler(&serial, config->tdx ? td_serial_irq : serial_irq,
+                           config->tdx ? (void *)&td_ioapic : (void *)&kvm);
     install_signal_handlers(&vcpu, config->warm_save_name != NULL);
     if (console_start(&console, &serial, STDIN_FILENO, console_quit, &vcpu,
                       config->warm_save_name ? console_snapshot : NULL, &vcpu) < 0)
@@ -625,6 +666,10 @@ done:
     vcpu_destroy(&vcpu);
     if (serial_ready)
         serial_destroy(&serial);
+    if (ioapic_ready)
+        ioapic_destroy(&td_ioapic);
+    tdx_vm_close(&td);
+    td_shim_close(shim);
     guest_memory_destroy(&memory);
     virtio_blk_close(&blk);
     virtio_net_close(&net);

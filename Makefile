@@ -6,7 +6,8 @@ CPPFLAGS += -Isrc
 
 SOURCES := src/main.c src/cli.c src/sandbox.c src/snapshot.c src/net-policy.c src/jail.c src/kvm.c src/memory.c \
            src/vmstate.c src/vcpu.c src/serial.c src/console.c src/metrics.c src/boot/linux.c src/boot/acpi.c \
-           src/virtio/virtq.c src/virtio/mmio.c src/virtio/blk.c src/virtio/net.c
+           src/virtio/virtq.c src/virtio/mmio.c src/virtio/blk.c src/virtio/net.c \
+           src/tdx.c src/boot/td-shim.c src/ioapic.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 # Stage 05 的 virtqueue 是纯用户态代码，不依赖 KVM，单独编进 virtq-demo。
 # Stage 06 起 virtq.c 也编进 svmm，给 virtio-mmio 设备用。
@@ -46,7 +47,7 @@ $(foreach variant,$(ABLATION_VARIANTS),$(eval $(call ABLATION_template,$(variant
 
 -include $(DEPFILES) $(ABLATION_DEPFILES)
 
-.PHONY: all ablation initramfs workload-initramfs test-workload disk run run-disk run-net run-virtq test clean \
+.PHONY: all ablation initramfs workload-initramfs test-workload test-tdx disk run run-disk run-net run-virtq test clean \
         netns netns-down run-netns jail-setup jail-clean run-jail \
         snapshot-save snapshot-list run-snapshot run-warm run-restore help
 
@@ -195,12 +196,16 @@ run-restore: all disk
 test-workload: all workload-initramfs
 	python3 -m unittest -v tests/test_workload.py tests/test_run_image.py
 
+test-tdx: all workload-initramfs
+	python3 -m unittest -v tests.test_tdx
+
 help:
 	@echo "make all          build bin/svmm and bin/virtq-demo"
 	@echo "make initramfs    build $(INITRD)"
 	@echo "bin/svmm run --image IMAGE  prepare and run an OCI image in a VM"
 	@echo "make workload-initramfs  build the static OCI workload guest init"
 	@echo "make test-workload       run real Docker-to-KVM workload E2E"
+	@echo "make test-tdx            run hardware E2E with SVMM_TEST_TDX_KERNEL and SVMM_TEST_TD_SHIM"
 	@echo "make run          boot KERNEL with the initramfs"
 	@echo "make run-disk     ... plus $(DISK) as virtio-blk"
 	@echo "make run-net      ... plus TAP=$(TAP) as virtio-net (sudo scripts/setup-tap.sh first)"

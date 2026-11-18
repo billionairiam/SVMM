@@ -114,13 +114,12 @@ static int vcpu_setup_cpuid(struct vcpu *vcpu, int system_fd, unsigned apic_id)
 }
 
 /*
- * 在 kvm->vm_fd 对应的虚拟机里创建编号为 id 的 vCPU，映射它的 kvm_run，
- * 并安装 CPUID 表。
+ * 在 kvm->vm_fd 对应的虚拟机里创建编号为 id 的 vCPU，并映射它的 kvm_run。
  *
  * 失败时可能已经打开了 vCPU fd 或建立了映射，但这些资源都已记录在
  * *vcpu 中；调用者无论成败都应调用 vcpu_destroy() 统一释放。
  */
-int vcpu_init(struct vcpu *vcpu, const struct kvm_context *kvm, unsigned id)
+int vcpu_open(struct vcpu *vcpu, const struct kvm_context *kvm, unsigned id)
 {
     /* 先置为“无资源”状态，保证任意失败路径下 vcpu_destroy() 都安全。 */
     vcpu->fd = -1;
@@ -157,6 +156,13 @@ int vcpu_init(struct vcpu *vcpu, const struct kvm_context *kvm, unsigned id)
         return -1;
     }
     vcpu->run = mapping;
+    return 0;
+}
+
+int vcpu_init(struct vcpu *vcpu, const struct kvm_context *kvm, unsigned id)
+{
+    if (vcpu_open(vcpu, kvm, id) < 0)
+        return -1;
     /* no_cpuid 消融项保留 KVM 的默认 CPUID，用来观察缺少 CPUID 时的失败点。 */
     if (SVMM_ABLATE_CPUID_ENABLED)
         return 0;
@@ -449,6 +455,33 @@ static const struct vcpu_mmio_region *find_mmio(const struct vcpu *vcpu, uint64_
  * 处理的退出。stats 记录退出次数、串口退出次数和最后一次
  * 退出原因，无论哪种结果都会通过 vcpu_finish() 输出。
  */
+static int workload_completion(struct vcpu *vcpu, const struct kvm_run *run, const uint8_t *data)
+{
+    if (!vcpu->workload_mode || run->io.direction != KVM_EXIT_IO_OUT || run->io.count != 1)
+        return -1;
+    if (!vcpu->tdx) {
+        if (run->io.port != WORKLOAD_EXIT_PORT || run->io.size != 4)
+            return -1;
+        uint32_t message;
+        memcpy(&message, data, sizeof(message));
+        return (message & WORKLOAD_EXIT_MASK) == WORKLOAD_EXIT_MAGIC ? (int)(message & 0xff) : -1;
+    }
+    if (run->io.port < WORKLOAD_EXIT_PORT ||
+        run->io.port >= WORKLOAD_EXIT_PORT + WORKLOAD_TD_FRAME_SIZE || run->io.size != 1)
+        return -1;
+    unsigned index = run->io.port - WORKLOAD_EXIT_PORT;
+    if (!index)
+        vcpu->td_completion_bytes = 0;
+    if (index != vcpu->td_completion_bytes ||
+        (index < WORKLOAD_TD_FRAME_SIZE - 1 && *data != WORKLOAD_TD_PREFIX[index])) {
+        vcpu->td_completion_bytes = 0;
+        return -1;
+    }
+    if (++vcpu->td_completion_bytes == WORKLOAD_TD_FRAME_SIZE)
+        return *data;
+    return -1;
+}
+
 int vcpu_run(struct vcpu *vcpu, struct serial *serial,
              struct vcpu_run_stats *stats)
 {
@@ -539,17 +572,11 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
                 return vcpu_finish(stats, "invalid_io_data", -1);
             }
             uint8_t *data = (uint8_t *)run + offset;
-            if (vcpu->workload_mode && run->io.port == WORKLOAD_EXIT_PORT &&
-                run->io.direction == KVM_EXIT_IO_OUT && run->io.size == 4 &&
-                run->io.count == 1) {
-                uint32_t message;
-                memcpy(&message, data, sizeof(message));
-                if ((message & WORKLOAD_EXIT_MASK) == WORKLOAD_EXIT_MAGIC) {
-                    vcpu->workload_exit_status = (int)(message & 0xff);
-                    fprintf(stderr, "INFO: workload exited status=%d\n",
-                            vcpu->workload_exit_status);
-                    return vcpu_finish(stats, "workload_exit", 0);
-                }
+            int completion = workload_completion(vcpu, run, data);
+            if (completion >= 0) {
+                vcpu->workload_exit_status = completion;
+                fprintf(stderr, "INFO: workload exited status=%d\n", completion);
+                return vcpu_finish(stats, "workload_exit", 0);
             }
             const char *event = NULL;
             int platform = platform_handle_io(run, data, data_size, &event);
@@ -600,16 +627,30 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
          * 设备在 vCPU 线程上同步处理，返回后 KVM 把读结果交给客户机指令；
          * 其他地址没有设备：写入丢弃，读取同样返回全 1。
          */
+        case KVM_EXIT_HYPERCALL:
+            if (vcpu->hypercall && vcpu->hypercall(vcpu->hypercall_opaque, run) == 0)
+                break;
+            return vcpu_finish(stats, "unhandled_hypercall", -1);
+        case KVM_EXIT_SYSTEM_EVENT:
+            if (vcpu->tdx) {
+                fprintf(stderr, "ERROR: TDX guest system event %u\n", run->system_event.type);
+                return vcpu_finish(stats, "tdx_system_event", -1);
+            }
+            fprintf(stderr, "unexpected KVM exit reason: %u\n", run->exit_reason);
+            return vcpu_finish(stats, "unexpected_exit", -1);
         case KVM_EXIT_MMIO:
             if (run->mmio.len > sizeof(run->mmio.data)) {
                 fprintf(stderr, "invalid MMIO width: %u\n", run->mmio.len);
                 return vcpu_finish(stats, "invalid_mmio_width", -1);
             }
             {
-                const struct vcpu_mmio_region *region = find_mmio(vcpu, run->mmio.phys_addr);
+                uint64_t gpa = run->mmio.phys_addr;
+                if (vcpu->tdx)
+                    gpa &= ~(UINT64_C(1) << 47); /* TD GPAW=48 */
+                const struct vcpu_mmio_region *region = find_mmio(vcpu, gpa);
                 if (region) {
                     stats->mmio_device_exits++;
-                    region->access(region->opaque, run->mmio.phys_addr - region->base,
+                    region->access(region->opaque, gpa - region->base,
                                    run->mmio.data, run->mmio.len, run->mmio.is_write);
                     break;
                 }

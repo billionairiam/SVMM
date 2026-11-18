@@ -63,14 +63,20 @@ def readable_file(path):
     return path.is_file() and os.access(path, os.R_OK)
 
 
-def kernel_path(explicit):
+def kernel_path(explicit, *, tdx=False):
     configured = explicit if explicit is not None else os.environ.get("SVMM_KERNEL")
     if configured is not None:
         path = Path(configured).absolute()
         if not readable_file(path):
             raise ValueError("guest kernel is not readable: " + str(path))
         return path
-    packaged = ROOT / "images/bzImage"
+    packaged = ROOT / ("images/tdx-bzImage" if tdx else "images/bzImage")
+    required = REQUIRED_KERNEL_OPTIONS
+    if tdx:
+        required = tuple(option for option in required
+                         if option not in ("CONFIG_X86_IOPL_IOPERM=y", "CONFIG_VIRTIO_NET=y"))
+        required += ("CONFIG_INTEL_TDX_GUEST=y", "CONFIG_KVM_GUEST=y", "CONFIG_X86_X2APIC=y",
+                     "CONFIG_SWIOTLB=y", "CONFIG_DEVPORT=y")
     if readable_file(packaged):
         return packaged
     candidates = []
@@ -87,7 +93,7 @@ def kernel_path(explicit):
                 config = (kernel.parent / ("config-" + candidate)).read_text().splitlines()
             except OSError:
                 continue
-            if all(option in config for option in REQUIRED_KERNEL_OPTIONS):
+            if all(option in config for option in required):
                 candidates.append(kernel)
                 break
     if not candidates:
@@ -127,6 +133,7 @@ def main():
     parser.add_argument("--user")
     parser.add_argument("--size-mb", type=int)
     parser.add_argument("--workload", action="store_true")
+    parser.add_argument("--tdx", action="store_true")
     options, vm_options = parser.parse_known_args(raw)
     runner = Runner()
     for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGUSR2):
@@ -134,7 +141,9 @@ def main():
     try:
         if os.geteuid() != 0:
             raise ValueError("run --image as root to preserve image file ownership")
-        kernel = kernel_path(options.kernel)
+        kernel = kernel_path(options.kernel, tdx=options.tdx)
+        if options.tdx:
+            vm_options.append("--tdx")
         initrd = initrd_path(options.initrd, runner)
         print("svmm: image %s; guest kernel %s" % (options.image, kernel), file=sys.stderr)
         with tempfile.TemporaryDirectory(prefix="svmm-image-") as runtime:

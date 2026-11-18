@@ -26,7 +26,11 @@ struct vcpu_mmio_region {
 
 struct vcpu {
     int fd;
+    int tdx;
+    int (*hypercall)(void *opaque, struct kvm_run *run);
+    void *hypercall_opaque;
     int workload_mode;
+    unsigned td_completion_bytes;
     int workload_exit_status; /* -1 until a valid completion report */
     struct kvm_run *run;
     size_t run_size;
@@ -75,6 +79,7 @@ struct vcpu_run_stats {
     unsigned long mmio_device_exits;
 };
 
+int vcpu_open(struct vcpu *vcpu, const struct kvm_context *kvm, unsigned id);
 int vcpu_init(struct vcpu *vcpu, const struct kvm_context *kvm, unsigned id);
 int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
                           unsigned boot_params_addr);

@@ -97,6 +97,7 @@
 
 /* 与设备类型无关的特性位。modern 设备必须提供 VERSION_1，Linux 也要求 driver 接受它。 */
 #define VIRTIO_F_VERSION_1 32u
+#define VIRTIO_F_ACCESS_PLATFORM 33u
 
 struct virtio_mmio;
 
@@ -155,6 +156,9 @@ struct virtio_mmio {
     /* 中断线：level=1 拉高，0 拉低。可以为 NULL（只更新 InterruptStatus）。 */
     void (*set_irq)(void *opaque, int level);
     void *irq_opaque;
+    /* Optional private-VM DMA translator. Installed before the first KVM_RUN. */
+    void *(*translate_dma)(void *opaque, uint64_t gpa, uint64_t len);
+    void *dma_opaque;
 
     /* driver 可见的寄存器状态。 */
     uint32_t status;

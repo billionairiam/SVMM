@@ -48,6 +48,8 @@
 
 void *virtio_mmio_gpa(const struct virtio_mmio *dev, uint64_t gpa, uint64_t len)
 {
+    if (dev->translate_dma)
+        return dev->translate_dma(dev->dma_opaque, gpa, len);
     /* 写成减法，gpa + len 溢出回绕时也不会误判为在范围内。 */
     if (gpa > dev->mem_size || len > dev->mem_size - gpa)
         return NULL;
@@ -201,7 +203,15 @@ static struct virtio_mmio_queue *live_queue(struct virtio_mmio *dev, uint32_t qu
         (dev->status & ready) != ready ||
         (dev->status & (VIRTIO_STATUS_DEVICE_NEEDS_RESET | VIRTIO_STATUS_FAILED)))
         return NULL;
-    return &dev->queues[queue];
+    struct virtio_mmio_queue *q = &dev->queues[queue];
+    /* A TD may have converted any part of an already registered ring
+     * since its previous kick. Its only device runs synchronously on the
+     * same vCPU thread as MapGPA so the ranges stay stable for this kick. */
+    if (dev->translate_dma && !queue_setup_valid(dev, q)) {
+        needs_reset(dev);
+        return NULL;
+    }
+    return q;
 }
 
 /*
@@ -292,8 +302,11 @@ static void write_status(struct virtio_mmio *dev, uint32_t value)
      */
     if ((next & VIRTIO_STATUS_FEATURES_OK) && !(old & VIRTIO_STATUS_FEATURES_OK)) {
         uint64_t offered = dev->backend->features;
+        uint64_t required = 1ull << VIRTIO_F_VERSION_1;
+        if (dev->translate_dma)
+            required |= 1ull << VIRTIO_F_ACCESS_PLATFORM;
         if ((dev->driver_features & ~offered) ||
-            !(dev->driver_features & (1ull << VIRTIO_F_VERSION_1)))
+            (dev->driver_features & required) != required)
             next &= ~VIRTIO_STATUS_FEATURES_OK;
     }
     next |= old & VIRTIO_STATUS_FEATURES_OK;

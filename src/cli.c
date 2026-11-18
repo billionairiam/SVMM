@@ -27,6 +27,8 @@ static void print_usage(FILE *stream)
             "attached to this process's stdin/stdout.\n"
             "\n"
             "Options:\n"
+            "      --tdx            launch a native KVM Trust Domain\n"
+            "      --td-shim PATH   TD-Shim firmware for --tdx (or SVMM_TD_SHIM)\n"
             "      --image REF      pull if needed, prepare a private rootfs, run in a VM;\n"
             "                       automatically select kernel and workload initramfs\n"
             "      --entrypoint EXE with --image: override entrypoint and clear image CMD\n"
@@ -129,6 +131,8 @@ enum {
     OPT_WORKDIR,
     OPT_USER,
     OPT_SIZE_MB,
+    OPT_TDX,
+    OPT_TD_SHIM,
 };
 
 static const struct option run_options[] = {
@@ -149,6 +153,8 @@ static const struct option run_options[] = {
     { "restore", required_argument, NULL, OPT_RESTORE },
     { "workload", no_argument, NULL, OPT_WORKLOAD },
     { "image", required_argument, NULL, OPT_IMAGE },
+    { "tdx", no_argument, NULL, OPT_TDX },
+    { "td-shim", required_argument, NULL, OPT_TD_SHIM },
     { "entrypoint", required_argument, NULL, OPT_ENTRYPOINT },
     { "env", required_argument, NULL, OPT_ENV },
     { "workdir", required_argument, NULL, OPT_WORKDIR },
@@ -161,6 +167,7 @@ static const struct option run_options[] = {
 int cli_parse(int argc, char **argv, struct sandbox_config *config)
 {
     sandbox_config_init(config);
+    const char *default_cmdline = config->cmdline;
     if (argc < 2)
         return usage_error("missing subcommand");
 
@@ -274,6 +281,14 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
             else
                 config->restore_name = optarg;
             break;
+        case OPT_TDX:
+            config->tdx = 1;
+            break;
+        case OPT_TD_SHIM:
+            if (!*optarg)
+                return usage_error("--td-shim requires a non-empty path");
+            config->td_shim_path = optarg;
+            break;
         case OPT_IMAGE:
             if (!*optarg)
                 return usage_error("--image requires a non-empty image reference");
@@ -323,6 +338,13 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
         return usage_error("--entrypoint/--env/--workdir/--user/--size-mb require --image");
     if (config->image && (config->disk_path || config->snapshot_name || config->restore_name))
         return usage_error("--image cannot be combined with --disk, --snapshot or --restore");
+    if (config->td_shim_path && !config->tdx)
+        return usage_error("--td-shim requires --tdx");
+    if (config->tdx && (config->tap_name || config->netns_name || config->jail.enabled ||
+                        config->warm_save_name || config->restore_name || config->snapshot_name))
+        return usage_error("--tdx does not support networking, jail or snapshots");
+    if (config->tdx && config->cmdline == default_cmdline)
+        config->cmdline = "console=ttyS0 earlycon=uart8250,io,0x3f8 loglevel=7 reboot=acpi panic=1 nokaslr";
     if (config->restore_name && boot_option)
         return usage_error("--restore takes the kernel, memory size and command line from "
                            "the snapshot; remove %s", boot_option);

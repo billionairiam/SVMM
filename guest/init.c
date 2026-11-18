@@ -3,6 +3,7 @@
 #include "workload.h"
 
 #include <arpa/inet.h>
+#include <cpuid.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -32,6 +33,17 @@ struct config {
 };
 static volatile sig_atomic_t child_pid;
 static int root_mounted, report_ready;
+static int td_guest, td_report_fd = -1;
+
+static int in_tdx(void)
+{
+    unsigned a, b, c, d;
+    if (__get_cpuid_max(0, NULL) < 0x21)
+        return 0;
+    __cpuid_count(0x21, 0, a, b, c, d);
+    (void)a;
+    return b == 0x65746e49u && d == 0x5844546cu && c == 0x20202020u;
+}
 
 static void forward_signal(int signo)
 {
@@ -54,8 +66,15 @@ static void finish(int code)
     if (root_mounted && mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL) < 0)
         perror("svmm-init: remount root read-only");
     fprintf(stderr, "svmm-init: workload exited status=%d\n", code);
-    if (report_ready)
+    if (td_report_fd >= 0) {
+        unsigned char frame[WORKLOAD_TD_FRAME_SIZE] = WORKLOAD_TD_PREFIX;
+        frame[sizeof(frame) - 1] = (unsigned char)code;
+        if (lseek(td_report_fd, WORKLOAD_EXIT_PORT, SEEK_SET) < 0 ||
+            write(td_report_fd, frame, sizeof(frame)) != sizeof(frame))
+            perror("svmm-init: send TD workload completion");
+    } else if (report_ready) {
         outl(WORKLOAD_EXIT_MAGIC | (unsigned)code, WORKLOAD_EXIT_PORT);
+    }
     /* Also terminates on a VMM which does not understand the report. */
     reboot(RB_POWER_OFF);
     for (;;) pause();
@@ -290,7 +309,10 @@ static void execute(struct config *config)
     signal(SIGINT, SIG_DFL);
     signal(SIGHUP, SIG_DFL);
     /* Never grant this init-only port to the application through inheritance. */
-    if (ioperm(WORKLOAD_EXIT_PORT, 4, 0) < 0) _exit(125);
+    if (td_report_fd >= 0)
+        close(td_report_fd);
+    if (!td_guest && ioperm(WORKLOAD_EXIT_PORT, 4, 0) < 0)
+        _exit(125);
     identity(config->user);
     if (chdir(config->cwd) < 0) { perror("workload cwd"); _exit(125); }
     if (clearenv()) _exit(125);
@@ -313,8 +335,18 @@ int main(void)
         for (int i = 0; i < 3; ++i) dup2(console, i);
         if (console > 2) close(console);
     }
-    report_ready = ioperm(WORKLOAD_EXIT_PORT, 4, 1) == 0;
-    if (!report_ready) fail("enable workload report");
+    td_guest = in_tdx();
+    if (td_guest) {
+        /* Linux handles a kernel outb through #VE. A userspace outl is
+         * rejected by the TDX handler even with ioperm enabled. */
+        td_report_fd = open("/dev/port", O_WRONLY | O_CLOEXEC);
+        if (td_report_fd < 0)
+            fail("open TD workload completion port");
+    } else {
+        report_ready = ioperm(WORKLOAD_EXIT_PORT, 4, 1) == 0;
+        if (!report_ready)
+            fail("enable workload report");
+    }
     mount_fs("proc", "/proc", NULL);
     mount_fs("sysfs", "/sys", NULL);
     for (int i = 0; access("/dev/vda", F_OK) && i < 500; ++i)

@@ -276,6 +276,8 @@ int boot_acpi_setup(struct guest_memory *memory, const struct acpi_virtio_mmio *
         put8(aml, VIRTIO_AML_UID, (uint8_t)i);
         put32(aml, VIRTIO_AML_MEM_BASE, devices[i].base);
         put32(aml, VIRTIO_AML_MEM_SIZE, devices[i].size);
+        if (devices[i].edge_triggered)
+            aml[VIRTIO_AML_GSI - 2] |= 2;
         put32(aml, VIRTIO_AML_GSI, devices[i].gsi);
         dsdt_size += sizeof(dsdt_virtio_mmio_aml);
     }

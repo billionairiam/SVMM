@@ -5,6 +5,9 @@
 #define WORKLOAD_EXIT_PORT 0x0604u
 #define WORKLOAD_EXIT_MAGIC 0x53564d00u
 #define WORKLOAD_EXIT_MASK 0xffffff00u
+/* TD init writes these three bytes and the status via guest /dev/port. */
+#define WORKLOAD_TD_PREFIX "SVM"
+#define WORKLOAD_TD_FRAME_SIZE 4u
 /* Config: 8-byte magic including NUL, LE32 argc/envc, then NUL-terminated
  * cwd, user, argv[argc], env[envc]. No trailing bytes; vectors are bounded. */
 #define WORKLOAD_CONFIG_MAGIC "SVMMWL1"

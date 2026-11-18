@@ -37,6 +37,7 @@ struct acpi_virtio_mmio {
     uint32_t base;
     uint32_t size;
     uint32_t gsi;
+    int edge_triggered;
 };
 
 /*
