@@ -185,11 +185,11 @@ class WorkloadTest(unittest.TestCase):
         proc = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         export_pid = None
         export_directory = None
-        owned = []
+        export_container = None
         def container_ids():
             result = subprocess.run(
                 ["docker", "ps", "-aq", "--filter", "label=svmm.workload-builder=true",
-                 "--filter", "ancestor=" + self.image], capture_output=True, check=True)
+                 "--filter", f"name=^/{export_container}$"], capture_output=True, check=True)
             return result.stdout.decode().split()
         try:
             deadline = time.monotonic() + 20
@@ -207,6 +207,7 @@ class WorkloadTest(unittest.TestCase):
                             export_pid = int(candidate)
                             arguments = command.split(b"\0")
                             export_directory = Path(os.fsdecode(arguments[arguments.index(b"--output") + 1])).parent
+                            export_container = os.fsdecode(arguments[-2])
                             break
                     except (FileNotFoundError, ProcessLookupError):
                         pass
@@ -214,8 +215,7 @@ class WorkloadTest(unittest.TestCase):
                     break
                 time.sleep(0.001)
             self.assertIsNotNone(export_pid, "could not observe the real Docker export")
-            owned = container_ids()
-            self.assertTrue(owned, "builder should own an export container")
+            self.assertTrue(container_ids(), "builder should own an export container")
             proc.send_signal(signal.SIGTERM)
             proc.wait(timeout=20)
             # An unfixed builder leaves the paused child holding stdout open.
@@ -235,8 +235,8 @@ class WorkloadTest(unittest.TestCase):
                 except ProcessLookupError:
                     pass
             proc.communicate(timeout=20)
-            if owned:
-                subprocess.run(["docker", "rm", "-f", "-v", *owned],
+            if export_container is not None:
+                subprocess.run(["docker", "rm", "-f", "-v", export_container],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if export_directory is not None:
                 shutil.rmtree(export_directory, ignore_errors=True)
