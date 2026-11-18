@@ -29,6 +29,7 @@ static void print_usage(FILE *stream)
             "\n"
             "Options:\n"
             "      --tdx            launch a native KVM Trust Domain\n"
+            "      --vcpus N        with --tdx: number of guest CPUs, 1-%u (default: 1)\n"
             "      --td-shim PATH   TD-Shim firmware for --tdx (or SVMM_TD_SHIM)\n"
             "      --image REF      pull if needed, prepare a private rootfs, run in a VM;\n"
             "                       automatically select kernel and workload initramfs\n"
@@ -72,7 +73,7 @@ static void print_usage(FILE *stream)
             "  -h, --help           show this help\n"
             "\n"
             "When stdin is a terminal, press Ctrl-A x to quit.\n",
-            GUEST_MEMORY_MIN_MB, GUEST_MEMORY_MAX_MB, DEFAULT_GUEST_MEM_MB, TDX_MAX_MEM_MB,
+            TDX_MAX_VCPUS, GUEST_MEMORY_MIN_MB, GUEST_MEMORY_MAX_MB, DEFAULT_GUEST_MEM_MB, TDX_MAX_MEM_MB,
             SANDBOX_DEFAULT_CMDLINE, JAIL_CPU_PERIOD_US, JAIL_DEFAULT_CPU_MAX_US,
             JAIL_DEFAULT_MEMORY_OVERHEAD_MB, JAIL_DEFAULT_NOFILE, JAIL_DEFAULT_NPROC);
 }
@@ -135,6 +136,7 @@ enum {
     OPT_SIZE_MB,
     OPT_TDX,
     OPT_TD_SHIM,
+    OPT_VCPUS,
 };
 
 static const struct option run_options[] = {
@@ -157,6 +159,7 @@ static const struct option run_options[] = {
     { "image", required_argument, NULL, OPT_IMAGE },
     { "tdx", no_argument, NULL, OPT_TDX },
     { "td-shim", required_argument, NULL, OPT_TD_SHIM },
+    { "vcpus", required_argument, NULL, OPT_VCPUS },
     { "entrypoint", required_argument, NULL, OPT_ENTRYPOINT },
     { "env", required_argument, NULL, OPT_ENV },
     { "workdir", required_argument, NULL, OPT_WORKDIR },
@@ -205,6 +208,7 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
     const char *invalid_memory_option = NULL;
     const char *large_memory_option = NULL;
     int image_options = 0;
+    int vcpus_specified = 0;
     while ((opt = getopt_long(sub_argc, sub_argv, "+:k:i:m:c:d:t:n:js:h", run_options, &index)) != -1) {
         if (opt >= OPT_CPU_MAX && opt <= OPT_NPROC && !jail_suboption)
             jail_suboption = run_options[index].name;
@@ -289,6 +293,12 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
         case OPT_TDX:
             config->tdx = 1;
             break;
+        case OPT_VCPUS:
+            if (parse_uint(optarg, 1, TDX_MAX_VCPUS, &value) < 0)
+                return usage_error("--vcpus must be an integer from 1 to %u", TDX_MAX_VCPUS);
+            config->vcpus = (unsigned)value;
+            vcpus_specified = 1;
+            break;
         case OPT_TD_SHIM:
             if (!*optarg)
                 return usage_error("--td-shim requires a non-empty path");
@@ -345,6 +355,8 @@ int cli_parse(int argc, char **argv, struct sandbox_config *config)
         return usage_error("--image cannot be combined with --disk, --snapshot or --restore");
     if (config->td_shim_path && !config->tdx)
         return usage_error("--td-shim requires --tdx");
+    if (vcpus_specified && !config->tdx)
+        return usage_error("--vcpus requires --tdx");
     if (!config->tdx && !invalid_memory_option)
         invalid_memory_option = large_memory_option;
     if (invalid_memory_option)

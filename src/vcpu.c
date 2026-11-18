@@ -279,31 +279,31 @@ int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
     return 0;
 }
 
-/* 输出本次运行的退出指标（供消融实验脚本解析），并把 status 原样返回。 */
+/* 单 CPU 或整个 CPU 组结束时，由调用方统一输出退出指标。 */
 static int vcpu_finish(struct vcpu_run_stats *stats, const char *reason,
                        int status)
 {
-    metric_exit(stderr, SVMM_VARIANT_NAME, reason, stats);
+    stats->reason = reason;
     return status;
 }
 
 /* 给（端口, 方向）的 I/O 退出计数；新端口追加到表尾，表满后只计总数。 */
 static void vcpu_count_io(struct vcpu_run_stats *stats, uint16_t port,
-                          uint8_t direction)
+                          uint8_t direction, unsigned long count)
 {
     for (unsigned i = 0; i < stats->io_port_count; ++i) {
         struct vcpu_io_port_stat *entry = &stats->io_ports[i];
         if (entry->port == port && entry->direction == direction) {
-            ++entry->exits;
+            entry->exits += count;
             return;
         }
     }
     if (stats->io_port_count == VCPU_IO_PORT_SLOTS) {
-        ++stats->io_other_exits;
+        stats->io_other_exits += count;
         return;
     }
     stats->io_ports[stats->io_port_count++] = (struct vcpu_io_port_stat){
-        .port = port, .direction = direction, .exits = 1,
+        .port = port, .direction = direction, .exits = count,
     };
 }
 
@@ -364,7 +364,7 @@ void vcpu_request_stop(struct vcpu *vcpu)
 {
     vcpu->stop_requested = 1;
     if (vcpu->run)
-        vcpu->run->immediate_exit = 1;
+        __atomic_store_n(&vcpu->run->immediate_exit, 1, __ATOMIC_RELAXED);
     if (vcpu->thread_valid)
         pthread_kill(vcpu->thread, SIGUSR1);
 }
@@ -382,10 +382,10 @@ int vcpu_quiesce(struct vcpu *vcpu)
      * （把 VMM 填好的 IN/读 MMIO 结果写进寄存器、RIP 越过那条指令），再检查
      * immediate_exit，以 EINTR 返回，一条客户机指令都不执行。
      */
-    vcpu->run->immediate_exit = 1;
+    __atomic_store_n(&vcpu->run->immediate_exit, 1, __ATOMIC_RELAXED);
     int r = ioctl(vcpu->fd, KVM_RUN, 0);
     int err = errno;
-    vcpu->run->immediate_exit = 0;
+    __atomic_store_n(&vcpu->run->immediate_exit, 0, __ATOMIC_RELAXED);
     if (r == 0 || err != EINTR) {
         fprintf(stderr, "ERROR: quiesce vCPU: KVM_RUN %s\n",
                 r == 0 ? "entered the guest" : strerror(err));
@@ -399,7 +399,7 @@ void vcpu_clear_stop(struct vcpu *vcpu)
     vcpu->save_requested = 0;
     vcpu->stop_requested = 0;
     if (vcpu->run)
-        vcpu->run->immediate_exit = 0;
+        __atomic_store_n(&vcpu->run->immediate_exit, 0, __ATOMIC_RELAXED);
 }
 
 int vcpu_mmio_register(struct vcpu *vcpu, uint64_t base, uint64_t size,
@@ -467,30 +467,39 @@ static int workload_completion(struct vcpu *vcpu, const struct kvm_run *run, con
         return (message & WORKLOAD_EXIT_MASK) == WORKLOAD_EXIT_MAGIC ? (int)(message & 0xff) : -1;
     }
     if (run->io.port < WORKLOAD_EXIT_PORT ||
-        run->io.port >= WORKLOAD_EXIT_PORT + WORKLOAD_TD_FRAME_SIZE || run->io.size != 1)
+        run->io.port >= WORKLOAD_EXIT_PORT + WORKLOAD_TD_FRAME_SIZE || run->io.size != 1 ||
+        !vcpu->td_completion)
         return -1;
+    /* A guest task may migrate between writes to /dev/port. The frame
+     * belongs to the VM, and the byte I/O exits may arrive on any vCPU. */
+    struct vcpu_workload_frame *frame = vcpu->td_completion;
+    pthread_mutex_lock(&frame->lock);
     unsigned index = run->io.port - WORKLOAD_EXIT_PORT;
     if (!index)
-        vcpu->td_completion_bytes = 0;
-    if (index != vcpu->td_completion_bytes ||
+        frame->bytes = 0;
+    int status = -1;
+    if (index != frame->bytes ||
         (index < WORKLOAD_TD_FRAME_SIZE - 1 && *data != WORKLOAD_TD_PREFIX[index])) {
-        vcpu->td_completion_bytes = 0;
-        return -1;
+        frame->bytes = 0;
+    } else if (++frame->bytes == WORKLOAD_TD_FRAME_SIZE) {
+        status = *data;
+        frame->bytes = 0;
     }
-    if (++vcpu->td_completion_bytes == WORKLOAD_TD_FRAME_SIZE)
-        return *data;
-    return -1;
+    pthread_mutex_unlock(&frame->lock);
+    return status;
 }
 
-int vcpu_run(struct vcpu *vcpu, struct serial *serial,
-             struct vcpu_run_stats *stats)
+static int vcpu_run_loop(struct vcpu *vcpu, struct serial *serial,
+                         struct vcpu_run_stats *stats)
 {
     /* 限制“未模拟设备”日志条数，避免内核探测硬件时刷屏。 */
     unsigned ignored_io = 0;
     vcpu->workload_exit_status = -1;
     *stats = (struct vcpu_run_stats){ 0 };
-    vcpu->thread = pthread_self();
-    vcpu->thread_valid = 1;
+    if (!vcpu->thread_valid) {
+        vcpu->thread = pthread_self();
+        vcpu->thread_valid = 1;
+    }
     for (;;) {
         if (vcpu->stop_requested) {
             if (vcpu->save_requested) {
@@ -498,7 +507,6 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
                 return vcpu_finish(stats, "warm_save", 0);
             }
             stats->host_stopped = 1;
-            fprintf(stderr, "INFO: VMM stopped by host request\n");
             return vcpu_finish(stats, "host_stop", 0);
         }
         /*
@@ -508,7 +516,7 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
         if (ioctl(vcpu->fd, KVM_RUN, 0) < 0) {
             if (errno == EINTR) {
                 if (!vcpu->stop_requested && vcpu->run)
-                    vcpu->run->immediate_exit = 0;
+                    __atomic_store_n(&vcpu->run->immediate_exit, 0, __ATOMIC_RELAXED);
                 continue;
             }
             perror("KVM_RUN");
@@ -560,7 +568,7 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
                 fprintf(stderr, "invalid I/O width: %u\n", run->io.size);
                 return vcpu_finish(stats, "invalid_io_width", -1);
             }
-            vcpu_count_io(stats, run->io.port, run->io.direction);
+            vcpu_count_io(stats, run->io.port, run->io.direction, 1);
             /*
              * 数据缓冲区位于共享映射内部。访问前确认 [offset, offset + size)
              * 完全落在映射范围里；用减法比较以避免 offset + size 溢出。
@@ -667,6 +675,112 @@ int vcpu_run(struct vcpu *vcpu, struct serial *serial,
             return vcpu_finish(stats, "unexpected_exit", -1);
         }
     }
+}
+
+static void report_exit(const struct vcpu_run_stats *stats)
+{
+    if (stats->host_stopped)
+        fprintf(stderr, "INFO: VMM stopped by host request\n");
+    metric_exit(stderr, SVMM_VARIANT_NAME, stats->reason, stats);
+}
+
+int vcpu_run(struct vcpu *vcpu, struct serial *serial,
+             struct vcpu_run_stats *stats)
+{
+    int result = vcpu_run_loop(vcpu, serial, stats);
+    report_exit(stats);
+    return result;
+}
+
+struct vcpu_group {
+    struct vcpu *vcpus;
+    struct serial *serial;
+    _Atomic unsigned first_exit;
+};
+
+struct vcpu_worker {
+    struct vcpu_group *group;
+    unsigned id;
+    pthread_t thread;
+    struct vcpu_run_stats stats;
+    int result;
+};
+
+static void *vcpu_worker_run(void *opaque)
+{
+    struct vcpu_worker *worker = opaque;
+    struct vcpu_group *group = worker->group;
+    worker->result = vcpu_run_loop(&group->vcpus[worker->id], group->serial, &worker->stats);
+    if (!worker->stats.host_stopped) {
+        unsigned none = 0;
+        if (atomic_compare_exchange_strong(&group->first_exit, &none, worker->id + 1))
+            vcpu_request_stop(&group->vcpus[0]);
+    }
+    return NULL;
+}
+
+static void accumulate_exits(struct vcpu_run_stats *total, const struct vcpu_run_stats *cpu)
+{
+    total->entered |= cpu->entered;
+    total->exits += cpu->exits;
+    total->serial_exits += cpu->serial_exits;
+    total->mmio_device_exits += cpu->mmio_device_exits;
+    total->io_other_exits += cpu->io_other_exits;
+    for (unsigned i = 0; i < VCPU_EXIT_REASON_SLOTS; ++i)
+        total->reason_exits[i] += cpu->reason_exits[i];
+    for (unsigned i = 0; i < cpu->io_port_count; ++i) {
+        const struct vcpu_io_port_stat *port = &cpu->io_ports[i];
+        vcpu_count_io(total, port->port, port->direction, port->exits);
+    }
+}
+
+int vcpu_run_group(struct vcpu *vcpus, unsigned count, struct serial *serial,
+                   struct vcpu_run_stats *stats, int *workload_exit_status)
+{
+    struct vcpu_group group = { .vcpus = vcpus, .serial = serial };
+    struct vcpu_worker *workers = calloc(count, sizeof(*workers));
+    if (!workers) {
+        perror("allocate vCPU workers");
+        return -1;
+    }
+
+    unsigned started = 1;
+    int result = -1;
+    for (; started < count; ++started) {
+        struct vcpu_worker *worker = &workers[started];
+        worker->group = &group;
+        worker->id = started;
+        int error = pthread_create(&worker->thread, NULL, vcpu_worker_run, worker);
+        if (error) {
+            fprintf(stderr, "ERROR: start vCPU %u: %s\n", started, strerror(error));
+            break;
+        }
+    }
+    if (started == count) {
+        result = vcpu_run_loop(&vcpus[0], serial, stats);
+        unsigned none = 0;
+        atomic_compare_exchange_strong(&group.first_exit, &none, 1);
+    }
+    for (unsigned i = 1; i < started; ++i)
+        vcpu_request_stop(&vcpus[i]);
+    for (unsigned i = 1; i < started; ++i)
+        pthread_join(workers[i].thread, NULL);
+
+    if (started == count) {
+        unsigned winner = atomic_load(&group.first_exit) - 1;
+        if (winner) {
+            stats->reason = workers[winner].stats.reason;
+            stats->host_stopped = workers[winner].stats.host_stopped;
+            stats->exit_reason = workers[winner].stats.exit_reason;
+            result = workers[winner].result;
+        }
+        for (unsigned i = 1; i < started; ++i)
+            accumulate_exits(stats, &workers[i].stats);
+        *workload_exit_status = vcpus[winner].workload_exit_status;
+        report_exit(stats);
+    }
+    free(workers);
+    return result;
 }
 
 /*

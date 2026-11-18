@@ -1,6 +1,6 @@
 # Stage 13：在 Intel TDX 中运行 OCI 镜像
 
-`--tdx` 让 SVMM 通过原生 KVM 启动一台单 vCPU 的 Trust Domain。TD-Shim 把控制权交给启用 TDX 的 Linux guest。Guest 用 virtio-blk 挂载现有的 OCI rootfs，应用退出后由 SVMM 返回它的退出码。
+`--tdx` 让 SVMM 通过原生 KVM 启动 Trust Domain。TD-Shim 把控制权交给启用 TDX 的 Linux guest。Guest 用 virtio-blk 挂载现有的 OCI rootfs，应用退出后由 SVMM 返回它的退出码。
 
 ```sh
 make all workload-initramfs
@@ -12,11 +12,16 @@ echo $?
 # 配置默认固件和内核后，直接运行镜像的 ENTRYPOINT 和 CMD。
 sudo bin/svmm run --tdx --image my-app:latest
 
+# 为同一个 workload 分配 4 个 vCPU。
+sudo bin/svmm run --tdx --vcpus 4 --image my-app:latest
+
 # 复用现有 TAP 和网络命名空间。
 sudo bin/svmm run --tdx --image my-app:latest --tap tap0 --netns sandbox-ns --mem 4096
 ```
 
 需要启用 TDX 的 Intel 宿主机和提供该 KVM ABI 的 Linux。在 Linux 7.0 上验证。固件使用 TD-Shim 的 Linux payload 构建（上游仓库的 `bash sh_script/build_final.sh boot_kernel`）。可通过 `SVMM_TD_SHIM` 或仓库的 `images/td-shim.bin` 设置默认固件。显式 `--kernel` 优先，其次是 `SVMM_KERNEL`、`images/tdx-bzImage` 与兼容的 `/boot/vmlinuz-*`。
+
+`--vcpus` 默认为 1，最多 64，同时受宿主 KVM TDX 上限约束。多核需要包含 [AP 唤醒修复](https://github.com/confidential-containers/td-shim/commit/e3a692b1e58c59b40647d919f6de8ae69b2c8846) 的 TD-Shim。已验证上游提交 `0362d0bc6d784170af28551e0b9bc6fd5ad414d2` 的 `final-boot-kernel.bin`，可将产物作为 `--td-shim` 参数或复制到 `images/td-shim.bin`。多核 guest 需要 `CONFIG_SMP=y` 且 `CONFIG_NR_CPUS` 不小于所请求的 CPU 数。多核自动选择随包内核时需要旁边的 `images/tdx-bzImage.config`。
 
 Guest 内核需要内建 `INTEL_TDX_GUEST`、`KVM_GUEST`、`X86_X2APIC`、`SWIOTLB`、`DEVPORT`，以及普通 workload 所需的 ACPI、串口、initramfs、virtio-mmio、virtio-blk 和 ext4。`DEVPORT` 用于由 guest 内核写出应用退出码，guest 安全策略要允许 PID 1 打开 `/dev/port`。硬件验证还需要内建 `TDX_GUEST_DRIVER`。
 
@@ -41,7 +46,7 @@ sudo env SVMM_TEST_TDX_KERNEL=/path/to/tdx-bzImage \
   SVMM_TEST_TD_SHIM=/path/to/td-shim.bin make test-tdx
 ```
 
-测试在真实硬件上检查非调试 TD 的 TDREPORT、内核兼容性、AVX 指令、4 GiB 内存布局、TCP 收发、ext4 读写、退出码、镜像默认命令、Registry 拉取及失败路径。网络用例需要 `ip` 和 `/dev/net/tun`，使用临时 netns。测试镜像默认为 `ubuntu:24.04`，可用 `SVMM_TEST_TDX_IMAGE` 指定带 `/bin/sh` 的兼容镜像。
+测试在真实硬件上检查非调试 TD 的 TDREPORT、内核兼容性、AVX 指令、4 GiB 内存布局、TCP 收发、ext4 读写、退出码、镜像默认命令、Registry 拉取及失败路径。多核用例验证 4 个 CPU 上线、应用逐核运行、块设备中断投递到 CPU 3，以及应用退出和宿主停止。网络用例需要 `ip` 和 `/dev/net/tun`，使用临时 netns。测试镜像默认为 `ubuntu:24.04`，可用 `SVMM_TEST_TDX_IMAGE` 指定带 `/bin/sh` 的兼容镜像。
 
 # Stage 12：直接运行 OCI / Docker 镜像里的应用
 

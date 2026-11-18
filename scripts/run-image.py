@@ -83,14 +83,23 @@ def tdx_bzimage(path):
             0 < payload_size <= file_size - setup_size <= init_size)
 
 
-def kernel_config_has(path, required):
+def kernel_config_has(path, required, vcpus):
     try:
-        return set(required).issubset(path.read_text().splitlines())
+        entries = path.read_text().splitlines()
     except (OSError, UnicodeError):
         return False
+    if not set(required).issubset(entries):
+        return False
+    if vcpus == 1:
+        return True
+    for entry in entries:
+        if entry.startswith("CONFIG_NR_CPUS="):
+            limit = entry.partition("=")[2]
+            return limit.isdecimal() and int(limit) >= vcpus
+    return False
 
 
-def kernel_path(explicit, *, tdx=False, tap=False):
+def kernel_path(explicit, *, tdx=False, tap=False, vcpus=1):
     configured = explicit if explicit is not None else os.environ.get("SVMM_KERNEL")
     if configured is not None:
         path = Path(configured).absolute()
@@ -107,12 +116,14 @@ def kernel_path(explicit, *, tdx=False, tap=False):
             required = tuple(option for option in required if option != "CONFIG_VIRTIO_NET=y")
         required += ("CONFIG_INTEL_TDX_GUEST=y", "CONFIG_KVM_GUEST=y", "CONFIG_X86_X2APIC=y",
                      "CONFIG_SWIOTLB=y", "CONFIG_DEVPORT=y")
+        if vcpus > 1:
+            required += ("CONFIG_SMP=y",)
     if readable_file(packaged):
         if not tdx:
             return packaged
         config = packaged.with_suffix(".config")
-        if tdx_bzimage(packaged) and ((not tap and not config.exists()) or
-                                     kernel_config_has(config, required)):
+        if tdx_bzimage(packaged) and ((not tap and vcpus == 1 and not config.exists()) or
+                                     kernel_config_has(config, required, vcpus)):
             return packaged
     candidates = []
     for kernel in Path("/boot").glob("vmlinuz-*"):
@@ -124,7 +135,7 @@ def kernel_path(explicit, *, tdx=False, tap=False):
             if version.endswith(suffix):
                 versions.append(version[:-len(suffix)])
         for candidate in versions:
-            if kernel_config_has(kernel.parent / ("config-" + candidate), required):
+            if kernel_config_has(kernel.parent / ("config-" + candidate), required, vcpus):
                 candidates.append(kernel)
                 break
     if not candidates:
@@ -165,6 +176,7 @@ def main():
     parser.add_argument("--size-mb", type=int)
     parser.add_argument("--workload", action="store_true")
     parser.add_argument("--tdx", action="store_true")
+    parser.add_argument("--vcpus", type=int)
     parser.add_argument("--tap")
     options, vm_options = parser.parse_known_args(raw)
     runner = Runner()
@@ -173,7 +185,10 @@ def main():
     try:
         if os.geteuid() != 0:
             raise ValueError("run --image as root to preserve image file ownership")
-        kernel = kernel_path(options.kernel, tdx=options.tdx, tap=options.tap is not None)
+        kernel = kernel_path(options.kernel, tdx=options.tdx, tap=options.tap is not None,
+                             vcpus=options.vcpus or 1)
+        if options.vcpus is not None:
+            vm_options.append("--vcpus=" + str(options.vcpus))
         if options.tap is not None:
             vm_options.append("--tap=" + options.tap)
         if options.tdx:

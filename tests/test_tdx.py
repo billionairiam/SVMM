@@ -6,12 +6,14 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import struct
 import tempfile
 import unittest
 
 from tests import test_run_image
+from tests.test_initramfs_shell import Guest
 from tests.test_virtio_net import NetNS, net_stats
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -193,6 +195,80 @@ class TdxTest(unittest.TestCase):
         self.assert_status(result, 7)
         self.assertIn(b"SVMM_TDX_IMAGE_OK", result.stdout)
         self.assertEqual(list(self.tmp.iterdir()), [])
+
+    def test_four_vcpus_run_workload_and_finish_on_secondary_cpu(self):
+        command = r'''
+test "$(cat /sys/devices/system/cpu/online)" = 0-3
+irq=$(awk '$NF == "virtio0" {sub(/:$/, "", $1); print $1}' /proc/interrupts)
+test -n "$irq"
+echo 3 > "/proc/irq/$irq/smp_affinity_list"
+# Linux applies the pending affinity change on a subsequent edge.
+dd if=/dev/vda of=/dev/null iflag=direct bs=4096 count=8 status=none
+test "$(cat "/proc/irq/$irq/effective_affinity_list")" = 3
+before=$(awk '$NF == "virtio0" {print $5}' /proc/interrupts)
+for cpu in 0 1 2 3; do
+    taskset -c "$cpu" /bin/sh -ec '
+        test "$(sed -n "s/^Cpus_allowed_list:[[:space:]]*//p" /proc/self/status)" = "$1"
+        dd if=/dev/zero of="/vcpu-$1" bs=4096 count=32 status=none
+        echo "SVMM_TDX_CPU_$1"
+    ' sh "$cpu" &
+    eval "pid_$cpu=$!"
+done
+for cpu in 0 1 2 3; do
+    eval "wait \$pid_$cpu"
+done
+sync
+after=$(awk '$NF == "virtio0" {print $5}' /proc/interrupts)
+test "$after" -gt "$before"
+echo SVMM_TDX_CPU3_IRQ_OK
+taskset -pc 3 1 >/dev/null
+test "$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/1/status)" = 3
+exit 7
+'''
+        result = self.boot("--vcpus", 4, "--image", "ubuntu:24.04", "--entrypoint", "/bin/sh",
+                           "--", "-ec", command, timeout=80,
+                           env={**os.environ, "TMPDIR": str(self.tmp)})
+        self.assert_status(result, 7)
+        for cpu in range(4):
+            self.assertIn(f"SVMM_TDX_CPU_{cpu}".encode(), result.stdout)
+        self.assertIn(b"SVMM_TDX_CPU3_IRQ_OK", result.stdout)
+        self.assertEqual(list(self.tmp.iterdir()), [])
+
+    def test_host_stop_joins_all_tdx_vcpus_and_cleans_image(self):
+        guest = Guest(base_args=["run", "--tdx", "--td-shim", SHIM, "--kernel", KERNEL,
+                                 "--vcpus", "4", "--image", "ubuntu:24.04"],
+                      args=["--entrypoint", "/bin/sh", "--", "-ec",
+                            'test "$(cat /sys/devices/system/cpu/online)" = 0-3; '
+                            'echo SVMM_TDX_ALL_ONLINE; exec sleep 300'],
+                      prefix=["env", "TMPDIR=" + str(self.tmp)])
+        self.addCleanup(guest.close)
+        guest.expect(b"SVMM_TDX_ALL_ONLINE", 60)
+        guest.proc.send_signal(signal.SIGTERM)
+        self.assertEqual(guest.wait(20), 0, guest.stderr[-4000:])
+        self.assertIn(b"reason=host_stop", guest.stderr)
+        self.assertEqual(list(self.tmp.iterdir()), [])
+
+    def test_four_vcpu_auto_selection_skips_kernel_with_two_cpu_limit(self):
+        boot_dir = self.tmp / "boot"
+        runtime = self.tmp / "runtime"
+        boot_dir.mkdir()
+        runtime.mkdir()
+        for limit in (4, 2):
+            kernel = boot_dir / f"vmlinuz-smp{limit}"
+            shutil.copyfile(KERNEL, kernel)
+            os.utime(kernel, (5 - limit, 5 - limit))
+            config = boot_dir / f"config-smp{limit}"
+            write_config(config, WORKLOAD_OPTIONS + TDX_OPTIONS + ("SMP",))
+            with config.open("a") as output:
+                output.write(f"CONFIG_NR_CPUS={limit}\n")
+        result = self.boot_with_candidates(
+            boot_dir, runtime, "--vcpus", 4, "--image", IMAGE,
+            "--entrypoint", "/bin/sh", "--", "-ec",
+            'test "$(cat /sys/devices/system/cpu/online)" = 0-3; exit 7',
+        )
+        self.assert_status(result, 7)
+        self.assertIn(b"guest kernel /boot/vmlinuz-smp4", result.stderr[-9000:])
+        self.assertEqual(list(runtime.iterdir()), [])
 
     def test_image_exchanges_tcp_data_over_tap_in_netns(self):
         # A packaged offline kernel must not hide a TAP-capable /boot kernel.

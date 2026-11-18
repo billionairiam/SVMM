@@ -62,7 +62,7 @@
  */
 
 /* 信号处理函数只能访问全局变量，所以把 vCPU 指针放在这里。 */
-static struct vcpu *signal_vcpu;
+static _Atomic(struct vcpu *) signal_vcpu;
 
 /* 什么都不做：SIGUSR1 的作用只是让阻塞中的 KVM_RUN 以 EINTR 返回。 */
 static void wake_handler(int signo)
@@ -73,16 +73,18 @@ static void wake_handler(int signo)
 static void stop_handler(int signo)
 {
     (void)signo;
-    if (signal_vcpu)
-        vcpu_request_stop(signal_vcpu);
+    struct vcpu *vcpu = signal_vcpu;
+    if (vcpu)
+        vcpu_request_stop(vcpu);
 }
 
 /* Stage 11：SIGUSR2 = 保存热快照（只在 --warm-save 时安装，否则默认动作是终止）。 */
 static void save_handler(int signo)
 {
     (void)signo;
-    if (signal_vcpu)
-        vcpu_request_save(signal_vcpu);
+    struct vcpu *vcpu = signal_vcpu;
+    if (vcpu)
+        vcpu_request_save(vcpu);
 }
 
 /*
@@ -98,6 +100,10 @@ static void install_signal_handlers(struct vcpu *vcpu, int warm_save)
     sigemptyset(&action.sa_mask);
     action.sa_handler = wake_handler;
     sigaction(SIGUSR1, &action, NULL);
+    sigset_t wake;
+    sigemptyset(&wake);
+    sigaddset(&wake, SIGUSR1);
+    pthread_sigmask(SIG_UNBLOCK, &wake, NULL);
     action.sa_handler = stop_handler;
     sigaction(SIGINT, &action, NULL);
     sigaction(SIGTERM, &action, NULL);
@@ -271,6 +277,7 @@ void sandbox_config_init(struct sandbox_config *config)
 {
     *config = (struct sandbox_config){
         .mem_size_mb = DEFAULT_GUEST_MEM_MB,
+        .vcpus = 1,
         .cmdline = SANDBOX_DEFAULT_CMDLINE,
     };
 }
@@ -307,7 +314,11 @@ int sandbox_run(const struct sandbox_config *config)
     struct td_shim *shim = NULL;
     struct ioapic td_ioapic = { 0 };
     int ioapic_ready = 0;
-    struct vcpu vcpu = { .fd = -1 };
+    struct vcpu vcpus[TDX_MAX_VCPUS] = { 0 };
+    for (unsigned i = 0; i < config->vcpus; ++i)
+        vcpus[i].fd = -1;
+    struct vcpu *vcpu = &vcpus[0];
+    struct vcpu_workload_frame td_completion = { .lock = PTHREAD_MUTEX_INITIALIZER };
     struct serial serial;
     struct console console = { 0 };
     struct linux_image image = { 0 };
@@ -437,7 +448,7 @@ int sandbox_run(const struct sandbox_config *config)
 
     if (config->tdx) {
         shim = td_shim_open(config->td_shim_path);
-        if (!shim || tdx_vm_open(&td, &kvm, &memory, mem_size_mb * MIB) < 0)
+        if (!shim || tdx_vm_open(&td, &kvm, &memory, mem_size_mb * MIB, config->vcpus) < 0)
             FAIL("tdx_init");
         if (ioapic_init(&td_ioapic, kvm.vm_fd))
             FAIL("tdx_ioapic");
@@ -470,7 +481,7 @@ int sandbox_run(const struct sandbox_config *config)
      */
     if (restore) {
         if (snapshot_warm_verify_memory(&warm, memory.data, memory.size) < 0 ||
-            vcpu_init(&vcpu, &kvm, 0) < 0 || vmstate_apply(vmstate, &kvm, &vcpu) < 0)
+            vcpu_init(vcpu, &kvm, 0) < 0 || vmstate_apply(vmstate, &kvm, vcpu) < 0)
             FAIL("restore");
         if (config->disk_path &&
             (snapshot_warm_restore_disk(restore, &warm, config->disk_path) < 0 ||
@@ -535,7 +546,7 @@ int sandbox_run(const struct sandbox_config *config)
      * 命令行）得知“0xd0000000 有一个设备、用 GSI 5”。VMM 和客户机对设备位置的
      * 约定全靠这张表。
      */
-    if (boot_acpi_setup(&memory, acpi_devices, acpi_count) < 0) {
+    if (boot_acpi_setup(&memory, acpi_devices, acpi_count, config->vcpus) < 0) {
         perror("ACPI tables");
         metric_failure("acpi_setup", memory_size);
         goto done;
@@ -557,8 +568,7 @@ int sandbox_run(const struct sandbox_config *config)
     }
 
     if (config->tdx) {
-        if (tdx_boot(&td, &kvm, &vcpu, shim, &image, &initrd, config->cmdline) < 0 ||
-            vcpu_mmio_register(&vcpu, IOAPIC_ADDR, 4096, ioapic_access, &td_ioapic) < 0)
+        if (tdx_boot(&td, &kvm, vcpus, shim, &image, &initrd, config->cmdline) < 0)
             FAIL("tdx_boot");
         goto register_mmio;
     }
@@ -572,25 +582,31 @@ int sandbox_run(const struct sandbox_config *config)
     metric_stage(stderr, SVMM_VARIANT_NAME, "boot_prepared", memory_size);
 
     /* 7. vCPU：CPUID、32 位保护模式寄存器，RIP 指向 1 MiB 处的内核入口。 */
-    if (vcpu_init(&vcpu, &kvm, 0) < 0) {
+    if (vcpu_init(vcpu, &kvm, 0) < 0) {
         metric_failure("vcpu_init", memory_size);
         goto done;
     }
-    if (vcpu_setup_linux_boot(&vcpu, KERNEL_ADDR, BOOT_PARAMS_ADDR) < 0) {
+    if (vcpu_setup_linux_boot(vcpu, KERNEL_ADDR, BOOT_PARAMS_ADDR) < 0) {
         metric_failure("vcpu_setup", memory_size);
         goto done;
     }
 register_mmio:
-    vcpu.workload_mode = config->workload;
     /*
      * 把 virtio 寄存器页登记给 vCPU 的 MMIO 分派。KVM 本身不知道哪个地址属于
      * 哪个设备，它只报告“客户机访问了某个未映射的 GPA”，由 VMM 自己查表。
      */
-    if ((blk_attached && vcpu_mmio_register(&vcpu, VIRTIO_MMIO_BASE, VIRTIO_MMIO_SIZE,
-                                            virtio_mmio_exit, &blk.mmio) < 0) ||
-        (net_attached && vcpu_mmio_register(&vcpu, VIRTIO_MMIO_NET_BASE, VIRTIO_MMIO_SIZE,
-                                            virtio_mmio_exit, &net.mmio) < 0))
-        FAIL("vcpu_setup");
+    for (unsigned i = 0; i < config->vcpus; ++i) {
+        struct vcpu *cpu = &vcpus[i];
+        cpu->workload_mode = config->workload;
+        cpu->td_completion = &td_completion;
+        if ((config->tdx && vcpu_mmio_register(cpu, IOAPIC_ADDR, 4096,
+                                               ioapic_access, &td_ioapic) < 0) ||
+            (blk_attached && vcpu_mmio_register(cpu, VIRTIO_MMIO_BASE, VIRTIO_MMIO_SIZE,
+                                               virtio_mmio_exit, &blk.mmio) < 0) ||
+            (net_attached && vcpu_mmio_register(cpu, VIRTIO_MMIO_NET_BASE, VIRTIO_MMIO_SIZE,
+                                               virtio_mmio_exit, &net.mmio) < 0))
+            FAIL("vcpu_setup");
+    }
     metric_stage(stderr, SVMM_VARIANT_NAME, "vcpu_setup", memory_size);
 
     /*
@@ -614,9 +630,9 @@ register_mmio:
         FAIL("restore");
     serial_set_irq_handler(&serial, config->tdx ? td_serial_irq : serial_irq,
                            config->tdx ? (void *)&td_ioapic : (void *)&kvm);
-    install_signal_handlers(&vcpu, config->warm_save_name != NULL);
-    if (console_start(&console, &serial, STDIN_FILENO, console_quit, &vcpu,
-                      config->warm_save_name ? console_snapshot : NULL, &vcpu) < 0)
+    install_signal_handlers(vcpu, config->warm_save_name != NULL);
+    if (console_start(&console, &serial, STDIN_FILENO, console_quit, vcpu,
+                      config->warm_save_name ? console_snapshot : NULL, vcpu) < 0)
         FAIL("console");
 
     /*
@@ -649,22 +665,29 @@ register_mmio:
      */
     metric_stage(stderr, SVMM_VARIANT_NAME, "kvm_run", memory_size);
     const struct warm_parts parts = {
-        .config = config, .kvm = &kvm, .vcpu = &vcpu, .serial = &serial, .memory = &memory,
+        .config = config, .kvm = &kvm, .vcpu = vcpu, .serial = &serial, .memory = &memory,
         .blk = blk_attached ? &blk : NULL, .net = net_attached ? &net : NULL,
     };
     for (;;) {
-        if (vcpu_run(&vcpu, &serial, &run_stats) < 0)
+        int result, workload_status;
+        if (config->vcpus > 1) {
+            result = vcpu_run_group(vcpus, config->vcpus, &serial, &run_stats, &workload_status);
+        } else {
+            result = vcpu_run(vcpu, &serial, &run_stats);
+            workload_status = vcpu->workload_exit_status;
+        }
+        if (result < 0)
             break;
-        if (!(vcpu.save_requested && config->warm_save_name) || warm_save(&parts) == 0) {
-            if (!config->workload || vcpu.save_requested || run_stats.host_stopped)
+        if (!(vcpu->save_requested && config->warm_save_name) || warm_save(&parts) == 0) {
+            if (!config->workload || vcpu->save_requested || run_stats.host_stopped)
                 status = 0;
-            else if (vcpu.workload_exit_status >= 0)
-                status = vcpu.workload_exit_status;
+            else if (workload_status >= 0)
+                status = workload_status;
             else
                 fprintf(stderr, "ERROR: guest stopped without a workload exit report\n");
             break;
         }
-        vcpu_clear_stop(&vcpu);
+        vcpu_clear_stop(vcpu);
     }
 
 done:
@@ -680,7 +703,9 @@ done:
     if (status == 0)
         fprintf(stderr, "INFO: sandbox completed\n");
     signal_vcpu = NULL;
-    vcpu_destroy(&vcpu);
+    for (unsigned i = 0; i < config->vcpus; ++i)
+        vcpu_destroy(&vcpus[i]);
+    pthread_mutex_destroy(&td_completion.lock);
     if (serial_ready)
         serial_destroy(&serial);
     if (ioapic_ready)

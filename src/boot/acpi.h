@@ -48,6 +48,6 @@ struct acpi_virtio_mmio {
 
 /* devices 指向 count 个设备，count 可以为 0；count 超过上限时返回 -1（EINVAL）。 */
 int boot_acpi_setup(struct guest_memory *memory, const struct acpi_virtio_mmio *devices,
-                    unsigned count);
+                    unsigned count, unsigned vcpus);
 
 #endif

@@ -17,6 +17,7 @@ struct linux_initrd;
 #define TDX_GPA_SHARED (UINT64_C(1) << 47)
 #define TDX_HIGH_RAM_BASE (UINT64_C(1) << 32)
 #define TDX_MAX_MEM_MB (32u * 1024u)
+#define TDX_MAX_VCPUS 64u
 
 struct tdx_range {
     uint64_t start, size;
@@ -24,6 +25,7 @@ struct tdx_range {
 
 struct tdx_vm {
     int vm_fd, ram_fd, high_ram_fd, firmware_fd;
+    unsigned vcpus;
     struct guest_memory *ram;
     uint64_t low_ram_size, high_ram_size;
     uint8_t *firmware;
@@ -43,9 +45,9 @@ int td_shim_stage(const struct td_shim *shim, struct tdx_vm *td,
                   const struct linux_image *image, const struct linux_initrd *initrd,
                   const char *cmdline, uint64_t *hob, struct tdx_range measure[3]);
 
-int tdx_preflight(const char *firmware);
+int tdx_preflight(const char *firmware, unsigned vcpus);
 int tdx_vm_open(struct tdx_vm *td, struct kvm_context *kvm, struct guest_memory *memory,
-                size_t ram_size);
+                size_t ram_size, unsigned vcpus);
 int tdx_boot(struct tdx_vm *td, struct kvm_context *kvm, struct vcpu *vcpu,
              const struct td_shim *shim, const struct linux_image *image,
              const struct linux_initrd *initrd, const char *cmdline);

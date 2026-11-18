@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 struct kvm_context;
@@ -24,22 +25,27 @@ struct vcpu_mmio_region {
 /* 设备数很少，线性查找即可。 */
 #define VCPU_MMIO_MAX 4u
 
+struct vcpu_workload_frame {
+    pthread_mutex_t lock;
+    unsigned bytes;
+};
+
 struct vcpu {
     int fd;
     int tdx;
     int (*hypercall)(void *opaque, struct kvm_run *run);
     void *hypercall_opaque;
     int workload_mode;
-    unsigned td_completion_bytes;
+    struct vcpu_workload_frame *td_completion;
     int workload_exit_status; /* -1 until a valid completion report */
     struct kvm_run *run;
     size_t run_size;
     /* vcpu_request_stop() 设置；可能在信号处理函数中写入。 */
-    volatile sig_atomic_t stop_requested;
+    _Atomic sig_atomic_t stop_requested;
     /* Stage 11：这次停止是为了保存热快照（vcpu_request_save()）。 */
-    volatile sig_atomic_t save_requested;
+    _Atomic sig_atomic_t save_requested;
     pthread_t thread;
-    volatile sig_atomic_t thread_valid;
+    _Atomic sig_atomic_t thread_valid;
     /*
      * 已注册的 MMIO 设备（Stage 06 virtio-blk、Stage 07 virtio-net）。
      * KVM_EXIT_MMIO 时按地址在表里查找；区间互不重叠，所以最多命中一个。
@@ -64,6 +70,7 @@ struct vcpu_io_port_stat {
  * 自己处理掉的退出（EPT 缺页、irqchip 下的 HLT、LAPIC 定时器等）看不到。
  */
 struct vcpu_run_stats {
+    const char *reason;
     unsigned long exits;
     unsigned long serial_exits;
     unsigned exit_reason;
@@ -85,6 +92,8 @@ int vcpu_setup_linux_boot(struct vcpu *vcpu, unsigned kernel_addr,
                           unsigned boot_params_addr);
 int vcpu_run(struct vcpu *vcpu, struct serial *serial,
              struct vcpu_run_stats *stats);
+int vcpu_run_group(struct vcpu *vcpus, unsigned count, struct serial *serial,
+                   struct vcpu_run_stats *stats, int *workload_exit_status);
 void vcpu_request_stop(struct vcpu *vcpu);
 
 /*

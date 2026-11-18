@@ -112,6 +112,21 @@ static int create_td(int fd)
     return vm;
 }
 
+static int check_td_vcpus(int vm, unsigned requested)
+{
+    int limit = ioctl(vm, KVM_CHECK_EXTENSION, KVM_CAP_MAX_VCPUS);
+    if (limit < 1) {
+        fprintf(stderr, "ERROR: cannot query the KVM TDX vCPU limit\n");
+        return -1;
+    }
+    if (requested > (unsigned)limit) {
+        fprintf(stderr, "ERROR: requested %u vCPUs but this KVM TDX host supports %d\n",
+                requested, limit);
+        return -1;
+    }
+    return 0;
+}
+
 static int check_td_capabilities(int vm, struct tdx_vm *td)
 {
     struct td_capabilities caps = { .cpuid.count = TD_CPUID_MAX };
@@ -134,7 +149,7 @@ static int check_td_capabilities(int vm, struct tdx_vm *td)
     return 0;
 }
 
-int tdx_preflight(const char *firmware)
+int tdx_preflight(const char *firmware, unsigned vcpus)
 {
     struct td_shim *shim = td_shim_open(firmware);
     if (!shim)
@@ -146,7 +161,9 @@ int tdx_preflight(const char *firmware)
     int vm = create_td(fd);
     int result = -1;
     if (vm >= 0) {
-        result = check_td_capabilities(vm, NULL);
+        result = check_td_vcpus(vm, vcpus);
+        if (!result)
+            result = check_td_capabilities(vm, NULL);
         close(vm);
     }
     close(fd);
@@ -195,15 +212,17 @@ static int enable_cap(int fd, unsigned name, uint64_t value)
 }
 
 int tdx_vm_open(struct tdx_vm *td, struct kvm_context *kvm, struct guest_memory *memory,
-                size_t ram_size)
+                size_t ram_size, unsigned vcpus)
 {
     kvm->system_fd = open_tdx_kvm();
     if (kvm->system_fd < 0)
         return -1;
     kvm->vm_fd = create_td(kvm->system_fd);
-    if (kvm->vm_fd < 0 || check_td_capabilities(kvm->vm_fd, td) < 0)
+    if (kvm->vm_fd < 0 || check_td_vcpus(kvm->vm_fd, vcpus) < 0 ||
+        check_td_capabilities(kvm->vm_fd, td) < 0)
         return -1;
     td->vm_fd = kvm->vm_fd;
+    td->vcpus = vcpus;
     if (enable_cap(td->vm_fd, KVM_CAP_SPLIT_IRQCHIP, 24) ||
         enable_cap(td->vm_fd, KVM_CAP_EXIT_HYPERCALL, 1u << TD_MAP_GPA))
         return -1;
@@ -245,21 +264,29 @@ int tdx_vm_open(struct tdx_vm *td, struct kvm_context *kvm, struct guest_memory 
     return 0;
 }
 
-static int launch_cpu(struct tdx_vm *td, struct kvm_context *kvm,
-                      struct vcpu *vcpu, uint64_t hob)
+/* Single package, one hardware thread per core, dense x2APIC IDs. */
+static struct kvm_cpuid_entry2 topology(unsigned leaf, unsigned count,
+                                        unsigned level, unsigned apic_id)
 {
-    /* Select four-level EPT. AVX needs both xstate and any configurable
-     * instruction bits advertised by the TDX capabilities. */
-    struct td_parameters params = {
-        .attrs = TD_SEPT_VE_DISABLE, .xfam = td->xfam,
-        .cpuid = { .count = 1, .entries = { { .function = 0x80000008, .eax = 48u << 16 } } },
+    struct kvm_cpuid_entry2 entry = {
+        .function = leaf, .index = level, .flags = KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+        .ecx = level, .edx = apic_id,
     };
-    if (td->cpuid_avx)
-        params.cpuid.entries[params.cpuid.count++] = (struct kvm_cpuid_entry2){
-            .function = 1, .ecx = td->cpuid_avx,
-        };
-    if (td_call(td->vm_fd, TD_INIT_VM, 0, (uintptr_t)&params) < 0 ||
-        vcpu_open(vcpu, kvm, 0) < 0)
+    if (level == 0) {
+        entry.ebx = 1;
+        entry.ecx |= 1u << 8;
+    } else if (level == 1) {
+        entry.eax = 32u - __builtin_clz(count - 1);
+        entry.ebx = count;
+        entry.ecx |= 2u << 8;
+    }
+    return entry;
+}
+
+static int launch_vcpu(struct tdx_vm *td, struct kvm_context *kvm,
+                       struct vcpu *vcpu, unsigned id, uint64_t hob)
+{
+    if (vcpu_open(vcpu, kvm, id) < 0)
         return -1;
 
     /* KVM needs x2APIC to initialize the vCPU. After initialization use
@@ -275,6 +302,23 @@ static int launch_cpu(struct tdx_vm *td, struct kvm_context *kvm,
     if (td_call(vcpu->fd, TD_INIT_VCPU, 0, hob) < 0 ||
         td_call(vcpu->fd, TD_GET_CPUID, 0, (uintptr_t)&cpuid) < 0)
         return -1;
+    if (td->vcpus > 1) {
+        /* TD-Shim uses an emulated CPUID(0xb, 0) when entering its ACPI
+         * wakeup loop. Match the module's topology and the MADT IDs. */
+        unsigned kept = 0;
+        for (unsigned i = 0; i < cpuid.count; ++i) {
+            struct kvm_cpuid_entry2 entry = cpuid.entries[i];
+            if (entry.function != 0xb)
+                cpuid.entries[kept++] = entry;
+        }
+        cpuid.count = kept;
+        if (cpuid.count > TD_CPUID_MAX - 5) {
+            fprintf(stderr, "ERROR: TDX CPUID table has no room for topology\n");
+            return -1;
+        }
+        for (unsigned level = 0; level < 3; ++level)
+            cpuid.entries[cpuid.count++] = topology(0xb, td->vcpus, level, id);
+    }
     if (cpuid.count > TD_CPUID_MAX - 2) {
         fprintf(stderr, "ERROR: TDX CPUID table has no room for KVM leaves\n");
         return -1;
@@ -290,6 +334,37 @@ static int launch_cpu(struct tdx_vm *td, struct kvm_context *kvm,
     if (ioctl(vcpu->fd, KVM_SET_CPUID2, &cpuid) < 0) {
         perror("KVM_SET_CPUID2 for TDX");
         return -1;
+    }
+    vcpu->tdx = 1;
+    vcpu->hypercall = tdx_handle_hypercall;
+    vcpu->hypercall_opaque = td;
+    return 0;
+}
+
+static int launch_cpus(struct tdx_vm *td, struct kvm_context *kvm,
+                       struct vcpu *vcpus, uint64_t hob)
+{
+    /* Select four-level EPT and configure the topology seen by native
+     * guest CPUID before creating any vCPU. */
+    struct td_parameters params = {
+        .attrs = TD_SEPT_VE_DISABLE, .xfam = td->xfam,
+        .cpuid = { .count = 1, .entries = { { .function = 0x80000008, .eax = 48u << 16 } } },
+    };
+    if (td->cpuid_avx)
+        params.cpuid.entries[params.cpuid.count++] = (struct kvm_cpuid_entry2){
+            .function = 1, .ecx = td->cpuid_avx,
+        };
+    if (td->vcpus > 1) {
+        for (unsigned level = 0; level < 2; ++level)
+            params.cpuid.entries[params.cpuid.count++] = topology(0x1f, td->vcpus, level, 0);
+    }
+    if (td_call(td->vm_fd, TD_INIT_VM, 0, (uintptr_t)&params) < 0)
+        return -1;
+    for (unsigned i = 0; i < td->vcpus; ++i) {
+        if (launch_vcpu(td, kvm, &vcpus[i], i, hob) < 0) {
+            fprintf(stderr, "ERROR: initialize TDX vCPU %u\n", i);
+            return -1;
+        }
     }
     return 0;
 }
@@ -311,20 +386,21 @@ static int import_pages(int fd, uint8_t *data, uint64_t start, uint64_t size, in
     }
 }
 
-int tdx_boot(struct tdx_vm *td, struct kvm_context *kvm, struct vcpu *vcpu,
+int tdx_boot(struct tdx_vm *td, struct kvm_context *kvm, struct vcpu *vcpus,
              const struct td_shim *shim, const struct linux_image *image,
              const struct linux_initrd *initrd, const char *cmdline)
 {
     struct tdx_range ranges[3] = { 0 };
     uint64_t hob;
     if (td_shim_stage(shim, td, image, initrd, cmdline, &hob, ranges) < 0 ||
-        launch_cpu(td, kvm, vcpu, hob) < 0)
+        launch_cpus(td, kvm, vcpus, hob) < 0)
         return -1;
 
     td->firmware_fd = private_slot(td->vm_fd, 1, td->firmware_base,
                                   td->firmware_size, td->firmware);
     if (td->firmware_fd < 0)
         return -1;
+    int bsp_fd = vcpus[0].fd;
     uint64_t cursor = 0;
     for (size_t i = 0; i < 3; ++i) {
         if (!ranges[i].size)
@@ -332,25 +408,22 @@ int tdx_boot(struct tdx_vm *td, struct kvm_context *kvm, struct vcpu *vcpu,
         if (ranges[i].start < cursor || ranges[i].start > td->low_ram_size ||
             ranges[i].size > td->low_ram_size - ranges[i].start)
             return -1;
-        if (import_pages(vcpu->fd, td->ram->data + cursor, cursor, ranges[i].start - cursor, 0) ||
-            import_pages(vcpu->fd, td->ram->data + ranges[i].start,
+        if (import_pages(bsp_fd, td->ram->data + cursor, cursor, ranges[i].start - cursor, 0) ||
+            import_pages(bsp_fd, td->ram->data + ranges[i].start,
                          ranges[i].start, ranges[i].size, 1))
             return -1;
         cursor = ranges[i].start + ranges[i].size;
     }
-    if (import_pages(vcpu->fd, td->ram->data + cursor, cursor, td->low_ram_size - cursor, 0) ||
-        (td->high_ram_size && import_pages(vcpu->fd, td->ram->data + TDX_HIGH_RAM_BASE,
+    if (import_pages(bsp_fd, td->ram->data + cursor, cursor, td->low_ram_size - cursor, 0) ||
+        (td->high_ram_size && import_pages(bsp_fd, td->ram->data + TDX_HIGH_RAM_BASE,
                                            TDX_HIGH_RAM_BASE, td->high_ram_size, 0)) ||
-        import_pages(vcpu->fd, td->firmware, td->firmware_base, td->firmware_size, 1) ||
+        import_pages(bsp_fd, td->firmware, td->firmware_base, td->firmware_size, 1) ||
         td_call(td->vm_fd, TD_FINALIZE, 0, 0) < 0)
         return -1;
     if (madvise(td->ram->data, td->ram->size, MADV_DONTNEED) < 0) {
         perror("clear TDX staging memory");
         return -1;
     }
-    vcpu->tdx = 1;
-    vcpu->hypercall = tdx_handle_hypercall;
-    vcpu->hypercall_opaque = td;
     fprintf(stderr, "INFO: TDX launch finalized (debug disabled)\n");
     return 0;
 }

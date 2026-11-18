@@ -82,7 +82,7 @@ int main(int argc, char **argv)
             config.td_shim_path = shim;
         }
     }
-    if (config.image && config.tdx && tdx_preflight(config.td_shim_path) < 0)
+    if (config.image && config.tdx && tdx_preflight(config.td_shim_path, config.vcpus) < 0)
         return 125;
     if (config.image)
         return enter_image_runner(argc, argv);

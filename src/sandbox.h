@@ -32,6 +32,7 @@ struct sandbox_config {
     /* Host-side OCI image preparation; dispatched before sandbox_run. */
     const char *image;
     int tdx;
+    unsigned vcpus;
     const char *td_shim_path;
     /* initramfs（cpio 或 cpio.gz）路径；NULL 或空串表示不加载。 */
     const char *initrd_path;

@@ -28,7 +28,8 @@
 #define RSDP_SIZE 36u
 #define RSDT_SIZE (ACPI_HEADER_SIZE + 2u * 4u)
 #define FADT_SIZE 276u
-#define MADT_SIZE (ACPI_HEADER_SIZE + 8u + 8u + 12u)
+#define MADT_FIXED_SIZE (ACPI_HEADER_SIZE + 8u + 12u)
+#define MADT_LAPIC_SIZE 8u
 
 #define FADT_WBINVD (1u << 0)
 #define FADT_PWR_BUTTON (1u << 4)
@@ -221,10 +222,10 @@ static void put_io_gas(uint8_t *table, size_t offset, uint16_t port)
 //   |
 //   +----> ...
 int boot_acpi_setup(struct guest_memory *memory, const struct acpi_virtio_mmio *devices,
-                    unsigned count)
+                    unsigned count, unsigned vcpus)
 {
     if (!memory->data || memory->size < ACPI_TABLES_END || count > ACPI_VIRTIO_MMIO_MAX ||
-        (count && !devices)) {
+        (count && !devices) || !vcpus || vcpus > 255) {
         errno = EINVAL;
         return -1;
     }
@@ -285,36 +286,37 @@ int boot_acpi_setup(struct guest_memory *memory, const struct acpi_virtio_mmio *
     finish_table(dsdt, dsdt_size);
 
     /*
-     * MADT：Local APIC 地址 + 两个条目。
-     *   type 0 Processor Local APIC：ACPI 处理器 ID 0，APIC ID 0，已启用
+     * MADT：每个 vCPU 一个已启用的 Local APIC，处理器 ID 与 APIC ID 同号。
      *   type 1 I/O APIC：ID 1，MMIO 0xFEC00000，GSI 从 0 开始
      * 没有中断源覆盖条目，ISA IRQ n 直接对应 GSI n（COM1 即 GSI 4）。
      */
-    // MADT：CPU 和中断控制器拓扑
-    uint8_t madt[MADT_SIZE] = { 0 };
-    put_header(madt, "APIC", MADT_SIZE, 4);
+    uint8_t madt[ACPI_TABLES_END - ACPI_MADT_ADDR] = { 0 };
+    size_t madt_size = MADT_FIXED_SIZE + vcpus * MADT_LAPIC_SIZE;
+    put_header(madt, "APIC", madt_size, 4);
     put32(madt, 36, LAPIC_ADDR);
     put32(madt, 40, 0);
     size_t entry = 44;
-    put8(madt, entry, 0);
-    put8(madt, entry + 1, 8);
-    put8(madt, entry + 2, 0);
-    put8(madt, entry + 3, 0);
-    put32(madt, entry + 4, 1);
-    entry += 8;
+    for (unsigned id = 0; id < vcpus; ++id) {
+        put8(madt, entry, 0);
+        put8(madt, entry + 1, MADT_LAPIC_SIZE);
+        put8(madt, entry + 2, id);
+        put8(madt, entry + 3, id);
+        put32(madt, entry + 4, 1);
+        entry += MADT_LAPIC_SIZE;
+    }
     put8(madt, entry, 1);
     put8(madt, entry + 1, 12);
     put8(madt, entry + 2, 1);
     put8(madt, entry + 3, 0);
     put32(madt, entry + 4, IOAPIC_ADDR);
     put32(madt, entry + 8, 0);
-    finish_table(madt, MADT_SIZE);
+    finish_table(madt, madt_size);
 
     if (guest_memory_load(memory, ACPI_RSDP_ADDR, rsdp, sizeof(rsdp)) < 0 ||
         guest_memory_load(memory, ACPI_RSDT_ADDR, rsdt, sizeof(rsdt)) < 0 ||
         guest_memory_load(memory, ACPI_FADT_ADDR, fadt, sizeof(fadt)) < 0 ||
         guest_memory_load(memory, ACPI_DSDT_ADDR, dsdt, dsdt_size) < 0 ||
-        guest_memory_load(memory, ACPI_MADT_ADDR, madt, sizeof(madt)) < 0)
+        guest_memory_load(memory, ACPI_MADT_ADDR, madt, madt_size) < 0)
         return -1;
     return 0;
 }
