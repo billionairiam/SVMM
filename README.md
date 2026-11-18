@@ -1,3 +1,15 @@
+# SVMM
+
+SVMM 是运行于 Linux x86_64 上的 Rust KVM VMM。`bin/svmm` 支持 Linux bzImage、OCI workload、virtio-blk/TAP、jailer、冷热快照和原生 Intel TDX。`make` 构建 Rust VMM 和 virtqueue 示例。OCI workload 使用静态链接的 Rust guest PID 1。
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+make all workload-initramfs
+sudo bin/svmm run --image ubuntu:24.04 -- /bin/sh -c 'echo hello-from-svmm'
+```
+
+构建宿主需 Rust 1.85 或更新版本。运行 OCI 镜像还需要 Docker CLI/daemon、e2fsprogs 和可访问的 `/dev/kvm`。Rust 源码位于 `src-rust/`。`stage11` 是 C 版参考分支，`make ablation` 继续使用原教程实验实现。已有 Python 命令入口会转到 Rust 二进制。
+
 # Stage 13：在 Intel TDX 中运行 OCI 镜像
 
 `--tdx` 让 SVMM 通过原生 KVM 启动 Trust Domain。TD-Shim 把控制权交给启用 TDX 的 Linux guest。Guest 用 virtio-blk 挂载现有的 OCI rootfs，应用退出后由 SVMM 返回它的退出码。
@@ -75,17 +87,17 @@ sudo bin/svmm run --image my-app:latest --warm-save app
 sudo bin/svmm run --restore app --disk build/restored.ext4 --workload
 ```
 
-`--image` 与 `--disk`、`--snapshot`、`--restore` 互斥。需要直接管理磁盘和持久化时使用下面的手动路径。现有 TAP/netns 由用户配置；镜像准备和临时文件清理位于 VMM jail 之外。请保留仓库的 bin/scripts/guest/rootfs 布局，方便二进制定位运行资源，调用时可位于任意工作目录。
+`--image` 与 `--disk`、`--snapshot`、`--restore` 互斥。需要直接管理磁盘和持久化时使用下面的手动路径。现有 TAP/netns 由用户配置；镜像准备和临时文件清理位于 VMM jail 之外。请保留仓库的 bin、rootfs、src-rust、Cargo.toml、Cargo.lock 和 Makefile，方便二进制定位运行资源，调用时可位于任意工作目录。
 
 ### 手动构建和运行
 
-宿主机需要 Docker CLI/daemon、Python 3、e2fsprogs、musl-gcc、cpio 和 gzip，以及带内建 ACPI、virtio-mmio、virtio-blk、ext4、devtmpfs 的 x86_64 Linux 内核。网络还需要 virtio-net。可以用 `GUEST_CC=...` 指定其他能产出静态 Linux x86_64 程序的编译器。
+宿主机需要 Docker CLI/daemon、e2fsprogs、cpio、gzip 和 Rust 的 `x86_64-unknown-linux-musl` 编译目标，以及带内建 ACPI、virtio-mmio、virtio-blk、ext4、devtmpfs 的 x86_64 Linux 内核。网络还需要 virtio-net。
 
 ```sh
 make all workload-initramfs
 
 # 构建需要 root，以保留镜像文件的 UID/GID 和权限；不执行镜像中的代码。
-sudo python3 scripts/build-workload.py \
+sudo bin/svmm image-build \
   --image ubuntu:24.04 --output build/ubuntu.ext4 \
   -- /bin/sh -c 'echo hello-from-guest; echo persisted > /message; exit 7'
 

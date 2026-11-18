@@ -138,9 +138,8 @@ class RunImageTest(unittest.TestCase):
         package = self.tmp / "package"
         (package / "bin").mkdir(parents=True)
         shutil.copy2(VMM, package / "bin/svmm")
-        for relative in ("scripts/run-image.py", "scripts/build-workload.py",
-                         "guest/init.c", "src/workload.h",
-                         "rootfs/build-workload-initramfs.sh", "Makefile"):
+        for relative in ("Cargo.toml", "Cargo.lock", "rootfs/build-workload-initramfs.sh", "Makefile",
+                         *(str(path.relative_to(ROOT)) for path in Path(ROOT, "src-rust").rglob("*.rs"))):
             destination = package / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(Path(ROOT) / relative, destination)

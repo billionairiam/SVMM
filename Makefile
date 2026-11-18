@@ -4,18 +4,19 @@ CFLAGS += -pthread
 CPPFLAGS += -Isrc
 .DEFAULT_GOAL := all
 
-SOURCES := src/main.c src/cli.c src/sandbox.c src/snapshot.c src/net-policy.c src/jail.c src/kvm.c src/memory.c \
+# The teaching benchmarks continue to compile their original C variants.
+LEGACY_C_SOURCES := src/main.c src/cli.c src/sandbox.c src/snapshot.c src/net-policy.c src/jail.c src/kvm.c src/memory.c \
            src/vmstate.c src/vcpu.c src/serial.c src/console.c src/metrics.c src/boot/linux.c src/boot/acpi.c \
            src/virtio/virtq.c src/virtio/mmio.c src/virtio/blk.c src/virtio/net.c \
            src/tdx.c src/boot/td-shim.c src/ioapic.c
-OBJECTS := $(SOURCES:src/%.c=build/%.o)
+CARGO ?= cargo
+RUST_TARGET ?= x86_64-unknown-linux-musl
+RUST_SOURCES := $(shell find src-rust -type f -name '*.rs')
 # Stage 05 的 virtqueue 是纯用户态代码，不依赖 KVM，单独编进 virtq-demo。
 # Stage 06 起 virtq.c 也编进 svmm，给 virtio-mmio 设备用。
 VIRTIO_SOURCES := src/virtio/virtq.c src/virtio/virtio.c
-VIRTIO_OBJECTS := $(VIRTIO_SOURCES:src/%.c=build/%.o)
 BLK_SOURCES := src/virtio/virtq.c src/virtio/mmio.c src/virtio/blk.c
 NET_SOURCES := src/virtio/virtq.c src/virtio/mmio.c src/virtio/net.c
-DEPFILES := $(OBJECTS:.o=.d) $(VIRTIO_OBJECTS:.o=.d) build/virtio/demo.d
 
 ABLATION_VARIANTS := baseline no_cpuid fixed_32m no_boot_params no_e820 \
                      no_cmdline no_protected_mode no_uart
@@ -31,7 +32,7 @@ ABLATION_CPPFLAGS_no_uart := -DSVMM_ABLATE_UART
 ABLATION_DEPFILES :=
 
 define ABLATION_template
-ABLATION_OBJECTS_$(1) := $(SOURCES:src/%.c=build/ablation/$(1)/%.o)
+ABLATION_OBJECTS_$(1) := $(LEGACY_C_SOURCES:src/%.c=build/ablation/$(1)/%.o)
 ABLATION_DEPFILES += $$(ABLATION_OBJECTS_$(1):.o=.d)
 
 bin/ablation/$(1)/svmm: $$(ABLATION_OBJECTS_$(1)) | bin/ablation/$(1)
@@ -45,7 +46,7 @@ endef
 
 $(foreach variant,$(ABLATION_VARIANTS),$(eval $(call ABLATION_template,$(variant))))
 
--include $(DEPFILES) $(ABLATION_DEPFILES)
+-include $(ABLATION_DEPFILES)
 
 .PHONY: all ablation initramfs workload-initramfs test-workload test-tdx disk run run-disk run-net run-virtq test clean \
         netns netns-down run-netns jail-setup jail-clean run-jail \
@@ -71,11 +72,11 @@ ablation: $(ABLATION_VARIANTS:%=bin/ablation/%/svmm)
 initramfs: build/initramfs.cpio.gz
 
 # Static guest PID 1: independent of the OCI image's libc or shell.
-GUEST_CC ?= musl-gcc
 workload-initramfs: build/workload-initramfs.cpio.gz
 
-build/workload-init: guest/init.c src/workload.h | build
-	$(GUEST_CC) -Isrc -std=c11 -Wall -Wextra -Werror -O2 -static $< -o $@
+build/workload-init: Cargo.toml Cargo.lock src-rust/guest.rs src-rust/workload_config.rs | build
+	$(CARGO) build --locked --release --target $(RUST_TARGET) --target-dir target --bin workload-init
+	tmp=$$(mktemp "$@.XXXXXX") && install -m 755 target/$(RUST_TARGET)/release/workload-init "$$tmp" && mv -f "$$tmp" "$@"
 
 build/workload-initramfs.cpio.gz: build/workload-init rootfs/build-workload-initramfs.sh | build
 	sh rootfs/build-workload-initramfs.sh $< $@
@@ -91,11 +92,9 @@ disk: | build
 build/initramfs.cpio.gz: rootfs/build-rootfs.sh | build
 	sh rootfs/build-rootfs.sh $@
 
-bin/svmm: $(OBJECTS) | bin
-	$(CC) $(CFLAGS) $(OBJECTS) -o $@
-
-bin/virtq-demo: build/virtio/demo.o $(VIRTIO_OBJECTS) | bin
-	$(CC) $(CFLAGS) $^ -o $@
+bin/svmm bin/virtq-demo: Cargo.toml Cargo.lock $(RUST_SOURCES) | bin
+	$(CARGO) build --locked --release --target-dir target --bin $(@F)
+	tmp=$$(mktemp "$@.XXXXXX") && install -m 755 target/release/$(@F) "$$tmp" && mv -f "$$tmp" "$@"
 
 bin/test_virtq: tests/test_virtq.c $(VIRTIO_SOURCES) src/virtio/virtq.h src/virtio/virtio.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_virtq.c $(VIRTIO_SOURCES) -o $@
@@ -128,10 +127,6 @@ bin/test_vcpu_errors: tests/test_vcpu_errors.c src/vcpu.c src/vcpu.h src/boot/ac
                       src/serial.c src/serial.h src/metrics.c src/metrics.h | bin
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_vcpu_errors.c src/vcpu.c \
 		src/serial.c src/metrics.c -Wl,--wrap=ioctl -o $@
-
-build/%.o: src/%.c | build
-	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
 build bin:
 	mkdir -p $@

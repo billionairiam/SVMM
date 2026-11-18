@@ -1,0 +1,29 @@
+[package]
+name = "svmm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+default-run = "svmm"
+
+[[bin]]
+name = "svmm"
+path = "src-rust/main.rs"
+
+[[bin]]
+name = "workload-init"
+path = "src-rust/guest.rs"
+
+[[bin]]
+name = "virtq-demo"
+path = "src-rust/devices/demo.rs"
+
+[dependencies]
+anyhow = "1"
+kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
+kvm-ioctls = "0.25"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3"
