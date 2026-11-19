@@ -22,12 +22,13 @@ sudo bin/svmm run --image ubuntu:24.04 -- /bin/sh -c 'echo hello-from-svmm'
 
 | Skill | 适用场景 |
 | --- | --- |
+| [`svmm-sandbox`](.agents/skills/svmm-sandbox/SKILL.md) | 在 SVMM 中隔离执行命令、脚本和测试，收集输出、退出码和产物 |
 | [`svmm-e2e`](.agents/skills/svmm-e2e/SKILL.md) | 选择与改动相关的启动、串口、virtio、网络或 jailer E2E |
 | [`svmm-oci`](.agents/skills/svmm-oci/SKILL.md) | 排查镜像拉取、rootfs 导出、guest PID 1、退出码或取消后的清理 |
 | [`svmm-tdx`](.agents/skills/svmm-tdx/SKILL.md) | 排查 TD-Shim、原生 KVM TDX、多 vCPU、大内存和共享 DMA |
 | [`svmm-snapshots`](.agents/skills/svmm-snapshots/SKILL.md) | 验证冷热快照、恢复兼容性和损坏快照的拒绝路径 |
 
-例如，给 Codex 发送「用 `$svmm-tdx` 排查 4 vCPU 启动失败，运行对应的真机 E2E」。测试约定见 [AGENTS.md](AGENTS.md)。
+例如，给 Codex 发送「用 `$svmm-sandbox` 在 Ubuntu 24.04 VM 里运行这个脚本，关闭 guest 网络，返回输出和退出码」。开发 SVMM 本身时，可用 `$svmm-e2e` 选择回归测试。测试约定见 [AGENTS.md](AGENTS.md)。
 
 ## Stage 13：在 Intel TDX 中运行 OCI 镜像
 
