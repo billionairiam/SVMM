@@ -1,24 +1,26 @@
 # SVMM
 
-**用本地 KVM 微虚拟机运行 AI 任务和 OCI workload。**
+**English** · [简体中文](README.zh-CN.md)
 
-SVMM 是一个面向 Linux x86_64 的 Rust VMM。指定一个 OCI 镜像，就能在独立的 Linux guest 中执行脚本、构建、测试或短任务，并拿到应用的输出和退出码。
+**Run AI tasks and OCI workloads in local KVM microVMs.**
 
-[快速开始](#快速开始) · [CLI 用法](#cli-用法) · [AI 编程助手](#ai-编程助手) · [Intel TDX](#intel-tdx) · [使用与实现指南](docs/guide.md)
+SVMM is a Rust virtual machine monitor for Linux x86_64. Give it an OCI image to run a script, build, test, or other short-lived job in an isolated Linux guest. SVMM returns the application's output and exit status.
 
-## 主要能力
+[Quick start](#quick-start) · [CLI usage](#cli-usage) · [AI coding assistants](#ai-coding-assistants) · [Intel TDX](#intel-tdx) · [Detailed guide (Chinese)](docs/guide.md)
 
-| 能力 | 支持范围 |
+## Features
+
+| Feature | What it supports |
 | --- | --- |
-| OCI 镜像 | 复用本地 Docker 镜像或拉取缺失镜像，生成可写的 ext4 rootfs，按镜像配置启动应用 |
-| 一次性沙箱 | 以命令或脚本为入口，应用退出后回传状态并清理临时磁盘 |
-| 资源与网络 | 普通 KVM 可用 jailer 约束 VMM，guest 网络按需接入宿主 TAP 和 netns |
-| 磁盘与快照 | 可通过 virtio-blk 持久化产物，普通 KVM 支持冷恢复和热续跑 |
-| Intel TDX | 原生 KVM TDX 启动，最多 64 vCPU 和 32 GiB 内存，支持 virtio-blk 与 TAP |
+| OCI images | Use a cached Docker image or pull a missing one, prepare a writable ext4 root filesystem, and launch the app with its image configuration |
+| One-shot sandboxes | Run a command or script, return its exit status, and clean up the temporary disk |
+| Resource limits and networking | Constrain the VMM with the jailer on standard KVM and connect the guest to a host TAP interface and network namespace as needed |
+| Disks and snapshots | Keep artifacts on a virtio-blk disk, or save and restore cold and warm snapshots on standard KVM |
+| Intel TDX | Boot with native KVM TDX, up to 64 vCPUs and 32 GiB of RAM, with virtio-blk and TAP support |
 
-## 快速开始
+## Quick start
 
-宿主机需要 Linux x86_64、可访问的 `/dev/kvm`、Rust 1.85+ 和链接工具。OCI 路径还需要 Docker CLI/daemon、`e2fsprogs`、`cpio`、`gzip`、兼容的 guest bzImage 和 root 权限。guest 内核需内建 virtio-mmio、virtio-blk、ext4 等启动驱动。 [内核与镜像配置](docs/guide.md#stage-12直接运行-oci--docker-镜像里的应用)
+Use a Linux x86_64 host with access to `/dev/kvm`, Rust 1.85 or later, and a linker. Running OCI images also requires the Docker CLI and daemon, `e2fsprogs`, `cpio`, `gzip`, a compatible guest bzImage, and root privileges. The guest kernel needs built-in drivers such as virtio-mmio, virtio-blk, and ext4. [Kernel and image configuration (Chinese)](docs/guide.md#stage-12直接运行-oci--docker-镜像里的应用)
 
 ```sh
 git clone https://github.com/billionairiam/SVMM.git
@@ -27,26 +29,26 @@ rustup target add x86_64-unknown-linux-musl
 make all workload-initramfs
 ```
 
-用 Ubuntu 镜像启动一个 guest，执行命令后退出。
+Boot an Ubuntu guest, run a command, and exit.
 
 ```sh
 sudo bin/svmm run --image ubuntu:24.04 --kernel /path/to/bzImage \
   --entrypoint /bin/sh -- -c 'echo hello-from-svmm'
 ```
 
-如果已经配置默认内核，直接运行镜像自带的 ENTRYPOINT 和 CMD。
+With a default kernel configured, run the image's own ENTRYPOINT and CMD.
 
 ```sh
 sudo bin/svmm run --image my-app:latest
 ```
 
-内核可通过 `--kernel` 或 `SVMM_KERNEL` 指定。`run --image` 也会从仓库的 `images/` 和宿主的 `/boot/` 查找兼容内核。首次运行可能需要拉取镜像。
+Set the guest kernel with `--kernel` or `SVMM_KERNEL`. The `run --image` command can also look for a compatible kernel in the repository's `images/` directory and the host's `/boot/` directory. The first run may need to pull the image.
 
-## CLI 用法
+## CLI usage
 
-### 限时运行脚本或测试
+### Run a script or test with a time limit
 
-普通 KVM 可加 `--jail`。`--mem` 配置 guest RAM，`--cpu-max` 和 `--memory-max` 配置宿主 cgroup 限制。
+Add `--jail` on standard KVM. Use `--mem` for guest RAM and `--cpu-max` and `--memory-max` for the host cgroup limits.
 
 ```sh
 sudo timeout --signal=TERM --kill-after=10s 90s bin/svmm run \
@@ -56,11 +58,11 @@ sudo timeout --signal=TERM --kill-after=10s 90s bin/svmm run \
 echo "$?"    # 7
 ```
 
-应用的 stdout 和 stderr 经串口合流，VMM 诊断单独写到宿主 stderr。正常应用退出时可看到 `reason=workload_exit`。未配置 `--tap` 时 guest 无网卡，Docker 的镜像准备仍由宿主执行。联网任务可传 `--tap tap0 --netns sandbox-ns`，并复用宿主配置。 [TAP 与出口策略](docs/guide.md#stage-08网络命名空间与出口策略)
+The guest's stdout and stderr share the serial stream. The VMM writes its diagnostics separately to host stderr, including `reason=workload_exit` when the app reports completion. Guests boot without a NIC by default, and Docker prepares the image on the host. For networking, pass `--tap tap0 --netns sandbox-ns` with an existing host setup. [TAP and egress policy (Chinese)](docs/guide.md#stage-08网络命名空间与出口策略)
 
-### 保留任务产物
+### Keep task artifacts
 
-一次性沙箱的磁盘随 VM 退出清理。需要读取或复用产物时，先创建独立的 ext4 工作盘，再用 `--disk` 运行。
+SVMM cleans up one-shot sandbox disks when the VM exits. To inspect or reuse an artifact, create a separate ext4 work disk and boot with `--disk`.
 
 ```sh
 sudo bin/svmm image-build --image ubuntu:24.04 --output build/task.ext4 \
@@ -72,27 +74,27 @@ sudo bin/svmm run --kernel /path/to/bzImage \
 sudo debugfs -R 'cat /tmp/task-result' build/task.ext4
 ```
 
-### 暂停与恢复
+### Pause and resume
 
-冷快照保存工作盘，恢复后重新启动 guest。热快照保存普通 KVM 的内存、vCPU、设备和磁盘状态，在同一宿主上从暂停点继续。 [快照操作](docs/guide.md#stage-11热快照从暂停点毫秒级恢复)
+A cold snapshot saves the work disk for a fresh guest boot. On standard KVM, a warm snapshot saves memory, vCPU state, device state, and the disk so the guest can resume on the same host. [Snapshot guide (Chinese)](docs/guide.md#stage-11热快照从暂停点毫秒级恢复)
 
 ```sh
 sudo bin/svmm run --image my-app:latest --kernel /path/to/bzImage --warm-save checkpoint
-# 在 workload 运行期间按 Ctrl-A s，保存并退出。
+# While the workload is running, press Ctrl-A s to save and exit.
 sudo bin/svmm run --restore checkpoint --disk build/resumed.ext4 --workload
 ```
 
-## AI 编程助手
+## AI coding assistants
 
-在仓库中打开 Codex，使用 [`$svmm-sandbox`](.agents/skills/svmm-sandbox/SKILL.md) 把一次任务交给独立 VM。其他编程助手可直接读取对应的 `SKILL.md`。
+Open Codex in the repository and use [`$svmm-sandbox`](.agents/skills/svmm-sandbox/SKILL.md) to run a task in a separate VM. Other coding assistants can read the same `SKILL.md` file directly.
 
-> 用 `$svmm-sandbox` 在 Ubuntu 24.04 VM 里运行这个脚本，关闭 guest 网络，最多运行 90 秒，返回应用输出和退出码。
+> Use `$svmm-sandbox` to run this script in an Ubuntu 24.04 VM with guest networking disabled. Give it 90 seconds and return the application output and exit status.
 
-这个技能说明如何选镜像、传入脚本、限制运行时间，以及从工作盘取回产物。开发 SVMM 时另有 [E2E](.agents/skills/svmm-e2e/SKILL.md)、[OCI](.agents/skills/svmm-oci/SKILL.md)、[TDX](.agents/skills/svmm-tdx/SKILL.md) 和 [快照](.agents/skills/svmm-snapshots/SKILL.md) 技能。
+The skill covers image selection, script inputs, time limits, and artifact retrieval. For SVMM development, see the [E2E](.agents/skills/svmm-e2e/SKILL.md), [OCI](.agents/skills/svmm-oci/SKILL.md), [TDX](.agents/skills/svmm-tdx/SKILL.md), and [snapshot](.agents/skills/svmm-snapshots/SKILL.md) skills.
 
 ## Intel TDX
 
-在启用 KVM TDX 的 Intel 宿主上，用 TD-Shim 和 TDX guest 内核启动 Trust Domain。下面的命令为同一个 workload 分配 4 个 vCPU。
+On an Intel host with KVM TDX enabled, use TD-Shim and a TDX guest kernel to boot a Trust Domain. This example allocates 4 vCPUs.
 
 ```sh
 sudo bin/svmm run --tdx --vcpus 4 \
@@ -100,11 +102,11 @@ sudo bin/svmm run --tdx --vcpus 4 \
   --image ubuntu:24.04 --entrypoint /bin/sh -- -c 'echo hello-from-tdx'
 ```
 
-vCPU 上限受宿主 KVM、TD-Shim 和 guest 内核配置约束。TDX 保护 guest 的私有内存，宿主仍可访问 rootfs 文件、串口输出和 TAP 流量。真机测试使用非调试 TDREPORT 验证启动，远程认证需接入 Quote 与验证方。jailer 和快照适用于普通 KVM。 [TDX 固件、内核配置与限制](docs/guide.md#stage-13在-intel-tdx-中运行-oci-镜像)
+The vCPU limit depends on the host KVM, TD-Shim, and guest kernel configuration. TDX protects private guest memory. The host can still access the rootfs file, serial output, and TAP traffic. Hardware tests verify boot with a non-debug TDREPORT. Remote attestation requires a Quote and a verifier. The jailer and snapshots are available on standard KVM. [TDX firmware, kernel configuration, and limits (Chinese)](docs/guide.md#stage-13在-intel-tdx-中运行-oci-镜像)
 
-## 开发与测试
+## Development and testing
 
-运行时代码位于 [`src-rust/`](src-rust/)。开发时先运行与改动相关的 E2E，完整普通 KVM 套件使用 `make test`。 [测试约定](AGENTS.md)
+The runtime source is in [`src-rust/`](src-rust/). Start with the E2E cases affected by your change and use `make test` for the full standard KVM suite. [Testing conventions (Chinese)](AGENTS.md)
 
 ```sh
 sudo env VIRTIO_BZIMAGE=/path/to/bzImage make test-workload
@@ -112,4 +114,4 @@ sudo env SVMM_TEST_TDX_KERNEL=/path/to/tdx-bzImage \
   SVMM_TEST_TD_SHIM=/path/to/td-shim.bin make test-tdx
 ```
 
-[使用与实现指南](docs/guide.md) 收录内核启动、virtio、网络、快照和消融实验。教学用 C 实现见 [`stage11`](https://github.com/billionairiam/SVMM/tree/stage11)。
+The [detailed guide (Chinese)](docs/guide.md) covers kernel boot, virtio, networking, snapshots, and ablation experiments. The educational C implementation is in [`stage11`](https://github.com/billionairiam/SVMM/tree/stage11).

@@ -9,7 +9,7 @@ Use the sandbox for the task command and collect its output and exit status. Use
 
 ## Prepare the run
 
-- Locate the SVMM checkout and `bin/svmm`. If it has yet to be built, follow [Quick start](../../../README.md#快速开始) and run `make all workload-initramfs` from the checkout. The host needs access to `/dev/kvm`, a compatible guest bzImage, Docker and root privileges for the OCI path. If SVMM cannot start, report the blocker and keep the task command inside the requested boundary.
+- Locate the SVMM checkout and `bin/svmm`. If it has yet to be built, follow [Quick start](../../../README.md#quick-start) and run `make all workload-initramfs` from the checkout. The host needs access to `/dev/kvm`, a compatible guest bzImage, Docker and root privileges for the OCI path. If SVMM cannot start, report the blocker and keep the task command inside the requested boundary.
 - Use the task's linux/amd64 image, or select an existing image with the needed tools. Pass program and arguments separately. `--entrypoint EXE` selects the guest executable and clears the image's default command. Put only the guest arguments after `--`.
 - The guest starts from an independent rootfs. For a small local script, pass its contents as a single guest argument to the chosen interpreter, using the host's argument-vector API or shell quoting. For a directory of inputs, use an OCI image containing the needed tools and copy in the task files so execution happens after the VM boots. The host working directory does not appear in the guest.
 - Leave `--tap` unset for a guest without a NIC. Docker can still pull images on the host. When the task also requires offline image preparation, verify the selected image is cached before launch. For a networked task, use its configured TAP and netns.

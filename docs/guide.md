@@ -1,6 +1,6 @@
 # SVMM 使用与实现指南
 
-[返回项目首页](../README.md)
+[返回中文首页](../README.zh-CN.md)
 
 Stage 12–13 介绍 OCI workload 和原生 KVM TDX 的配置、接口与测试。Stage 02–11 记录功能演进，其中的 C 源码路径对应教学实现。当前运行时代码见 [src-rust/](../src-rust/)。
 
