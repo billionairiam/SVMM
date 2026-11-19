@@ -5,7 +5,7 @@ description: Use when changing or diagnosing SVMM native KVM TDX launch, TD-Shim
 
 # SVMM native KVM TDX
 
-Read the [TDX requirements and limits](../../../README.md#stage-13在-intel-tdx-中运行-oci-镜像). Identify the host KVM TDX support, the exact guest bzImage and TD-Shim payload, and the requested vCPU count before interpreting a failure. For SMP, verify the shim includes the AP wake fix and that the guest kernel's `CONFIG_NR_CPUS` covers the requested CPUs.
+Read the [TDX requirements and limits](../../../docs/guide.md#stage-13在-intel-tdx-中运行-oci-镜像). Identify the host KVM TDX support, the exact guest bzImage and TD-Shim payload, and the requested vCPU count before interpreting a failure. For SMP, verify the shim includes the AP wake fix and that the guest kernel's `CONFIG_NR_CPUS` covers the requested CPUs.
 
 - For launch errors, start with [machine.rs](../../../src-rust/machine.rs), [boot/tdx.rs](../../../src-rust/boot/tdx.rs) and [boot/td_shim.rs](../../../src-rust/boot/td_shim.rs). Check the last boot stage to distinguish preflight, memory import, and vCPU entry.
 - For TAP and disk failures, follow the shared GPA and DMA checks in [memory.rs](../../../src-rust/memory.rs) and [devices.rs](../../../src-rust/devices.rs). Private TD memory is inaccessible to the device model. Preserve that boundary when changing device access.
